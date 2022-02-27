@@ -1,9 +1,10 @@
 use gatewaysocks::arp::ArpHandler;
 
-use pnet::datalink;
+use pnet::datalink::{self, Config};
 use pnet::packet::ethernet::{EtherTypes, EthernetPacket};
 
 use std::net::Ipv4Addr;
+use std::time::Duration;
 
 fn main() {
     let interface = datalink::interfaces()
@@ -18,7 +19,18 @@ fn main() {
         .next()
         .unwrap_or_else(|| panic!("Could not find local network interface."));
 
-    let (mut tx, mut rx) = match datalink::channel(&interface, Default::default()) {
+    let config = Config {
+        write_buffer_size: 4096,
+        read_buffer_size: 4096,
+        read_timeout: Some(Duration::from_millis(10)),
+        write_timeout: None,
+        channel_type: datalink::ChannelType::Layer2,
+        bpf_fd_attempts: 1000,
+        linux_fanout: None,
+        promiscuous: false,
+    };
+
+    let (mut tx, mut rx) = match datalink::channel(&interface, config) {
         Ok(datalink::Channel::Ethernet(tx, rx)) => (tx, rx),
         Ok(_) => panic!("Unhandled channel type"),
         Err(e) => panic!("Unable to create channel: {}", e),
