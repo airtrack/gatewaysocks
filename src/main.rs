@@ -1,4 +1,4 @@
-use gatewaysocks::arp::ArpHandler;
+use gatewaysocks::gateway::arp::ArpHandler;
 
 use pnet::datalink::{self, Config};
 use pnet::packet::ethernet::{EtherTypes, EthernetPacket};
