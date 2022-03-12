@@ -1,31 +1,33 @@
-use gatewaysocks::gateway::arp::ArpHandler;
-use gatewaysocks::gateway::udp::{UdpLayerPacket, UdpProcessor};
-use gatewaysocks::socks5::udp::UdpSocks5;
-use gatewaysocks::socks5::{socks_channel, SocksChannel, SocksData};
+use std::net::{Ipv4Addr, SocketAddr};
+use std::thread;
+use std::time::Duration;
+
 use pnet::datalink::{self, Config, DataLinkSender, NetworkInterface};
 use pnet::packet::ethernet::{EtherTypes, EthernetPacket};
 use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::packet::ipv4::Ipv4Packet;
 use pnet::packet::Packet;
 use pnet::util::MacAddr;
+
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::error::TryRecvError;
 
-use std::net::Ipv4Addr;
-use std::thread;
-use std::time::Duration;
+use gatewaysocks::gateway::arp::ArpHandler;
+use gatewaysocks::gateway::udp::{UdpLayerPacket, UdpProcessor};
+use gatewaysocks::socks5::udp::UdpSocks5;
+use gatewaysocks::socks5::{socks_channel, SocksChannel, SocksData};
 
-fn socks5_main(udp_channel: SocksChannel) {
+fn socks5_main(socks5: SocketAddr, udp_channel: SocksChannel) {
     let rt = Runtime::new().unwrap();
     rt.block_on(async move {
-        let mut udp_socks5 = UdpSocks5::new(udp_channel);
+        let mut udp_socks5 = UdpSocks5::new(socks5, udp_channel);
         udp_socks5.run().await;
     });
 }
 
-fn start_socks5(udp_channel: SocksChannel) {
+fn start_socks5(socks5: SocketAddr, udp_channel: SocksChannel) {
     thread::spawn(move || {
-        socks5_main(udp_channel);
+        socks5_main(socks5, udp_channel);
     });
 }
 
@@ -129,6 +131,7 @@ fn gateway_main(
 }
 
 fn main() {
+    let socks5 = "127.0.0.1:1080".parse::<SocketAddr>().unwrap();
     let gateway = "10.6.0.1".parse::<Ipv4Addr>().unwrap();
     let subnet_mask = "255.255.255.0".parse::<Ipv4Addr>().unwrap();
     let interface = datalink::interfaces()
@@ -145,6 +148,6 @@ fn main() {
     let mac = interface.mac.unwrap();
 
     let (udp_channel, channel_udp) = socks_channel();
-    start_socks5(channel_udp);
+    start_socks5(socks5, channel_udp);
     gateway_main(mac, gateway, subnet_mask, &interface, udp_channel);
 }
