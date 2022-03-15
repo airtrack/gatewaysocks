@@ -4,6 +4,8 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use log::info;
+
 use tokio::io::AsyncReadExt;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{error::SendError, unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -44,9 +46,10 @@ impl UdpSocks5 {
         loop {
             tokio::select! {
                 _ = self.timer.tick() => {
-                    self.clients.retain(|_, client| {
+                    self.clients.retain(|key, client| {
                         let timeout = client.is_timeout();
                         if timeout {
+                            info!("timeout to stop UDP socks5 {}", key);
                             client.shutdown();
                         }
                         !timeout
@@ -93,7 +96,9 @@ impl Client {
         let (shutdown_tx, shutdown_rx) = watch::channel(());
 
         tokio::spawn(async move {
+            info!("start UDP socks5 {}", key);
             let _ = Self::socks5_task(&key, shutdown_rx, server_addr, output_tx, rx).await;
+            info!("stop UDP socks5 {}", key);
             let _ = exited_tx.send(key);
         });
 
@@ -163,12 +168,14 @@ impl Client {
     }
 
     async fn send_to_socks5(
-        _key: String,
+        key: String,
         mut shutdown: Receiver<()>,
         mut input_rx: UnboundedReceiver<SocksData>,
         udp_socket: Arc<UdpSocket>,
         relay_addr: SocketAddr,
     ) {
+        info!("start UDP socks5 send task {} -> {}", key, relay_addr);
+
         loop {
             tokio::select! {
                 result = input_rx.recv() => {
@@ -190,6 +197,8 @@ impl Client {
                 _ = shutdown.changed() => break,
             }
         }
+
+        info!("stop UDP socks5 send task {} -> {}", key, relay_addr);
     }
 
     async fn receive_from_socks5(
@@ -198,6 +207,8 @@ impl Client {
         output_tx: UnboundedSender<SocksData>,
         udp_socket: Arc<UdpSocket>,
     ) {
+        info!("start UDP socks5 recv task {}", key);
+
         loop {
             let mut buffer = [0u8; 1500];
             tokio::select! {
@@ -225,5 +236,7 @@ impl Client {
                 _ = shutdown.changed() => break,
             }
         }
+
+        info!("stop UDP socks5 recv task {}", key);
     }
 }

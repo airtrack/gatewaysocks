@@ -1,10 +1,12 @@
+use std::net::Ipv4Addr;
+
+use log::info;
+
 use pnet::datalink::DataLinkSender;
 use pnet::packet::arp::{ArpHardwareTypes, ArpOperations, ArpPacket, MutableArpPacket};
 use pnet::packet::ethernet::{EtherTypes, EthernetPacket, MutableEthernetPacket};
 use pnet::packet::Packet;
 use pnet::util::MacAddr;
-
-use std::net::Ipv4Addr;
 
 pub struct ArpHandler {
     mac: MacAddr,
@@ -35,6 +37,8 @@ impl ArpHandler {
 
             let mut arp_buffer = [0u8; 28];
             let mut arp_response = MutableArpPacket::new(&mut arp_buffer).unwrap();
+            let source_mac = request.get_source();
+            let source_ip = arp_request.get_sender_proto_addr();
 
             arp_response.set_hardware_type(ArpHardwareTypes::Ethernet);
             arp_response.set_protocol_type(EtherTypes::Ipv4);
@@ -43,10 +47,12 @@ impl ArpHandler {
             arp_response.set_operation(ArpOperations::Reply);
             arp_response.set_sender_hw_addr(self.mac);
             arp_response.set_sender_proto_addr(self.gateway);
-            arp_response.set_target_hw_addr(request.get_source());
-            arp_response.set_target_proto_addr(arp_request.get_sender_proto_addr());
+            arp_response.set_target_hw_addr(source_mac);
+            arp_response.set_target_proto_addr(source_ip);
 
             ethernet_packet.set_payload(arp_response.packet());
+
+            info!("ARP reply to {}[{}]", source_ip, source_mac);
             tx.send_to(ethernet_packet.packet(), None);
         }
     }

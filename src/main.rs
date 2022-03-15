@@ -2,6 +2,9 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::thread;
 use std::time::Duration;
 
+use log::info;
+use simple_logger::SimpleLogger;
+
 use pnet::datalink::{self, Config, DataLinkSender, NetworkInterface};
 use pnet::packet::ethernet::{EtherTypes, EthernetPacket};
 use pnet::packet::ip::IpNextHeaderProtocols;
@@ -112,9 +115,7 @@ fn gateway_main(
                                         &ipv4_packet,
                                     );
                                 }
-                                IpNextHeaderProtocols::Tcp => {
-                                    println!("tcp packet");
-                                }
+                                IpNextHeaderProtocols::Tcp => {}
                                 _ => {}
                             }
                         }
@@ -131,6 +132,13 @@ fn gateway_main(
 }
 
 fn main() {
+    SimpleLogger::new()
+        .env()
+        .with_utc_timestamps()
+        .with_level(log::LevelFilter::Info)
+        .init()
+        .unwrap();
+
     let socks5 = "127.0.0.1:1080".parse::<SocketAddr>().unwrap();
     let gateway = "10.6.0.1".parse::<Ipv4Addr>().unwrap();
     let subnet_mask = "255.255.255.0".parse::<Ipv4Addr>().unwrap();
@@ -146,6 +154,8 @@ fn main() {
         .next()
         .unwrap_or_else(|| panic!("Could not find local network interface."));
     let mac = interface.mac.unwrap();
+
+    info!("start gatewaysocks on {}({}) ...", gateway, subnet_mask);
 
     let (udp_channel, channel_udp) = socks_channel();
     start_socks5(socks5, channel_udp);
