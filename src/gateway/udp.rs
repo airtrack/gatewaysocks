@@ -9,7 +9,7 @@ use pnet::packet::udp::{self, MutableUdpPacket, UdpPacket};
 use pnet::packet::Packet;
 use pnet::util::MacAddr;
 
-use super::is_same_subnet;
+use super::is_to_gateway;
 
 pub struct UdpProcessor {
     mac: MacAddr,
@@ -44,11 +44,7 @@ impl UdpProcessor {
         source_mac: MacAddr,
         request: &Ipv4Packet,
     ) -> Option<UdpLayerPacket> {
-        if self.gateway == request.get_source() {
-            return None;
-        }
-
-        if !is_same_subnet(self.gateway, request.get_source(), self.subnet_mask) {
+        if !is_to_gateway(self.gateway, self.subnet_mask, request.get_source()) {
             return None;
         }
 

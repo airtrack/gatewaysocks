@@ -4,7 +4,11 @@ pub mod arp;
 pub mod tcp;
 pub mod udp;
 
-pub(crate) fn is_same_subnet(addr1: Ipv4Addr, addr2: Ipv4Addr, subnet_mask: Ipv4Addr) -> bool {
+fn is_to_gateway(gateway: Ipv4Addr, subnet_mask: Ipv4Addr, source: Ipv4Addr) -> bool {
+    source != gateway && is_same_subnet(source, gateway, subnet_mask)
+}
+
+fn is_same_subnet(addr1: Ipv4Addr, addr2: Ipv4Addr, subnet_mask: Ipv4Addr) -> bool {
     let mask = subnet_mask.octets();
     let a1 = addr1.octets();
     let a2 = addr2.octets();
