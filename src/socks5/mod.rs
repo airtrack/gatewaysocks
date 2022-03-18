@@ -13,23 +13,17 @@ const VER: u8 = 5;
 const NO_AUTH: u8 = 0;
 const CMD_UDP_ASSOCIATE: u8 = 3;
 
-pub struct SocksData {
-    pub key: String,
-    pub data: Vec<u8>,
-    pub addr: SocketAddrV4,
+pub struct Socks5Channel<T> {
+    pub tx: UnboundedSender<T>,
+    pub rx: UnboundedReceiver<T>,
 }
 
-pub struct SocksChannel {
-    pub tx: UnboundedSender<SocksData>,
-    pub rx: UnboundedReceiver<SocksData>,
-}
-
-pub fn socks_channel() -> (SocksChannel, SocksChannel) {
+pub fn socks5_channel<T>() -> (Socks5Channel<T>, Socks5Channel<T>) {
     let (tx1, rx1) = unbounded_channel();
     let (tx2, rx2) = unbounded_channel();
     (
-        SocksChannel { tx: tx1, rx: rx2 },
-        SocksChannel { tx: tx2, rx: rx1 },
+        Socks5Channel { tx: tx1, rx: rx2 },
+        Socks5Channel { tx: tx2, rx: rx1 },
     )
 }
 

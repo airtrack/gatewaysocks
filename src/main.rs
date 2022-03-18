@@ -17,10 +17,10 @@ use tokio::sync::mpsc::error::TryRecvError;
 
 use gatewaysocks::gateway::arp::ArpHandler;
 use gatewaysocks::gateway::udp::{UdpLayerPacket, UdpProcessor};
-use gatewaysocks::socks5::udp::UdpSocks5;
-use gatewaysocks::socks5::{socks_channel, SocksChannel, SocksData};
+use gatewaysocks::socks5::udp::{UdpSocks5, UdpSocks5Data};
+use gatewaysocks::socks5::{socks5_channel, Socks5Channel};
 
-fn socks5_main(socks5: SocketAddr, udp_channel: SocksChannel) {
+fn socks5_main(socks5: SocketAddr, udp_channel: Socks5Channel<UdpSocks5Data>) {
     let rt = Runtime::new().unwrap();
     rt.block_on(async move {
         let mut udp_socks5 = UdpSocks5::new(socks5, udp_channel);
@@ -28,7 +28,7 @@ fn socks5_main(socks5: SocketAddr, udp_channel: SocksChannel) {
     });
 }
 
-fn start_socks5(socks5: SocketAddr, udp_channel: SocksChannel) {
+fn start_socks5(socks5: SocketAddr, udp_channel: Socks5Channel<UdpSocks5Data>) {
     thread::spawn(move || {
         socks5_main(socks5, udp_channel);
     });
@@ -36,14 +36,14 @@ fn start_socks5(socks5: SocketAddr, udp_channel: SocksChannel) {
 
 fn handle_udp_from_ethernet(
     udp_processor: &mut UdpProcessor,
-    udp_channel: &SocksChannel,
+    udp_channel: &Socks5Channel<UdpSocks5Data>,
     ethernet_packet: &EthernetPacket,
     ipv4_packet: &Ipv4Packet,
 ) {
     let udp_data = udp_processor.handle_input_packet(ethernet_packet.get_source(), ipv4_packet);
 
     if let Some(data) = udp_data {
-        let _ = udp_channel.tx.send(SocksData {
+        let _ = udp_channel.tx.send(UdpSocks5Data {
             key: data.key,
             data: data.data,
             addr: data.addr,
@@ -53,7 +53,7 @@ fn handle_udp_from_ethernet(
 
 fn handle_udp_from_socks5(
     udp_processor: &UdpProcessor,
-    udp_channel: &mut SocksChannel,
+    udp_channel: &mut Socks5Channel<UdpSocks5Data>,
     tx: &mut Box<dyn DataLinkSender>,
 ) {
     loop {
@@ -77,7 +77,7 @@ fn gateway_main(
     gateway: Ipv4Addr,
     subnet_mask: Ipv4Addr,
     interface: &NetworkInterface,
-    mut udp_channel: SocksChannel,
+    mut udp_channel: Socks5Channel<UdpSocks5Data>,
 ) {
     let config = Config {
         write_buffer_size: 4096,
@@ -157,7 +157,7 @@ fn main() {
 
     info!("start gatewaysocks on {}({}) ...", gateway, subnet_mask);
 
-    let (udp_channel, channel_udp) = socks_channel();
+    let (udp_channel, channel_udp) = socks5_channel();
     start_socks5(socks5, channel_udp);
     gateway_main(mac, gateway, subnet_mask, &interface, udp_channel);
 }

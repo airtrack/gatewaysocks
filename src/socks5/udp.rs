@@ -12,11 +12,17 @@ use tokio::sync::mpsc::{error::SendError, unbounded_channel, UnboundedReceiver, 
 use tokio::sync::watch::{self, Receiver, Sender};
 use tokio::time::{interval, Interval};
 
-use super::{Handshaker, SocksChannel, SocksData};
+use super::{Handshaker, Socks5Channel};
+
+pub struct UdpSocks5Data {
+    pub key: String,
+    pub data: Vec<u8>,
+    pub addr: SocketAddrV4,
+}
 
 pub struct UdpSocks5 {
     server_addr: SocketAddr,
-    channel: SocksChannel,
+    channel: Socks5Channel<UdpSocks5Data>,
     exited_tx: UnboundedSender<String>,
     exited_rx: UnboundedReceiver<String>,
     timer: Interval,
@@ -24,13 +30,13 @@ pub struct UdpSocks5 {
 }
 
 struct Client {
-    tx: UnboundedSender<SocksData>,
+    tx: UnboundedSender<UdpSocks5Data>,
     alive_time: Instant,
     shutdown: Sender<()>,
 }
 
 impl UdpSocks5 {
-    pub fn new(server_addr: SocketAddr, channel: SocksChannel) -> Self {
+    pub fn new(server_addr: SocketAddr, channel: Socks5Channel<UdpSocks5Data>) -> Self {
         let (exited_tx, exited_rx) = unbounded_channel();
         Self {
             server_addr,
@@ -89,7 +95,7 @@ impl Client {
     fn new(
         key: String,
         server_addr: SocketAddr,
-        output_tx: UnboundedSender<SocksData>,
+        output_tx: UnboundedSender<UdpSocks5Data>,
         exited_tx: UnboundedSender<String>,
     ) -> Self {
         let (tx, rx) = unbounded_channel();
@@ -117,7 +123,10 @@ impl Client {
         let _ = self.shutdown.send(());
     }
 
-    fn send_to(&mut self, packet: SocksData) -> core::result::Result<(), SendError<SocksData>> {
+    fn send_to(
+        &mut self,
+        packet: UdpSocks5Data,
+    ) -> core::result::Result<(), SendError<UdpSocks5Data>> {
         self.alive_time = Instant::now();
         self.tx.send(packet)
     }
@@ -126,8 +135,8 @@ impl Client {
         key: &String,
         mut shutdown: Receiver<()>,
         server_addr: SocketAddr,
-        output_tx: UnboundedSender<SocksData>,
-        input_rx: UnboundedReceiver<SocksData>,
+        output_tx: UnboundedSender<UdpSocks5Data>,
+        input_rx: UnboundedReceiver<UdpSocks5Data>,
     ) -> Result<()> {
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
         let local_addr = socket.local_addr()?;
@@ -170,7 +179,7 @@ impl Client {
     async fn send_to_socks5(
         key: String,
         mut shutdown: Receiver<()>,
-        mut input_rx: UnboundedReceiver<SocksData>,
+        mut input_rx: UnboundedReceiver<UdpSocks5Data>,
         udp_socket: Arc<UdpSocket>,
         relay_addr: SocketAddr,
     ) {
@@ -204,7 +213,7 @@ impl Client {
     async fn receive_from_socks5(
         key: String,
         mut shutdown: Receiver<()>,
-        output_tx: UnboundedSender<SocksData>,
+        output_tx: UnboundedSender<UdpSocks5Data>,
         udp_socket: Arc<UdpSocket>,
     ) {
         info!("start UDP socks5 recv task {}", key);
@@ -224,7 +233,7 @@ impl Client {
                             let mut data = Vec::with_capacity(n - 10);
                             data.extend_from_slice(&buffer[10..n]);
 
-                            let _ = output_tx.send(SocksData {
+                            let _ = output_tx.send(UdpSocks5Data {
                                 key: key.clone(),
                                 data,
                                 addr: SocketAddrV4::new(ip, port),
