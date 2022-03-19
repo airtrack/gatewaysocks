@@ -61,6 +61,7 @@ fn handle_tcp_from_gateway(
     if let Some(data) = tcp_data {
         let _ = tcp_channel.tx.send(match data {
             TcpLayerPacket::Connect(v) => TcpSocks5Data::Connect(v),
+            TcpLayerPacket::Established(v) => TcpSocks5Data::Established(v),
             TcpLayerPacket::Push(v) => TcpSocks5Data::Push(v),
             TcpLayerPacket::Shutdown(v) => TcpSocks5Data::Shutdown(v),
             TcpLayerPacket::Close(v) => TcpSocks5Data::Close(v),
@@ -95,6 +96,7 @@ fn handle_tcp_from_socks5(
             Ok(data) => {
                 let tcp_data = match data {
                     TcpSocks5Data::Connect(v) => TcpLayerPacket::Connect(v),
+                    TcpSocks5Data::Established(v) => TcpLayerPacket::Established(v),
                     TcpSocks5Data::Push(v) => TcpLayerPacket::Push(v),
                     TcpSocks5Data::Shutdown(v) => TcpLayerPacket::Shutdown(v),
                     TcpSocks5Data::Close(v) => TcpLayerPacket::Close(v),

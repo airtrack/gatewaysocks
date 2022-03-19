@@ -8,9 +8,10 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 pub mod tcp;
 pub mod udp;
 
-pub(crate) const ATYP_IPV4: u8 = 1;
+const ATYP_IPV4: u8 = 1;
 const VER: u8 = 5;
 const NO_AUTH: u8 = 0;
+const CMD_CONNECT: u8 = 1;
 const CMD_UDP_ASSOCIATE: u8 = 3;
 
 pub struct Socks5Channel<T> {
@@ -27,13 +28,13 @@ pub fn socks5_channel<T>() -> (Socks5Channel<T>, Socks5Channel<T>) {
     )
 }
 
-pub(crate) struct Handshaker {
+struct Handshaker {
     server: SocketAddr,
     stream: TcpStream,
 }
 
 impl Handshaker {
-    pub(crate) async fn new(server: SocketAddr) -> Result<Self> {
+    async fn new(server: SocketAddr) -> Result<Self> {
         let stream = TcpStream::connect(server).await?;
         let mut handshaker = Self { server, stream };
 
@@ -41,11 +42,15 @@ impl Handshaker {
         Ok(handshaker)
     }
 
-    pub(crate) fn into_tcp_stream(self) -> TcpStream {
+    fn into_tcp_stream(self) -> TcpStream {
         self.stream
     }
 
-    pub(crate) async fn udp_associate(&mut self, local_addr: SocketAddr) -> Result<SocketAddr> {
+    async fn connect(&mut self, destination: SocketAddr) -> Result<SocketAddr> {
+        self.handshake(destination, CMD_CONNECT).await
+    }
+
+    async fn udp_associate(&mut self, local_addr: SocketAddr) -> Result<SocketAddr> {
         let addr = self.handshake(local_addr, CMD_UDP_ASSOCIATE).await?;
         Ok(SocketAddr::new(self.server.ip(), addr.port()))
     }

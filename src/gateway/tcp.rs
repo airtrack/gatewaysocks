@@ -15,6 +15,7 @@ pub struct TcpProcessor {
 
 pub enum TcpLayerPacket {
     Connect((String, SocketAddrV4)),
+    Established(String),
     Push((String, Vec<u8>)),
     Shutdown(String),
     Close(String),
