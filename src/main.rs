@@ -86,6 +86,26 @@ fn handle_udp_from_gateway(
     }
 }
 
+fn handle_ipv4_from_gateway(
+    ethernet_packet: &EthernetPacket,
+    tcp_processor: &mut TcpProcessor,
+    udp_processor: &mut UdpProcessor,
+    tcp_channel: &Socks5Channel<TcpSocks5Data>,
+    udp_channel: &Socks5Channel<UdpSocks5Data>,
+) {
+    if let Some(ipv4_packet) = Ipv4Packet::new(ethernet_packet.payload()) {
+        match ipv4_packet.get_next_level_protocol() {
+            IpNextHeaderProtocols::Tcp => {
+                handle_tcp_from_gateway(tcp_processor, tcp_channel, ethernet_packet, &ipv4_packet);
+            }
+            IpNextHeaderProtocols::Udp => {
+                handle_udp_from_gateway(udp_processor, udp_channel, ethernet_packet, &ipv4_packet);
+            }
+            _ => {}
+        }
+    }
+}
+
 fn handle_tcp_from_socks5(
     tcp_processor: &TcpProcessor,
     tcp_channel: &mut Socks5Channel<TcpSocks5Data>,
@@ -141,7 +161,7 @@ fn gateway_main(
     let config = Config {
         write_buffer_size: 4096,
         read_buffer_size: 4096,
-        read_timeout: Some(Duration::from_millis(10)),
+        read_timeout: Some(Duration::from_millis(1)),
         write_timeout: None,
         channel_type: datalink::ChannelType::Layer2,
         bpf_fd_attempts: 1000,
@@ -165,27 +185,13 @@ fn gateway_main(
                 let ethernet_packet = EthernetPacket::new(packet).unwrap();
                 match ethernet_packet.get_ethertype() {
                     EtherTypes::Ipv4 => {
-                        if let Some(ipv4_packet) = Ipv4Packet::new(ethernet_packet.payload()) {
-                            match ipv4_packet.get_next_level_protocol() {
-                                IpNextHeaderProtocols::Udp => {
-                                    handle_udp_from_gateway(
-                                        &mut udp_processor,
-                                        &udp_channel,
-                                        &ethernet_packet,
-                                        &ipv4_packet,
-                                    );
-                                }
-                                IpNextHeaderProtocols::Tcp => {
-                                    handle_tcp_from_gateway(
-                                        &mut tcp_processor,
-                                        &tcp_channel,
-                                        &ethernet_packet,
-                                        &ipv4_packet,
-                                    );
-                                }
-                                _ => {}
-                            }
-                        }
+                        handle_ipv4_from_gateway(
+                            &ethernet_packet,
+                            &mut tcp_processor,
+                            &mut udp_processor,
+                            &tcp_channel,
+                            &udp_channel,
+                        );
                     }
                     EtherTypes::Arp => arp_handler.handle_packet(&mut tx, &ethernet_packet),
                     _ => {}
