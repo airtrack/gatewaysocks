@@ -51,12 +51,13 @@ fn start_socks5(
 }
 
 fn handle_tcp_from_gateway(
+    tx: &mut Box<dyn DataLinkSender>,
     tcp_processor: &mut TcpProcessor,
     tcp_channel: &Socks5Channel<TcpSocks5Data>,
     ethernet_packet: &EthernetPacket,
     ipv4_packet: &Ipv4Packet,
 ) {
-    let tcp_data = tcp_processor.handle_input_packet(ethernet_packet.get_source(), ipv4_packet);
+    let tcp_data = tcp_processor.handle_input_packet(tx, ethernet_packet.get_source(), ipv4_packet);
 
     if let Some(data) = tcp_data {
         let _ = tcp_channel.tx.send(match data {
@@ -88,6 +89,7 @@ fn handle_udp_from_gateway(
 
 fn handle_ipv4_from_gateway(
     ethernet_packet: &EthernetPacket,
+    tx: &mut Box<dyn DataLinkSender>,
     tcp_processor: &mut TcpProcessor,
     udp_processor: &mut UdpProcessor,
     tcp_channel: &Socks5Channel<TcpSocks5Data>,
@@ -96,7 +98,13 @@ fn handle_ipv4_from_gateway(
     if let Some(ipv4_packet) = Ipv4Packet::new(ethernet_packet.payload()) {
         match ipv4_packet.get_next_level_protocol() {
             IpNextHeaderProtocols::Tcp => {
-                handle_tcp_from_gateway(tcp_processor, tcp_channel, ethernet_packet, &ipv4_packet);
+                handle_tcp_from_gateway(
+                    tx,
+                    tcp_processor,
+                    tcp_channel,
+                    ethernet_packet,
+                    &ipv4_packet,
+                );
             }
             IpNextHeaderProtocols::Udp => {
                 handle_udp_from_gateway(udp_processor, udp_channel, ethernet_packet, &ipv4_packet);
@@ -107,7 +115,7 @@ fn handle_ipv4_from_gateway(
 }
 
 fn handle_tcp_from_socks5(
-    tcp_processor: &TcpProcessor,
+    tcp_processor: &mut TcpProcessor,
     tcp_channel: &mut Socks5Channel<TcpSocks5Data>,
     tx: &mut Box<dyn DataLinkSender>,
 ) {
@@ -121,7 +129,7 @@ fn handle_tcp_from_socks5(
                     TcpSocks5Data::Shutdown(v) => TcpLayerPacket::Shutdown(v),
                     TcpSocks5Data::Close(v) => TcpLayerPacket::Close(v),
                 };
-                tcp_processor.handle_output_packet(tx, &tcp_data);
+                tcp_processor.handle_output_packet(tx, tcp_data);
             }
             Err(TryRecvError::Empty) => break,
             Err(_) => {}
@@ -142,7 +150,7 @@ fn handle_udp_from_socks5(
                     data: data.data,
                     addr: data.addr,
                 };
-                udp_processor.handle_output_packet(tx, &udp_data);
+                udp_processor.handle_output_packet(tx, udp_data);
             }
             Err(TryRecvError::Empty) => break,
             Err(_) => {}
@@ -187,6 +195,7 @@ fn gateway_main(
                     EtherTypes::Ipv4 => {
                         handle_ipv4_from_gateway(
                             &ethernet_packet,
+                            &mut tx,
                             &mut tcp_processor,
                             &mut udp_processor,
                             &tcp_channel,
@@ -200,7 +209,7 @@ fn gateway_main(
             Err(_) => {}
         }
 
-        handle_tcp_from_socks5(&tcp_processor, &mut tcp_channel, &mut tx);
+        handle_tcp_from_socks5(&mut tcp_processor, &mut tcp_channel, &mut tx);
         handle_udp_from_socks5(&udp_processor, &mut udp_channel, &mut tx);
     }
 }

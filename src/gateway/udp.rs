@@ -74,7 +74,7 @@ impl UdpProcessor {
         None
     }
 
-    pub fn handle_output_packet(&self, tx: &mut Box<dyn DataLinkSender>, packet: &UdpLayerPacket) {
+    pub fn handle_output_packet(&self, tx: &mut Box<dyn DataLinkSender>, packet: UdpLayerPacket) {
         if let Some(slot) = self.slots.get(&packet.key) {
             let udp_packet_len = 8 + packet.data.len();
             let mut udp_buffer = vec![0u8; udp_packet_len];
