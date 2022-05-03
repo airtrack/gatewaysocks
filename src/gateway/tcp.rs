@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::Instant;
 
@@ -7,7 +7,9 @@ use pnet::datalink::DataLinkSender;
 use pnet::packet::ethernet::{EtherTypes, MutableEthernetPacket};
 use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::packet::ipv4::{self, Ipv4Packet, MutableIpv4Packet};
-use pnet::packet::tcp::{self, MutableTcpPacket, TcpFlags, TcpOption, TcpOptionNumbers, TcpPacket};
+use pnet::packet::tcp::{
+    self, MutableTcpPacket, TcpFlags, TcpOption, TcpOptionNumbers, TcpOptionPacket, TcpPacket,
+};
 use pnet::packet::Packet;
 use pnet::util::MacAddr;
 
@@ -134,6 +136,11 @@ impl LayerHandler {
         self.connect = true;
         Some(TcpLayerPacket::Connect((self.key.clone(), self.dst_addr)))
     }
+
+    fn handle_recv(&self, data: Vec<u8>) -> Option<TcpLayerPacket> {
+        info!("{}: recv data size: {}", self.key, data.len());
+        Some(TcpLayerPacket::Push((self.key.clone(), data)))
+    }
 }
 
 enum State {
@@ -162,6 +169,9 @@ struct Connection {
     src_addr: SocketAddrV4,
     dst_addr: SocketAddrV4,
 
+    recv_buffer: VecDeque<u8>,
+    recv_ranges: VecDeque<(u32, u32)>,
+
     seq: u32,
     ack: u32,
     local_window: u32,
@@ -181,6 +191,11 @@ impl Connection {
         src_addr: SocketAddrV4,
         dst_addr: SocketAddrV4,
     ) -> Self {
+        let mut recv_buffer = VecDeque::new();
+        recv_buffer.resize(LOCAL_WINDOW as usize, 0);
+
+        let recv_ranges = VecDeque::new();
+
         Self {
             handler: LayerHandler::new(key.clone(), dst_addr),
             key,
@@ -190,6 +205,8 @@ impl Connection {
             src_mac,
             src_addr,
             dst_addr,
+            recv_buffer,
+            recv_ranges,
             seq: 0,
             ack: 0,
             local_window: LOCAL_WINDOW,
@@ -222,23 +239,22 @@ impl Connection {
     fn heartbeat(&mut self, _tx: &mut Box<dyn DataLinkSender>) {}
 
     fn connected(&mut self, tx: &mut Box<dyn DataLinkSender>) {
-        info!("{}: connected, change state to SynRcvd", self.key);
         let mut opts = Vec::new();
         let mut opts_size = 0;
         let payload = [0u8; 0];
 
         opts.push(TcpOption::mss(self.mss));
-        opts_size = opts_size + 4;
+        opts_size += 4;
 
         opts.push(TcpOption::wscale(self.wscale));
         opts.push(TcpOption::nop());
-        opts_size = opts_size + 4;
+        opts_size += 4;
 
         opts.push(TcpOption::sack_perm());
-        opts_size = opts_size + 2;
+        opts_size += 2;
 
         opts.push(TcpOption::timestamp(self.timestamp(), self.remote_ts));
-        opts_size = opts_size + 10;
+        opts_size += 10;
 
         self.send_tcp_packet(
             tx,
@@ -247,11 +263,14 @@ impl Connection {
             opts_size,
             &payload,
         );
-        self.seq = self.seq + 1;
+        self.seq += 1;
         self.state = State::SynRcvd;
+        info!("{}: connected, change state to SynRcvd", self.key);
     }
 
-    fn push(&mut self, _data: Vec<u8>, _tx: &mut Box<dyn DataLinkSender>) {}
+    fn push(&mut self, data: Vec<u8>, _tx: &mut Box<dyn DataLinkSender>) {
+        info!("{}: send data size: {}", self.key, data.len());
+    }
 
     fn shutdown(&mut self, _tx: &mut Box<dyn DataLinkSender>) {}
 
@@ -263,9 +282,9 @@ impl Connection {
         _tx: &mut Box<dyn DataLinkSender>,
     ) -> Option<TcpLayerPacket> {
         if request.get_flags() & TcpFlags::SYN != 0 {
-            info!("{}: tcp SYN", self.key);
+            info!("{}: tcp SYN, ISN: {}", self.key, request.get_sequence());
             self.ack = request.get_sequence() + 1;
-            self.remote_window = request.get_window() as u32;
+            self.update_remote_window(request);
 
             for opt in request.get_options_iter() {
                 match opt.get_number() {
@@ -284,13 +303,11 @@ impl Connection {
                         info!("tcp window scale: {}", self.wscale);
 
                         self.wscale = std::cmp::min(self.wscale, 14);
-                        self.remote_window = self.remote_window << self.wscale;
+                        self.update_remote_window(request);
                         info!("tcp window size: {}", self.remote_window);
                     }
                     TcpOptionNumbers::TIMESTAMPS => {
-                        let mut payload = [0u8; 4];
-                        payload.copy_from_slice(&opt.payload()[0..4]);
-                        self.remote_ts = u32::from_be_bytes(payload);
+                        self.update_remote_ts(&opt);
                         info!("tcp remote ts: {}", self.remote_ts);
                     }
                     TcpOptionNumbers::NOP | TcpOptionNumbers::EOL => {}
@@ -328,7 +345,7 @@ impl Connection {
     fn state_estab(
         &mut self,
         request: &TcpPacket,
-        _tx: &mut Box<dyn DataLinkSender>,
+        tx: &mut Box<dyn DataLinkSender>,
     ) -> Option<TcpLayerPacket> {
         info!(
             "{}: recv packet at state Estab, flags: {:b}, payload size: {}",
@@ -336,7 +353,18 @@ impl Connection {
             request.get_flags(),
             request.payload().len()
         );
-        None
+
+        for opt in request.get_options_iter() {
+            match opt.get_number() {
+                TcpOptionNumbers::TIMESTAMPS => {
+                    self.update_remote_ts(&opt);
+                }
+                _ => {}
+            }
+        }
+
+        self.update_remote_window(request);
+        self.process_payload(request, tx)
     }
 
     fn state_fin_wait1(
@@ -385,6 +413,17 @@ impl Connection {
         _tx: &mut Box<dyn DataLinkSender>,
     ) -> Option<TcpLayerPacket> {
         None
+    }
+
+    fn update_remote_window(&mut self, request: &TcpPacket) {
+        self.remote_window = request.get_window() as u32;
+        self.remote_window <<= self.wscale;
+    }
+
+    fn update_remote_ts(&mut self, opt: &TcpOptionPacket) {
+        let mut payload = [0u8; 4];
+        payload.copy_from_slice(&opt.payload()[0..4]);
+        self.remote_ts = u32::from_be_bytes(payload);
     }
 
     fn timestamp(&self) -> u32 {
@@ -453,5 +492,151 @@ impl Connection {
         ethernet_packet.set_payload(ipv4_packet.packet());
 
         tx.send_to(ethernet_packet.packet(), None);
+    }
+
+    fn acknowledge(&mut self, seq_range: (u32, u32), tx: &mut Box<dyn DataLinkSender>) {
+        let mut opts = Vec::new();
+        let mut opts_size = 0;
+        let payload = [0u8; 0];
+
+        opts.push(TcpOption::timestamp(self.timestamp(), self.remote_ts));
+        opts_size += 10;
+
+        let mut blocks = 3;
+        let mut acks = Vec::new();
+        if ((self.ack - seq_range.0) as i32) < 0 {
+            acks.push(seq_range.0);
+            acks.push(seq_range.1);
+            blocks -= 1;
+        }
+        for range in &self.recv_ranges {
+            if blocks == 0 {
+                break;
+            }
+            acks.push(range.0);
+            acks.push(range.1);
+            blocks -= 1;
+        }
+
+        opts.push(TcpOption::selective_ack(&acks));
+        opts_size += 2 + 4 * acks.len();
+
+        self.send_tcp_packet(tx, TcpFlags::ACK, &opts, opts_size, &payload);
+        info!("{}: acknowledge ack: {}", self.key, self.ack);
+    }
+
+    fn process_payload(
+        &mut self,
+        request: &TcpPacket,
+        tx: &mut Box<dyn DataLinkSender>,
+    ) -> Option<TcpLayerPacket> {
+        let payload = request.payload();
+        if payload.len() == 0 {
+            return None;
+        }
+
+        let seq = request.get_sequence();
+        let range = (seq, seq + payload.len() as u32);
+        let window = (self.ack, self.ack + self.local_window);
+
+        let range_left = ((range.0 - window.0) as i32, (range.1 - window.0) as i32);
+        let range_right = ((range.0 - window.1) as i32, (range.1 - window.1) as i32);
+        if range_left.1 <= 0 || range_right.0 >= 0 {
+            return None;
+        }
+
+        let mut data_index = 0usize;
+        let mut data_len = payload.len();
+        if range_left.0 < 0 {
+            data_index = range_left.0.abs() as usize;
+            data_len -= data_index;
+        }
+
+        if range_right.1 > 0 {
+            data_len -= range_right.1 as usize;
+        }
+
+        let buffer_index = if range_left.0 > 0 {
+            range_left.0 as usize
+        } else {
+            0usize
+        };
+
+        self.copy_to_recv_buffer(buffer_index, &payload[data_index..data_index + data_len]);
+
+        let seq_range = (
+            seq + data_index as u32,
+            seq + data_index as u32 + data_len as u32,
+        );
+        self.update_recv_ranges(seq_range);
+
+        let result = self.handle_recv_buffer();
+        self.acknowledge(seq_range, tx);
+        result
+    }
+
+    fn copy_to_recv_buffer(&mut self, mut index: usize, buffer: &[u8]) {
+        let slices = self.recv_buffer.as_mut_slices();
+
+        let mut consumed = 0usize;
+        let mut remain = buffer.len();
+        if index < slices.0.len() {
+            let len = std::cmp::min(slices.0.len() - index, remain);
+            slices.0[index..index + len].copy_from_slice(&buffer[0..len]);
+
+            index += len;
+            remain -= len;
+            consumed = len;
+        }
+
+        if remain == 0 {
+            return;
+        }
+
+        index -= slices.0.len();
+        let len = std::cmp::min(slices.1.len() - index, remain);
+        slices.1[index..index + len].copy_from_slice(&buffer[consumed..consumed + len]);
+    }
+
+    fn update_recv_ranges(&mut self, seq_range: (u32, u32)) {
+        for index in 0..self.recv_ranges.len() {
+            let diff = (seq_range.0 - self.recv_ranges[index].0) as i32;
+            if diff < 0 {
+                self.recv_ranges.insert(index, seq_range);
+                return;
+            }
+        }
+
+        self.recv_ranges.push_back(seq_range);
+    }
+
+    fn handle_recv_buffer(&mut self) -> Option<TcpLayerPacket> {
+        let mut range = self.recv_ranges.front().unwrap().clone();
+        if self.ack != range.0 {
+            return None;
+        }
+
+        loop {
+            self.recv_ranges.pop_front();
+            if self.recv_ranges.is_empty() {
+                break;
+            }
+
+            let front = self.recv_ranges.front().unwrap().clone();
+            if ((front.0 - range.1) as i32) > 0 {
+                break;
+            }
+
+            if ((front.1 - range.1) as i32) > 0 {
+                range.1 = front.1;
+            }
+        }
+
+        self.ack = range.1;
+
+        let len = (range.1 - range.0) as usize;
+        let data = self.recv_buffer.drain(0..len).collect();
+        self.recv_buffer.resize(self.local_window as usize, 0);
+        self.handler.handle_recv(data)
     }
 }
