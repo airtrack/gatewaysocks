@@ -117,6 +117,7 @@ struct LayerHandler {
     key: String,
     dst_addr: SocketAddrV4,
     connect: bool,
+    shutdown: bool,
 }
 
 impl LayerHandler {
@@ -125,6 +126,7 @@ impl LayerHandler {
             key,
             dst_addr,
             connect: false,
+            shutdown: false,
         }
     }
 
@@ -141,8 +143,22 @@ impl LayerHandler {
         info!("{}: recv data size: {}", self.key, data.len());
         Some(TcpLayerPacket::Push((self.key.clone(), data)))
     }
+
+    fn handle_recv_fin(&mut self) -> Option<TcpLayerPacket> {
+        if self.shutdown {
+            return None;
+        }
+
+        self.shutdown = true;
+        Some(TcpLayerPacket::Shutdown(self.key.clone()))
+    }
+
+    fn handle_reset(&self) -> Option<TcpLayerPacket> {
+        Some(TcpLayerPacket::Close(self.key.clone()))
+    }
 }
 
+#[derive(PartialEq)]
 enum State {
     Listen,
     SynRcvd,
@@ -151,7 +167,7 @@ enum State {
     _FinWait2,
     _Closing,
     _TimeWait,
-    _CloseWait,
+    CloseWait,
     _LastAck,
 }
 
@@ -257,7 +273,7 @@ impl Connection {
             State::_FinWait2 => self.state_fin_wait2(request, tx),
             State::_Closing => self.state_closing(request, tx),
             State::_TimeWait => self.state_time_wait(request, tx),
-            State::_CloseWait => self.state_close_wait(request, tx),
+            State::CloseWait => self.state_close_wait(request, tx),
             State::_LastAck => self.state_last_ack(request, tx),
         }
     }
@@ -272,7 +288,7 @@ impl Connection {
 
     fn push(&mut self, mut data: Vec<u8>, tx: &mut Box<dyn DataLinkSender>) {
         info!("{}: send data size: {}", self.key, data.len());
-        if !self.pending_buffer.is_empty() {
+        if self.state != State::Estab || !self.pending_buffer.is_empty() {
             self.pending_buffer.push_back(data);
             return;
         }
@@ -393,6 +409,18 @@ impl Connection {
         }
 
         self.update_remote_window(request);
+        self.process_acknowledgement(request);
+
+        if request.get_flags() & TcpFlags::FIN != 0 {
+            if request.get_sequence() == self.ack {
+                info!("{}: recv FIN, change state to CloseWait", self.key);
+                return self.process_fin(request, tx);
+            }
+        } else if request.get_flags() & TcpFlags::RST != 0 {
+            info!("{}: recv RST", self.key);
+            return self.process_reset();
+        }
+
         self.process_payload(request, tx)
     }
 
@@ -430,9 +458,14 @@ impl Connection {
 
     fn state_close_wait(
         &mut self,
-        _request: &TcpPacket,
-        _tx: &mut Box<dyn DataLinkSender>,
+        request: &TcpPacket,
+        tx: &mut Box<dyn DataLinkSender>,
     ) -> Option<TcpLayerPacket> {
+        if request.get_flags() & TcpFlags::FIN != 0 {
+            return self.process_fin(request, tx);
+        } else if request.get_flags() & TcpFlags::RST != 0 {
+            return self.process_reset();
+        }
         None
     }
 
@@ -496,7 +529,11 @@ impl Connection {
         );
     }
 
-    fn send_tcp_acknowledge_packet(&self, seq_range: (u32, u32), tx: &mut Box<dyn DataLinkSender>) {
+    fn send_tcp_acknowledge_packet(
+        &self,
+        seq_range: Option<(u32, u32)>,
+        tx: &mut Box<dyn DataLinkSender>,
+    ) {
         let mut opts = Vec::new();
         let mut opts_size = 0;
         let payload = [0u8; 0];
@@ -506,10 +543,12 @@ impl Connection {
 
         let mut blocks = 3;
         let mut acks = Vec::new();
-        if ((self.ack - seq_range.0) as i32) < 0 {
-            acks.push(seq_range.0);
-            acks.push(seq_range.1);
-            blocks -= 1;
+        if let Some(seq_range) = seq_range {
+            if ((self.ack - seq_range.0) as i32) < 0 {
+                acks.push(seq_range.0);
+                acks.push(seq_range.1);
+                blocks -= 1;
+            }
         }
         for range in &self.recv_ranges {
             if blocks == 0 {
@@ -637,6 +676,29 @@ impl Connection {
         tx.send_to(ethernet_packet.packet(), None);
     }
 
+    fn process_acknowledgement(&mut self, request: &TcpPacket) {
+        let ack = request.get_acknowledgement();
+
+        while !self.send_buffer.is_empty() {
+            let front = self.send_buffer.front_mut().unwrap();
+            let begin_seq = front.seq;
+            let end_seq = begin_seq + front.data.len() as u32;
+
+            if ((begin_seq - ack) as i32) >= 0 {
+                break;
+            }
+
+            if ((end_seq - ack) as i32) <= 0 {
+                self.send_buffer.pop_front();
+                continue;
+            }
+
+            let len = (ack - begin_seq) as usize;
+            front.data.drain(0..len);
+            front.seq = ack;
+        }
+    }
+
     fn process_payload(
         &mut self,
         request: &TcpPacket,
@@ -683,8 +745,23 @@ impl Connection {
         self.update_recv_ranges(seq_range);
 
         let result = self.handle_recv_buffer();
-        self.send_tcp_acknowledge_packet(seq_range, tx);
+        self.send_tcp_acknowledge_packet(Some(seq_range), tx);
         result
+    }
+
+    fn process_fin(
+        &mut self,
+        request: &TcpPacket,
+        tx: &mut Box<dyn DataLinkSender>,
+    ) -> Option<TcpLayerPacket> {
+        self.ack = request.get_sequence() + 1;
+        self.send_tcp_acknowledge_packet(None, tx);
+        self.state = State::CloseWait;
+        self.handler.handle_recv_fin()
+    }
+
+    fn process_reset(&self) -> Option<TcpLayerPacket> {
+        self.handler.handle_reset()
     }
 
     fn copy_to_recv_buffer(&mut self, mut index: usize, buffer: &[u8]) {
