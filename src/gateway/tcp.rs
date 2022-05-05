@@ -155,7 +155,24 @@ enum State {
     _LastAck,
 }
 
+struct SendingData {
+    _send_time: Instant,
+    seq: u32,
+    data: Vec<u8>,
+}
+
+impl SendingData {
+    fn new(seq: u32, data: Vec<u8>) -> Self {
+        Self {
+            _send_time: Instant::now(),
+            seq,
+            data,
+        }
+    }
+}
+
 const LOCAL_WINDOW: u32 = 2 * 1024 * 1024;
+const MAX_TCP_HEADER_LEN: usize = 60;
 
 struct Connection {
     handler: LayerHandler,
@@ -171,6 +188,10 @@ struct Connection {
 
     recv_buffer: VecDeque<u8>,
     recv_ranges: VecDeque<(u32, u32)>,
+
+    send_buffer_size: usize,
+    send_buffer: VecDeque<SendingData>,
+    pending_buffer: VecDeque<Vec<u8>>,
 
     seq: u32,
     ack: u32,
@@ -195,6 +216,8 @@ impl Connection {
         recv_buffer.resize(LOCAL_WINDOW as usize, 0);
 
         let recv_ranges = VecDeque::new();
+        let send_buffer = VecDeque::new();
+        let pending_buffer = VecDeque::new();
 
         Self {
             handler: LayerHandler::new(key.clone(), dst_addr),
@@ -207,6 +230,9 @@ impl Connection {
             dst_addr,
             recv_buffer,
             recv_ranges,
+            send_buffer_size: 0,
+            send_buffer,
+            pending_buffer,
             seq: 0,
             ack: 0,
             local_window: LOCAL_WINDOW,
@@ -239,37 +265,33 @@ impl Connection {
     fn heartbeat(&mut self, _tx: &mut Box<dyn DataLinkSender>) {}
 
     fn connected(&mut self, tx: &mut Box<dyn DataLinkSender>) {
-        let mut opts = Vec::new();
-        let mut opts_size = 0;
-        let payload = [0u8; 0];
-
-        opts.push(TcpOption::mss(self.mss));
-        opts_size += 4;
-
-        opts.push(TcpOption::wscale(self.wscale));
-        opts.push(TcpOption::nop());
-        opts_size += 4;
-
-        opts.push(TcpOption::sack_perm());
-        opts_size += 2;
-
-        opts.push(TcpOption::timestamp(self.timestamp(), self.remote_ts));
-        opts_size += 10;
-
-        self.send_tcp_packet(
-            tx,
-            TcpFlags::SYN | TcpFlags::ACK,
-            &opts,
-            opts_size,
-            &payload,
-        );
-        self.seq += 1;
+        self.send_tcp_syn_ack_packet(tx);
         self.state = State::SynRcvd;
         info!("{}: connected, change state to SynRcvd", self.key);
     }
 
-    fn push(&mut self, data: Vec<u8>, _tx: &mut Box<dyn DataLinkSender>) {
+    fn push(&mut self, mut data: Vec<u8>, tx: &mut Box<dyn DataLinkSender>) {
         info!("{}: send data size: {}", self.key, data.len());
+        if !self.pending_buffer.is_empty() {
+            self.pending_buffer.push_back(data);
+            return;
+        }
+
+        let remote_window = self.remote_window as usize;
+        if self.send_buffer_size >= remote_window {
+            self.pending_buffer.push_back(data);
+            return;
+        }
+
+        if data.len() + self.send_buffer_size <= remote_window {
+            self.send_data(tx, data);
+            return;
+        }
+
+        let space = remote_window - self.send_buffer_size;
+        let pending_data = data.split_off(space);
+        self.pending_buffer.push_back(pending_data);
+        self.send_data(tx, data);
     }
 
     fn shutdown(&mut self, _tx: &mut Box<dyn DataLinkSender>) {}
@@ -326,16 +348,23 @@ impl Connection {
     fn state_syn_rcvd(
         &mut self,
         request: &TcpPacket,
-        _tx: &mut Box<dyn DataLinkSender>,
+        tx: &mut Box<dyn DataLinkSender>,
     ) -> Option<TcpLayerPacket> {
+        if request.get_flags() & TcpFlags::SYN != 0 {
+            self.send_tcp_syn_ack_packet(tx);
+        }
+
         if request.get_flags() & TcpFlags::ACK != 0 {
-            if request.get_acknowledgement() == self.seq {
+            if request.get_acknowledgement() == self.seq + 1 {
                 info!(
                     "{}: change state to Estab, payload size: {}",
                     self.key,
                     request.payload().len()
                 );
+                self.seq += 1;
                 self.state = State::Estab;
+
+                self.process_payload(request, tx);
             }
         }
 
@@ -415,6 +444,15 @@ impl Connection {
         None
     }
 
+    fn send_data(&mut self, tx: &mut Box<dyn DataLinkSender>, data: Vec<u8>) {
+        let sending_data = SendingData::new(self.seq, data);
+        self.seq += sending_data.data.len() as u32;
+        self.send_buffer_size += sending_data.data.len();
+
+        self.send_tcp_data_packet(tx, &sending_data);
+        self.send_buffer.push_back(sending_data);
+    }
+
     fn update_remote_window(&mut self, request: &TcpPacket) {
         self.remote_window = request.get_window() as u32;
         self.remote_window <<= self.wscale;
@@ -430,9 +468,114 @@ impl Connection {
         (Instant::now() - self.init_time).as_millis() as u32
     }
 
+    fn send_tcp_syn_ack_packet(&self, tx: &mut Box<dyn DataLinkSender>) {
+        let mut opts = Vec::new();
+        let mut opts_size = 0;
+        let payload = [0u8; 0];
+
+        opts.push(TcpOption::mss(self.mss));
+        opts_size += 4;
+
+        opts.push(TcpOption::wscale(self.wscale));
+        opts.push(TcpOption::nop());
+        opts_size += 4;
+
+        opts.push(TcpOption::sack_perm());
+        opts_size += 2;
+
+        opts.push(TcpOption::timestamp(self.timestamp(), self.remote_ts));
+        opts_size += 10;
+
+        self.send_tcp_packet(
+            tx,
+            self.seq,
+            TcpFlags::SYN | TcpFlags::ACK,
+            &opts,
+            opts_size,
+            &payload,
+        );
+    }
+
+    fn send_tcp_acknowledge_packet(&self, seq_range: (u32, u32), tx: &mut Box<dyn DataLinkSender>) {
+        let mut opts = Vec::new();
+        let mut opts_size = 0;
+        let payload = [0u8; 0];
+
+        opts.push(TcpOption::timestamp(self.timestamp(), self.remote_ts));
+        opts_size += 10;
+
+        let mut blocks = 3;
+        let mut acks = Vec::new();
+        if ((self.ack - seq_range.0) as i32) < 0 {
+            acks.push(seq_range.0);
+            acks.push(seq_range.1);
+            blocks -= 1;
+        }
+        for range in &self.recv_ranges {
+            if blocks == 0 {
+                break;
+            }
+            acks.push(range.0);
+            acks.push(range.1);
+            blocks -= 1;
+        }
+
+        opts.push(TcpOption::selective_ack(&acks));
+        opts_size += 2 + 4 * acks.len();
+
+        self.send_tcp_packet(tx, self.seq, TcpFlags::ACK, &opts, opts_size, &payload);
+        info!("{}: send acknowledge ack: {}", self.key, self.ack);
+    }
+
+    fn send_tcp_data_packet(&self, tx: &mut Box<dyn DataLinkSender>, data: &SendingData) {
+        let mut opts = Vec::new();
+        let mut opts_size = 0;
+
+        opts.push(TcpOption::timestamp(self.timestamp(), self.remote_ts));
+        opts_size += 10;
+
+        let mut blocks = 3;
+        let mut acks = Vec::new();
+        for range in &self.recv_ranges {
+            if blocks == 0 {
+                break;
+            }
+            acks.push(range.0);
+            acks.push(range.1);
+            blocks -= 1;
+        }
+
+        opts.push(TcpOption::selective_ack(&acks));
+        opts_size += 2 + 4 * acks.len();
+
+        let mut index = 0;
+        let mut seq = data.seq;
+        let mut len = data.data.len();
+        let max_payload_len = self.mss as usize - MAX_TCP_HEADER_LEN;
+
+        while len > 0 {
+            let payload_len = std::cmp::min(len, max_payload_len);
+            let payload = &data.data[index..index + payload_len];
+
+            self.send_tcp_packet(
+                tx,
+                seq,
+                TcpFlags::ACK | TcpFlags::PSH,
+                &opts,
+                opts_size,
+                payload,
+            );
+
+            index += payload_len;
+            seq += payload_len as u32;
+            len -= payload_len;
+        }
+    }
+
     fn send_tcp_packet(
         &self,
         tx: &mut Box<dyn DataLinkSender>,
+        seq: u32,
         flags: u16,
         opts: &[TcpOption],
         opts_size: usize,
@@ -444,7 +587,7 @@ impl Connection {
 
         tcp_packet.set_source(self.dst_addr.port());
         tcp_packet.set_destination(self.src_addr.port());
-        tcp_packet.set_sequence(self.seq);
+        tcp_packet.set_sequence(seq);
         tcp_packet.set_acknowledgement(self.ack);
         tcp_packet.set_data_offset(((20 + opts_size) / 4) as u8);
         tcp_packet.set_reserved(0);
@@ -494,44 +637,13 @@ impl Connection {
         tx.send_to(ethernet_packet.packet(), None);
     }
 
-    fn acknowledge(&mut self, seq_range: (u32, u32), tx: &mut Box<dyn DataLinkSender>) {
-        let mut opts = Vec::new();
-        let mut opts_size = 0;
-        let payload = [0u8; 0];
-
-        opts.push(TcpOption::timestamp(self.timestamp(), self.remote_ts));
-        opts_size += 10;
-
-        let mut blocks = 3;
-        let mut acks = Vec::new();
-        if ((self.ack - seq_range.0) as i32) < 0 {
-            acks.push(seq_range.0);
-            acks.push(seq_range.1);
-            blocks -= 1;
-        }
-        for range in &self.recv_ranges {
-            if blocks == 0 {
-                break;
-            }
-            acks.push(range.0);
-            acks.push(range.1);
-            blocks -= 1;
-        }
-
-        opts.push(TcpOption::selective_ack(&acks));
-        opts_size += 2 + 4 * acks.len();
-
-        self.send_tcp_packet(tx, TcpFlags::ACK, &opts, opts_size, &payload);
-        info!("{}: acknowledge ack: {}", self.key, self.ack);
-    }
-
     fn process_payload(
         &mut self,
         request: &TcpPacket,
         tx: &mut Box<dyn DataLinkSender>,
     ) -> Option<TcpLayerPacket> {
         let payload = request.payload();
-        if payload.len() == 0 {
+        if payload.is_empty() {
             return None;
         }
 
@@ -571,7 +683,7 @@ impl Connection {
         self.update_recv_ranges(seq_range);
 
         let result = self.handle_recv_buffer();
-        self.acknowledge(seq_range, tx);
+        self.send_tcp_acknowledge_packet(seq_range, tx);
         result
     }
 
