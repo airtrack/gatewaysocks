@@ -299,29 +299,35 @@ impl Connection {
     }
 
     fn push(&mut self, mut data: Vec<u8>, tx: &mut Box<dyn DataLinkSender>) {
-        info!("{}: send data size: {}", self.key, data.len());
         if (self.state != State::Estab && self.state != State::CloseWait)
             || !self.pending_buffer.is_empty()
         {
+            info!("{}: pending data size: {}", self.key, data.len());
             self.pending_buffer.push_back(PendingData::Data(data));
             return;
         }
 
         let remote_window = self.remote_window as usize;
         if self.send_buffer_size >= remote_window {
+            info!("{}: pending data size: {}", self.key, data.len());
             self.pending_buffer.push_back(PendingData::Data(data));
             return;
         }
 
         if data.len() + self.send_buffer_size <= remote_window {
+            info!("{}: send data size: {}", self.key, data.len());
             self.send_data(tx, data);
             return;
         }
 
         let space = remote_window - self.send_buffer_size;
         let pending_data = data.split_off(space);
+
+        info!("{}: pending data size: {}", self.key, pending_data.len());
         self.pending_buffer
             .push_back(PendingData::Data(pending_data));
+
+        info!("{}: send data size: {}", self.key, data.len());
         self.send_data(tx, data);
     }
 
@@ -342,6 +348,7 @@ impl Connection {
             return;
         }
 
+        info!("{}: pending FIN", self.key);
         self.pending_buffer.push_back(PendingData::Fin);
     }
 
@@ -444,7 +451,7 @@ impl Connection {
         }
 
         self.update_remote_window(request);
-        self.process_acknowledgement(request);
+        self.process_acknowledgement(request, tx);
 
         if request.get_flags() & TcpFlags::FIN != 0 {
             if request.get_sequence() == self.ack {
@@ -529,7 +536,7 @@ impl Connection {
         tx: &mut Box<dyn DataLinkSender>,
     ) -> Option<TcpLayerPacket> {
         self.update_remote_window(request);
-        self.process_acknowledgement(request);
+        self.process_acknowledgement(request, tx);
 
         if request.get_flags() & TcpFlags::FIN != 0 {
             return self.process_fin(request, tx);
@@ -560,6 +567,52 @@ impl Connection {
 
         self.send_tcp_data_packet(tx, &sending_data);
         self.send_buffer.push_back(sending_data);
+    }
+
+    fn send_pending_data(&mut self, tx: &mut Box<dyn DataLinkSender>) {
+        let remote_window = self.remote_window as usize;
+        if self.send_buffer_size >= remote_window {
+            return;
+        }
+
+        let mut window = remote_window - self.send_buffer_size;
+        while !self.pending_buffer.is_empty() && window > 0 {
+            let front = self.pending_buffer.pop_front().unwrap();
+
+            match front {
+                PendingData::Data(mut data) => {
+                    let len = data.len();
+                    if len <= window {
+                        info!("{}: send pending data size: {}", self.key, data.len());
+                        self.send_data(tx, data);
+
+                        window -= len;
+                    } else {
+                        let tail = data.split_off(window);
+
+                        info!("{}: send pending data size: {}", self.key, data.len());
+                        self.send_data(tx, data);
+
+                        window = 0;
+                        self.pending_buffer.push_front(PendingData::Data(tail));
+                    }
+                }
+                PendingData::Fin => {
+                    if self.send_buffer.is_empty() {
+                        self.send_tcp_fin_packet(tx);
+
+                        match self.state {
+                            State::Estab => self.state = State::FinWait1,
+                            State::CloseWait => self.state = State::LastAck,
+                            _ => unreachable!(),
+                        }
+                    } else {
+                        self.pending_buffer.push_front(PendingData::Fin);
+                    }
+                    break;
+                }
+            }
+        }
     }
 
     fn update_remote_window(&mut self, request: &TcpPacket) {
@@ -769,7 +822,7 @@ impl Connection {
         tx.send_to(ethernet_packet.packet(), None);
     }
 
-    fn process_acknowledgement(&mut self, request: &TcpPacket) {
+    fn process_acknowledgement(&mut self, request: &TcpPacket, tx: &mut Box<dyn DataLinkSender>) {
         let ack = request.get_acknowledgement();
 
         while !self.send_buffer.is_empty() {
@@ -782,6 +835,7 @@ impl Connection {
             }
 
             if ((end_seq - ack) as i32) <= 0 {
+                self.send_buffer_size -= front.data.len();
                 self.send_buffer.pop_front();
                 continue;
             }
@@ -789,7 +843,10 @@ impl Connection {
             let len = (ack - begin_seq) as usize;
             front.data.drain(0..len);
             front.seq = ack;
+            self.send_buffer_size -= len;
         }
+
+        self.send_pending_data(tx);
     }
 
     fn process_payload(

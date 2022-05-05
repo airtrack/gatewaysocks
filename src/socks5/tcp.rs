@@ -188,8 +188,8 @@ impl Client {
                             TcpSocks5Data::Shutdown(_) => {
                                 if writer.shutdown().await.is_err() {
                                     let _ = exited_tx.send(key);
-                                    break;
                                 }
+                                break;
                             }
                             _ => {}
                         }
@@ -214,6 +214,7 @@ impl Client {
                     match result {
                         Ok(0) => {
                             let _ = output_tx.send(TcpSocks5Data::Shutdown(key.clone()));
+                            break;
                         }
                         Ok(n) => {
                             buffer.truncate(n);
