@@ -211,6 +211,8 @@ fn gateway_main(
 
         handle_tcp_from_socks5(&mut tcp_processor, &mut tcp_channel, &mut tx);
         handle_udp_from_socks5(&udp_processor, &mut udp_channel, &mut tx);
+
+        tcp_processor.heartbeat(&mut tx);
     }
 }
 
