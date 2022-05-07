@@ -55,7 +55,7 @@ impl UdpSocks5 {
                     self.clients.retain(|key, client| {
                         let timeout = client.is_timeout();
                         if timeout {
-                            trace!("timeout to stop UDP socks5 {}", key);
+                            trace!("{}: timeout to stop udp socks5", key);
                             client.shutdown();
                         }
                         !timeout
@@ -102,9 +102,9 @@ impl Client {
         let (shutdown_tx, shutdown_rx) = watch::channel(());
 
         tokio::spawn(async move {
-            info!("start UDP socks5 {}", key);
+            info!("{}: start udp socks5", key);
             let _ = Self::socks5_task(&key, shutdown_rx, server_addr, output_tx, rx).await;
-            info!("stop UDP socks5 {}", key);
+            info!("{}: stop udp socks5", key);
             let _ = exited_tx.send(key);
         });
 
@@ -183,7 +183,7 @@ impl Client {
         udp_socket: Arc<UdpSocket>,
         relay_addr: SocketAddr,
     ) {
-        trace!("start UDP socks5 send task {} -> {}", key, relay_addr);
+        trace!("{}: start udp socks5 send task to {}", key, relay_addr);
 
         loop {
             tokio::select! {
@@ -207,7 +207,7 @@ impl Client {
             }
         }
 
-        trace!("stop UDP socks5 send task {} -> {}", key, relay_addr);
+        trace!("{}: stop udp socks5 send task to {}", key, relay_addr);
     }
 
     async fn receive_from_socks5(
@@ -216,7 +216,7 @@ impl Client {
         output_tx: UnboundedSender<UdpSocks5Data>,
         udp_socket: Arc<UdpSocket>,
     ) {
-        trace!("start UDP socks5 recv task {}", key);
+        trace!("{}: start udp socks5 recv task", key);
 
         loop {
             let mut buffer = [0u8; 1500];
@@ -246,6 +246,6 @@ impl Client {
             }
         }
 
-        trace!("stop UDP socks5 recv task {}", key);
+        trace!("{}: stop udp socks5 recv task", key);
     }
 }
