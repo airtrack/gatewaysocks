@@ -208,9 +208,9 @@ fn gateway_main(
 
 fn main() {
     SimpleLogger::new()
-        .env()
         .with_utc_timestamps()
         .with_level(log::LevelFilter::Info)
+        .env()
         .init()
         .unwrap();
 

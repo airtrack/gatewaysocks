@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::Instant;
 
-use log::{error, info, trace, warn};
+use log::{error, info, trace};
 use pnet::datalink::DataLinkSender;
 use pnet::packet::ethernet::{EtherTypes, MutableEthernetPacket};
 use pnet::packet::ip::IpNextHeaderProtocols;
@@ -173,6 +173,10 @@ impl LayerHandler {
     fn handle_reset(&self, mut callback: impl FnMut(TcpLayerPacket)) {
         callback(TcpLayerPacket::Close(self.key.clone()));
     }
+
+    fn handle_close(&self, mut callback: impl FnMut(TcpLayerPacket)) {
+        callback(TcpLayerPacket::Close(self.key.clone()));
+    }
 }
 
 #[derive(PartialEq, Debug)]
@@ -317,7 +321,7 @@ impl TcpData {
     }
 }
 
-const CONNECTION_ALIVE_TIMEOUT: u128 = 30000;
+const MSL_2: u128 = 30000;
 const MAX_TCP_HEADER_LEN: usize = 60;
 const LOCAL_WINDOW: u32 = 2 * 1024 * 1024;
 const DEFAULT_RTT: u32 = 100;
@@ -363,8 +367,8 @@ impl Connection {
         self.state == State::Closed
     }
 
-    fn is_timeout(&self) -> bool {
-        (Instant::now() - self.time.alive).as_millis() > CONNECTION_ALIVE_TIMEOUT
+    fn is_timewait_timeout(&self) -> bool {
+        self.state == State::TimeWait && (Instant::now() - self.time.alive).as_millis() >= MSL_2
     }
 
     fn handle_tcp_packet(
@@ -404,10 +408,10 @@ impl Connection {
             return false;
         }
 
-        if self.is_timeout() {
-            warn!("{}: timeout close", self.key);
-            self.handler.handle_reset(callback);
-            self.close(tx);
+        if self.is_timewait_timeout() {
+            trace!("{}: TimeWait timeout", self.key);
+            self.handler.handle_close(callback);
+            self.state = State::Closed;
             return false;
         }
 
@@ -470,6 +474,10 @@ impl Connection {
     }
 
     fn shutdown(&mut self, tx: &mut Box<dyn DataLinkSender>) {
+        if self.state == State::SynRcvd {
+            return self.send_buffer.pending.push_back(PendingData::Fin);
+        }
+
         if self.state != State::Estab && self.state != State::CloseWait {
             return error!("{}: shutdown error on state: {:?}", self.key, self.state);
         }
