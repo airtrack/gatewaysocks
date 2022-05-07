@@ -4,7 +4,7 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use log::info;
+use log::{info, trace};
 
 use tokio::io::AsyncReadExt;
 use tokio::net::UdpSocket;
@@ -55,7 +55,7 @@ impl UdpSocks5 {
                     self.clients.retain(|key, client| {
                         let timeout = client.is_timeout();
                         if timeout {
-                            info!("timeout to stop UDP socks5 {}", key);
+                            trace!("timeout to stop UDP socks5 {}", key);
                             client.shutdown();
                         }
                         !timeout
@@ -183,7 +183,7 @@ impl Client {
         udp_socket: Arc<UdpSocket>,
         relay_addr: SocketAddr,
     ) {
-        info!("start UDP socks5 send task {} -> {}", key, relay_addr);
+        trace!("start UDP socks5 send task {} -> {}", key, relay_addr);
 
         loop {
             tokio::select! {
@@ -207,7 +207,7 @@ impl Client {
             }
         }
 
-        info!("stop UDP socks5 send task {} -> {}", key, relay_addr);
+        trace!("stop UDP socks5 send task {} -> {}", key, relay_addr);
     }
 
     async fn receive_from_socks5(
@@ -216,7 +216,7 @@ impl Client {
         output_tx: UnboundedSender<UdpSocks5Data>,
         udp_socket: Arc<UdpSocket>,
     ) {
-        info!("start UDP socks5 recv task {}", key);
+        trace!("start UDP socks5 recv task {}", key);
 
         loop {
             let mut buffer = [0u8; 1500];
@@ -246,6 +246,6 @@ impl Client {
             }
         }
 
-        info!("stop UDP socks5 recv task {}", key);
+        trace!("stop UDP socks5 recv task {}", key);
     }
 }

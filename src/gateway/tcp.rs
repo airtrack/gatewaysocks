@@ -56,7 +56,7 @@ impl TcpProcessor {
         self.connections.retain(|key, connection| -> bool {
             let alive = connection.heartbeat(tx, &mut callback);
             if !alive {
-                info!("{}: removed by heartbeat", key);
+                info!("{}: remove tcp connection", key);
             }
             alive
         });
@@ -123,7 +123,7 @@ impl TcpProcessor {
                 if let Some(connection) = self.connections.get_mut(&key) {
                     connection.close(tx);
                     self.connections.remove(&key);
-                    info!("{}: removed by close", key);
+                    info!("{}: close to remove tcp connection", key);
                 }
             }
         }
