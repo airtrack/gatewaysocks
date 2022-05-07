@@ -60,33 +60,12 @@ fn send_tcp_data_to_socks5(tcp_channel: &Socks5Channel<TcpSocks5Data>, data: Tcp
     });
 }
 
-fn handle_tcp_from_gateway(
-    tx: &mut Box<dyn DataLinkSender>,
-    tcp_processor: &mut TcpProcessor,
-    tcp_channel: &Socks5Channel<TcpSocks5Data>,
-    ethernet_packet: &EthernetPacket,
-    ipv4_packet: &Ipv4Packet,
-) {
-    tcp_processor.handle_input_packet(tx, ethernet_packet.get_source(), ipv4_packet, |data| {
-        send_tcp_data_to_socks5(tcp_channel, data);
+fn send_udp_data_to_socks5(udp_channel: &Socks5Channel<UdpSocks5Data>, data: UdpLayerPacket) {
+    let _ = udp_channel.tx.send(UdpSocks5Data {
+        key: data.key,
+        data: data.data,
+        addr: data.addr,
     });
-}
-
-fn handle_udp_from_gateway(
-    udp_processor: &mut UdpProcessor,
-    udp_channel: &Socks5Channel<UdpSocks5Data>,
-    ethernet_packet: &EthernetPacket,
-    ipv4_packet: &Ipv4Packet,
-) {
-    let udp_data = udp_processor.handle_input_packet(ethernet_packet.get_source(), ipv4_packet);
-
-    if let Some(data) = udp_data {
-        let _ = udp_channel.tx.send(UdpSocks5Data {
-            key: data.key,
-            data: data.data,
-            addr: data.addr,
-        });
-    }
 }
 
 fn handle_ipv4_from_gateway(
@@ -100,16 +79,23 @@ fn handle_ipv4_from_gateway(
     if let Some(ipv4_packet) = Ipv4Packet::new(ethernet_packet.payload()) {
         match ipv4_packet.get_next_level_protocol() {
             IpNextHeaderProtocols::Tcp => {
-                handle_tcp_from_gateway(
+                tcp_processor.handle_input_packet(
                     tx,
-                    tcp_processor,
-                    tcp_channel,
-                    ethernet_packet,
+                    ethernet_packet.get_source(),
                     &ipv4_packet,
+                    |data| {
+                        send_tcp_data_to_socks5(tcp_channel, data);
+                    },
                 );
             }
             IpNextHeaderProtocols::Udp => {
-                handle_udp_from_gateway(udp_processor, udp_channel, ethernet_packet, &ipv4_packet);
+                udp_processor.handle_input_packet(
+                    ethernet_packet.get_source(),
+                    &ipv4_packet,
+                    |data| {
+                        send_udp_data_to_socks5(udp_channel, data);
+                    },
+                );
             }
             _ => {}
         }

@@ -43,9 +43,10 @@ impl UdpProcessor {
         &mut self,
         source_mac: MacAddr,
         request: &Ipv4Packet,
-    ) -> Option<UdpLayerPacket> {
+        mut callback: impl FnMut(UdpLayerPacket),
+    ) {
         if !is_to_gateway(self.gateway, self.subnet_mask, request.get_source()) {
-            return None;
+            return;
         }
 
         if let Some(udp_request) = UdpPacket::new(request.payload()) {
@@ -64,14 +65,12 @@ impl UdpProcessor {
                 );
             }
 
-            return Some(UdpLayerPacket {
+            callback(UdpLayerPacket {
                 key,
                 data,
                 addr: dst,
             });
         }
-
-        None
     }
 
     pub fn handle_output_packet(&self, tx: &mut Box<dyn DataLinkSender>, packet: UdpLayerPacket) {
