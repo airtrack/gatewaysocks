@@ -50,6 +50,16 @@ fn start_socks5(
     });
 }
 
+fn send_tcp_data_to_socks5(tcp_channel: &Socks5Channel<TcpSocks5Data>, data: TcpLayerPacket) {
+    let _ = tcp_channel.tx.send(match data {
+        TcpLayerPacket::Connect(v) => TcpSocks5Data::Connect(v),
+        TcpLayerPacket::Established(v) => TcpSocks5Data::Established(v),
+        TcpLayerPacket::Push(v) => TcpSocks5Data::Push(v),
+        TcpLayerPacket::Shutdown(v) => TcpSocks5Data::Shutdown(v),
+        TcpLayerPacket::Close(v) => TcpSocks5Data::Close(v),
+    });
+}
+
 fn handle_tcp_from_gateway(
     tx: &mut Box<dyn DataLinkSender>,
     tcp_processor: &mut TcpProcessor,
@@ -57,17 +67,9 @@ fn handle_tcp_from_gateway(
     ethernet_packet: &EthernetPacket,
     ipv4_packet: &Ipv4Packet,
 ) {
-    let tcp_data = tcp_processor.handle_input_packet(tx, ethernet_packet.get_source(), ipv4_packet);
-
-    if let Some(data) = tcp_data {
-        let _ = tcp_channel.tx.send(match data {
-            TcpLayerPacket::Connect(v) => TcpSocks5Data::Connect(v),
-            TcpLayerPacket::Established(v) => TcpSocks5Data::Established(v),
-            TcpLayerPacket::Push(v) => TcpSocks5Data::Push(v),
-            TcpLayerPacket::Shutdown(v) => TcpSocks5Data::Shutdown(v),
-            TcpLayerPacket::Close(v) => TcpSocks5Data::Close(v),
-        });
-    }
+    tcp_processor.handle_input_packet(tx, ethernet_packet.get_source(), ipv4_packet, |data| {
+        send_tcp_data_to_socks5(tcp_channel, data);
+    });
 }
 
 fn handle_udp_from_gateway(
@@ -212,7 +214,9 @@ fn gateway_main(
         handle_tcp_from_socks5(&mut tcp_processor, &mut tcp_channel, &mut tx);
         handle_udp_from_socks5(&udp_processor, &mut udp_channel, &mut tx);
 
-        tcp_processor.heartbeat(&mut tx);
+        tcp_processor.heartbeat(&mut tx, |data| {
+            send_tcp_data_to_socks5(&tcp_channel, data);
+        });
     }
 }
 

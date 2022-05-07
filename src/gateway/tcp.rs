@@ -42,7 +42,11 @@ impl TcpProcessor {
         }
     }
 
-    pub fn heartbeat(&mut self, tx: &mut Box<dyn DataLinkSender>) {
+    pub fn heartbeat(
+        &mut self,
+        tx: &mut Box<dyn DataLinkSender>,
+        mut callback: impl FnMut(TcpLayerPacket),
+    ) {
         let now = Instant::now();
         if (now - self.heartbeat).as_millis() < 5 {
             return;
@@ -50,16 +54,11 @@ impl TcpProcessor {
 
         self.heartbeat = now;
         self.connections.retain(|key, connection| -> bool {
-            let closed = connection.is_closed();
-            let timeout = connection.is_timeout();
-
-            if closed || timeout {
+            let alive = connection.heartbeat(tx, &mut callback);
+            if !alive {
                 info!("{}: removed by heartbeat", key);
-            } else {
-                connection.heartbeat(tx);
             }
-
-            !closed && !timeout
+            alive
         });
     }
 
@@ -68,9 +67,10 @@ impl TcpProcessor {
         tx: &mut Box<dyn DataLinkSender>,
         source_mac: MacAddr,
         request: &Ipv4Packet,
-    ) -> Option<TcpLayerPacket> {
+        callback: impl FnMut(TcpLayerPacket),
+    ) {
         if !is_to_gateway(self.gateway, self.subnet_mask, request.get_source()) {
-            return None;
+            return;
         }
 
         info!(
@@ -85,18 +85,15 @@ impl TcpProcessor {
             let key = src.to_string() + "|" + &dst.to_string();
 
             if let Some(connection) = self.connections.get_mut(&key) {
-                return connection.handle_tcp_packet(&tcp_request, tx);
+                return connection.handle_tcp_packet(&tcp_request, tx, callback);
             }
 
             if Connection::is_syn_packet(&tcp_request) {
                 let mut connection = Connection::new(key.clone(), self.mac, source_mac, src, dst);
-                let result = connection.handle_tcp_packet(&tcp_request, tx);
+                connection.handle_tcp_packet(&tcp_request, tx, callback);
                 self.connections.insert(key, connection);
-                return result;
             }
         }
-
-        None
     }
 
     pub fn handle_output_packet(
@@ -149,31 +146,31 @@ impl LayerHandler {
         }
     }
 
-    fn handle_connect(&mut self) -> Option<TcpLayerPacket> {
+    fn handle_connect(&mut self, mut callback: impl FnMut(TcpLayerPacket)) {
         if self.connect {
-            return None;
+            return;
         }
 
         self.connect = true;
-        Some(TcpLayerPacket::Connect((self.key.clone(), self.dst_addr)))
+        callback(TcpLayerPacket::Connect((self.key.clone(), self.dst_addr)));
     }
 
-    fn handle_recv(&self, data: Vec<u8>) -> Option<TcpLayerPacket> {
+    fn handle_recv(&self, data: Vec<u8>, mut callback: impl FnMut(TcpLayerPacket)) {
         info!("{}: recv data size: {}", self.key, data.len());
-        Some(TcpLayerPacket::Push((self.key.clone(), data)))
+        callback(TcpLayerPacket::Push((self.key.clone(), data)));
     }
 
-    fn handle_recv_fin(&mut self) -> Option<TcpLayerPacket> {
+    fn handle_recv_fin(&mut self, mut callback: impl FnMut(TcpLayerPacket)) {
         if self.shutdown {
-            return None;
+            return;
         }
 
         self.shutdown = true;
-        Some(TcpLayerPacket::Shutdown(self.key.clone()))
+        callback(TcpLayerPacket::Shutdown(self.key.clone()));
     }
 
-    fn handle_reset(&self) -> Option<TcpLayerPacket> {
-        Some(TcpLayerPacket::Close(self.key.clone()))
+    fn handle_reset(&self, mut callback: impl FnMut(TcpLayerPacket)) {
+        callback(TcpLayerPacket::Close(self.key.clone()));
     }
 }
 
@@ -373,31 +370,42 @@ impl Connection {
         &mut self,
         request: &TcpPacket,
         tx: &mut Box<dyn DataLinkSender>,
-    ) -> Option<TcpLayerPacket> {
+        callback: impl FnMut(TcpLayerPacket),
+    ) {
         if request.get_flags() & TcpFlags::RST != 0 {
             info!("{}: recv RST", self.key);
             self.state = State::Closed;
-            return self.handler.handle_reset();
+            return self.handler.handle_reset(callback);
         }
 
         self.time.alive = Instant::now();
 
         match self.state {
-            State::Listen => self.state_listen(request, tx),
-            State::SynRcvd => self.state_syn_rcvd(request, tx),
-            State::Estab => self.state_estab(request, tx),
-            State::FinWait1 => self.state_fin_wait1(request, tx),
-            State::FinWait2 => self.state_fin_wait2(request, tx),
-            State::Closing => self.state_closing(request, tx),
-            State::TimeWait => self.state_time_wait(request, tx),
-            State::CloseWait => self.state_close_wait(request, tx),
-            State::LastAck => self.state_last_ack(request, tx),
-            State::Closed => None,
+            State::Listen => self.state_listen(request, tx, callback),
+            State::SynRcvd => self.state_syn_rcvd(request, tx, callback),
+            State::Estab => self.state_estab(request, tx, callback),
+            State::FinWait1 => self.state_fin_wait1(request, tx, callback),
+            State::FinWait2 => self.state_fin_wait2(request, tx, callback),
+            State::Closing => self.state_closing(request, tx, callback),
+            State::TimeWait => self.state_time_wait(request, tx, callback),
+            State::CloseWait => self.state_close_wait(request, tx, callback),
+            State::LastAck => self.state_last_ack(request, tx, callback),
+            State::Closed => {}
         }
     }
 
-    fn heartbeat(&mut self, tx: &mut Box<dyn DataLinkSender>) -> bool {
+    fn heartbeat(
+        &mut self,
+        tx: &mut Box<dyn DataLinkSender>,
+        callback: &mut impl FnMut(TcpLayerPacket),
+    ) -> bool {
         if self.is_closed() {
+            return false;
+        }
+
+        if self.is_timeout() {
+            self.handler.handle_reset(callback);
+            self.close(tx);
             return false;
         }
 
@@ -417,7 +425,7 @@ impl Connection {
         }
 
         self.send_pending_data(tx);
-        true
+        return true;
     }
 
     fn connected(&mut self, tx: &mut Box<dyn DataLinkSender>) {
@@ -486,7 +494,8 @@ impl Connection {
         &mut self,
         request: &TcpPacket,
         _tx: &mut Box<dyn DataLinkSender>,
-    ) -> Option<TcpLayerPacket> {
+        callback: impl FnMut(TcpLayerPacket),
+    ) {
         if request.get_flags() & TcpFlags::SYN != 0 {
             info!("{}: tcp SYN, ISN: {}", self.key, request.get_sequence());
             self.tcp_data.ack = request.get_sequence() + 1;
@@ -523,17 +532,16 @@ impl Connection {
                 }
             }
 
-            return self.handler.handle_connect();
+            self.handler.handle_connect(callback);
         }
-
-        None
     }
 
     fn state_syn_rcvd(
         &mut self,
         request: &TcpPacket,
         tx: &mut Box<dyn DataLinkSender>,
-    ) -> Option<TcpLayerPacket> {
+        callback: impl FnMut(TcpLayerPacket),
+    ) {
         if request.get_flags() & TcpFlags::SYN != 0 {
             self.send_tcp_syn_ack_packet(tx);
         }
@@ -548,18 +556,17 @@ impl Connection {
                 self.tcp_data.seq += 1;
                 self.state = State::Estab;
 
-                self.process_payload(request, tx);
+                self.process_payload(request, tx, callback);
             }
         }
-
-        None
     }
 
     fn state_estab(
         &mut self,
         request: &TcpPacket,
         tx: &mut Box<dyn DataLinkSender>,
-    ) -> Option<TcpLayerPacket> {
+        callback: impl FnMut(TcpLayerPacket),
+    ) {
         info!(
             "{}: recv packet at state Estab, flags: {:b}, payload size: {}",
             self.key,
@@ -582,22 +589,23 @@ impl Connection {
         if request.get_flags() & TcpFlags::FIN != 0 {
             if request.get_sequence() == self.tcp_data.ack {
                 info!("{}: recv FIN, change state to CloseWait", self.key);
-                return self.process_fin(request, tx);
+                return self.process_fin(request, tx, callback);
             }
         }
 
-        self.process_payload(request, tx)
+        self.process_payload(request, tx, callback);
     }
 
     fn state_fin_wait1(
         &mut self,
         request: &TcpPacket,
         tx: &mut Box<dyn DataLinkSender>,
-    ) -> Option<TcpLayerPacket> {
+        callback: impl FnMut(TcpLayerPacket),
+    ) {
         if request.get_flags() & TcpFlags::FIN != 0 {
             if request.get_sequence() == self.tcp_data.ack {
                 info!("{}: recv FIN, change state to Closing", self.key);
-                return self.process_fin(request, tx);
+                return self.process_fin(request, tx, callback);
             }
         }
 
@@ -607,31 +615,33 @@ impl Connection {
             }
         }
 
-        return self.process_payload(request, tx);
+        self.process_payload(request, tx, callback);
     }
 
     fn state_fin_wait2(
         &mut self,
         request: &TcpPacket,
         tx: &mut Box<dyn DataLinkSender>,
-    ) -> Option<TcpLayerPacket> {
+        callback: impl FnMut(TcpLayerPacket),
+    ) {
         if request.get_flags() & TcpFlags::FIN != 0 {
             if request.get_sequence() == self.tcp_data.ack {
                 info!("{}: recv FIN, change state to TimeWait", self.key);
-                return self.process_fin(request, tx);
+                return self.process_fin(request, tx, callback);
             }
         }
 
-        return self.process_payload(request, tx);
+        self.process_payload(request, tx, callback);
     }
 
     fn state_closing(
         &mut self,
         request: &TcpPacket,
         tx: &mut Box<dyn DataLinkSender>,
-    ) -> Option<TcpLayerPacket> {
+        callback: impl FnMut(TcpLayerPacket),
+    ) {
         if request.get_flags() & TcpFlags::FIN != 0 {
-            return self.process_fin(request, tx);
+            return self.process_fin(request, tx, callback);
         }
 
         if request.get_flags() & TcpFlags::ACK != 0 {
@@ -640,50 +650,45 @@ impl Connection {
                 self.state = State::TimeWait;
             }
         }
-
-        None
     }
 
     fn state_time_wait(
         &mut self,
         request: &TcpPacket,
         tx: &mut Box<dyn DataLinkSender>,
-    ) -> Option<TcpLayerPacket> {
+        callback: impl FnMut(TcpLayerPacket),
+    ) {
         if request.get_flags() & TcpFlags::FIN != 0 {
-            return self.process_fin(request, tx);
+            self.process_fin(request, tx, callback);
         }
-
-        None
     }
 
     fn state_close_wait(
         &mut self,
         request: &TcpPacket,
         tx: &mut Box<dyn DataLinkSender>,
-    ) -> Option<TcpLayerPacket> {
+        callback: impl FnMut(TcpLayerPacket),
+    ) {
         self.update_remote_window(request);
         self.process_acknowledgement(request, tx);
 
         if request.get_flags() & TcpFlags::FIN != 0 {
-            return self.process_fin(request, tx);
+            self.process_fin(request, tx, callback);
         }
-
-        None
     }
 
     fn state_last_ack(
         &mut self,
         request: &TcpPacket,
         _tx: &mut Box<dyn DataLinkSender>,
-    ) -> Option<TcpLayerPacket> {
+        _callback: impl FnMut(TcpLayerPacket),
+    ) {
         if request.get_flags() & TcpFlags::ACK != 0 {
             if request.get_acknowledgement() == self.tcp_data.seq + 1 {
                 self.state = State::Closed;
                 info!("{}: recv last ack, change state to Closed", self.key);
             }
         }
-
-        None
     }
 
     fn send_data(&mut self, tx: &mut Box<dyn DataLinkSender>, data: Vec<u8>) {
@@ -1012,10 +1017,11 @@ impl Connection {
         &mut self,
         request: &TcpPacket,
         tx: &mut Box<dyn DataLinkSender>,
-    ) -> Option<TcpLayerPacket> {
+        callback: impl FnMut(TcpLayerPacket),
+    ) {
         let payload = request.payload();
         if payload.is_empty() {
-            return None;
+            return;
         }
 
         let seq = request.get_sequence();
@@ -1028,7 +1034,7 @@ impl Connection {
         let range_left = ((range.0 - window.0) as i32, (range.1 - window.0) as i32);
         let range_right = ((range.0 - window.1) as i32, (range.1 - window.1) as i32);
         if range_left.1 <= 0 || range_right.0 >= 0 {
-            return None;
+            return;
         }
 
         let mut data_index = 0usize;
@@ -1056,16 +1062,16 @@ impl Connection {
         );
         self.update_recv_ranges(seq_range);
 
-        let result = self.handle_recv_buffer();
+        self.handle_recv_buffer(callback);
         self.send_tcp_acknowledge_packet(Some(seq_range), tx);
-        result
     }
 
     fn process_fin(
         &mut self,
         request: &TcpPacket,
         tx: &mut Box<dyn DataLinkSender>,
-    ) -> Option<TcpLayerPacket> {
+        callback: impl FnMut(TcpLayerPacket),
+    ) {
         self.tcp_data.ack = request.get_sequence() + 1;
         self.send_tcp_acknowledge_packet(None, tx);
 
@@ -1078,7 +1084,7 @@ impl Connection {
             }
         }
 
-        self.handler.handle_recv_fin()
+        self.handler.handle_recv_fin(callback);
     }
 
     fn copy_to_recv_buffer(&mut self, mut index: usize, buffer: &[u8]) {
@@ -1115,10 +1121,10 @@ impl Connection {
         self.recv_buffer.ranges.push_back(seq_range);
     }
 
-    fn handle_recv_buffer(&mut self) -> Option<TcpLayerPacket> {
+    fn handle_recv_buffer(&mut self, callback: impl FnMut(TcpLayerPacket)) {
         let mut range = self.recv_buffer.ranges.front().unwrap().clone();
         if self.tcp_data.ack != range.0 {
-            return None;
+            return;
         }
 
         loop {
@@ -1144,6 +1150,6 @@ impl Connection {
         self.recv_buffer
             .buffer
             .resize(self.tcp_data.local_window as usize, 0);
-        self.handler.handle_recv(data)
+        self.handler.handle_recv(data, callback);
     }
 }
