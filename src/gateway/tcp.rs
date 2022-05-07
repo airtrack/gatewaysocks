@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::Instant;
 
-use log::{error, info};
+use log::{error, info, trace, warn};
 use pnet::datalink::DataLinkSender;
 use pnet::packet::ethernet::{EtherTypes, MutableEthernetPacket};
 use pnet::packet::ip::IpNextHeaderProtocols;
@@ -73,7 +73,7 @@ impl TcpProcessor {
             return;
         }
 
-        info!(
+        trace!(
             "TCP packet {} -> {}",
             request.get_source(),
             request.get_destination()
@@ -89,6 +89,7 @@ impl TcpProcessor {
             }
 
             if Connection::is_syn_packet(&tcp_request) {
+                info!("{}: new tcp connection", key);
                 let mut connection = Connection::new(key.clone(), self.mac, source_mac, src, dst);
                 connection.handle_tcp_packet(&tcp_request, tx, callback);
                 self.connections.insert(key, connection);
@@ -156,7 +157,7 @@ impl LayerHandler {
     }
 
     fn handle_recv(&self, data: Vec<u8>, mut callback: impl FnMut(TcpLayerPacket)) {
-        info!("{}: recv data size: {}", self.key, data.len());
+        trace!("{}: recv data size: {}", self.key, data.len());
         callback(TcpLayerPacket::Push((self.key.clone(), data)));
     }
 
@@ -373,7 +374,7 @@ impl Connection {
         callback: impl FnMut(TcpLayerPacket),
     ) {
         if request.get_flags() & TcpFlags::RST != 0 {
-            info!("{}: recv RST", self.key);
+            trace!("{}: recv RST", self.key);
             self.state = State::Closed;
             return self.handler.handle_reset(callback);
         }
@@ -404,6 +405,7 @@ impl Connection {
         }
 
         if self.is_timeout() {
+            warn!("{}: timeout close", self.key);
             self.handler.handle_reset(callback);
             self.close(tx);
             return false;
@@ -418,9 +420,11 @@ impl Connection {
 
             self.send_tcp_data_packet(tx, sending_data);
             self.send_buffer.buffer[index].send_time = now;
-            info!(
+            trace!(
                 "{}: resend data at seq: {}, rto: {}",
-                self.key, self.send_buffer.buffer[index].seq, self.rto_vars.rto
+                self.key,
+                self.send_buffer.buffer[index].seq,
+                self.rto_vars.rto
             );
         }
 
@@ -431,38 +435,38 @@ impl Connection {
     fn connected(&mut self, tx: &mut Box<dyn DataLinkSender>) {
         self.send_tcp_syn_ack_packet(tx);
         self.state = State::SynRcvd;
-        info!("{}: connected, change state to SynRcvd", self.key);
+        trace!("{}: connected, change state to SynRcvd", self.key);
     }
 
     fn push(&mut self, mut data: Vec<u8>, tx: &mut Box<dyn DataLinkSender>) {
         if (self.state != State::Estab && self.state != State::CloseWait)
             || !self.send_buffer.pending.is_empty()
         {
-            info!("{}: pending data size: {}", self.key, data.len());
+            trace!("{}: pending data size: {}", self.key, data.len());
             return self.send_buffer.pending.push_back(PendingData::Data(data));
         }
 
         let remote_window = self.tcp_data.remote_window as usize;
         if self.send_buffer.size >= remote_window {
-            info!("{}: pending data size: {}", self.key, data.len());
+            trace!("{}: pending data size: {}", self.key, data.len());
             return self.send_buffer.pending.push_back(PendingData::Data(data));
         }
 
         if data.len() + self.send_buffer.size <= remote_window {
-            info!("{}: send data size: {}", self.key, data.len());
+            trace!("{}: send data size: {}", self.key, data.len());
             return self.send_data(tx, data);
         }
 
         let space = remote_window - self.send_buffer.size;
         let pending_data = data.split_off(space);
 
-        info!("{}: pending data size: {}", self.key, pending_data.len());
+        trace!("{}: send data size: {}", self.key, data.len());
+        self.send_data(tx, data);
+
+        trace!("{}: pending data size: {}", self.key, pending_data.len());
         self.send_buffer
             .pending
             .push_back(PendingData::Data(pending_data));
-
-        info!("{}: send data size: {}", self.key, data.len());
-        self.send_data(tx, data);
     }
 
     fn shutdown(&mut self, tx: &mut Box<dyn DataLinkSender>) {
@@ -471,17 +475,10 @@ impl Connection {
         }
 
         if self.send_buffer.buffer.is_empty() && self.send_buffer.pending.is_empty() {
-            self.send_tcp_fin_packet(tx);
-
-            match self.state {
-                State::Estab => self.state = State::FinWait1,
-                State::CloseWait => self.state = State::LastAck,
-                _ => unreachable!(),
-            }
-            return;
+            return self.send_fin(tx);
         }
 
-        info!("{}: pending FIN", self.key);
+        trace!("{}: pending FIN", self.key);
         self.send_buffer.pending.push_back(PendingData::Fin);
     }
 
@@ -497,7 +494,7 @@ impl Connection {
         callback: impl FnMut(TcpLayerPacket),
     ) {
         if request.get_flags() & TcpFlags::SYN != 0 {
-            info!("{}: tcp SYN, ISN: {}", self.key, request.get_sequence());
+            trace!("{}: tcp SYN, ISN: {}", self.key, request.get_sequence());
             self.tcp_data.ack = request.get_sequence() + 1;
             self.update_remote_window(request);
 
@@ -507,27 +504,27 @@ impl Connection {
                         let mut payload = [0u8; 2];
                         payload.copy_from_slice(&opt.payload()[0..2]);
                         self.tcp_data.mss = u16::from_be_bytes(payload);
-                        info!("tcp mss: {}", self.tcp_data.mss);
+                        trace!("tcp mss: {}", self.tcp_data.mss);
                     }
                     TcpOptionNumbers::SACK_PERMITTED => {
                         self.tcp_data.sack = true;
-                        info!("tcp sack permitted");
+                        trace!("tcp sack permitted");
                     }
                     TcpOptionNumbers::WSCALE => {
                         self.tcp_data.wscale = opt.payload()[0];
-                        info!("tcp window scale: {}", self.tcp_data.wscale);
+                        trace!("tcp window scale: {}", self.tcp_data.wscale);
 
                         self.tcp_data.wscale = std::cmp::min(self.tcp_data.wscale, 14);
                         self.update_remote_window(request);
-                        info!("tcp window size: {}", self.tcp_data.remote_window);
+                        trace!("tcp window size: {}", self.tcp_data.remote_window);
                     }
                     TcpOptionNumbers::TIMESTAMPS => {
                         self.process_timestamp_option(&opt);
-                        info!("tcp remote ts: {}", self.tcp_data.remote_ts);
+                        trace!("tcp remote ts: {}", self.tcp_data.remote_ts);
                     }
                     TcpOptionNumbers::NOP | TcpOptionNumbers::EOL => {}
                     _ => {
-                        info!("tcp unknown option {}", opt.get_number().0);
+                        trace!("tcp unknown option {}", opt.get_number().0);
                     }
                 }
             }
@@ -548,7 +545,7 @@ impl Connection {
 
         if request.get_flags() & TcpFlags::ACK != 0 {
             if request.get_acknowledgement() == self.tcp_data.seq + 1 {
-                info!(
+                trace!(
                     "{}: change state to Estab, payload size: {}",
                     self.key,
                     request.payload().len()
@@ -567,7 +564,7 @@ impl Connection {
         tx: &mut Box<dyn DataLinkSender>,
         callback: impl FnMut(TcpLayerPacket),
     ) {
-        info!(
+        trace!(
             "{}: recv packet at state Estab, flags: {:b}, payload size: {}",
             self.key,
             request.get_flags(),
@@ -588,7 +585,7 @@ impl Connection {
 
         if request.get_flags() & TcpFlags::FIN != 0 {
             if request.get_sequence() == self.tcp_data.ack {
-                info!("{}: recv FIN, change state to CloseWait", self.key);
+                trace!("{}: recv FIN, change state to CloseWait", self.key);
                 return self.process_fin(request, tx, callback);
             }
         }
@@ -604,7 +601,7 @@ impl Connection {
     ) {
         if request.get_flags() & TcpFlags::FIN != 0 {
             if request.get_sequence() == self.tcp_data.ack {
-                info!("{}: recv FIN, change state to Closing", self.key);
+                trace!("{}: recv FIN, change state to Closing", self.key);
                 return self.process_fin(request, tx, callback);
             }
         }
@@ -626,7 +623,7 @@ impl Connection {
     ) {
         if request.get_flags() & TcpFlags::FIN != 0 {
             if request.get_sequence() == self.tcp_data.ack {
-                info!("{}: recv FIN, change state to TimeWait", self.key);
+                trace!("{}: recv FIN, change state to TimeWait", self.key);
                 return self.process_fin(request, tx, callback);
             }
         }
@@ -646,7 +643,7 @@ impl Connection {
 
         if request.get_flags() & TcpFlags::ACK != 0 {
             if request.get_acknowledgement() == self.tcp_data.seq + 1 {
-                info!("{}: recv FIN ack, change state to TimeWait", self.key);
+                trace!("{}: recv FIN ack, change state to TimeWait", self.key);
                 self.state = State::TimeWait;
             }
         }
@@ -686,7 +683,7 @@ impl Connection {
         if request.get_flags() & TcpFlags::ACK != 0 {
             if request.get_acknowledgement() == self.tcp_data.seq + 1 {
                 self.state = State::Closed;
-                info!("{}: recv last ack, change state to Closed", self.key);
+                trace!("{}: recv last ack, change state to Closed", self.key);
             }
         }
     }
@@ -719,14 +716,14 @@ impl Connection {
                 PendingData::Data(mut data) => {
                     let len = data.len();
                     if len <= window {
-                        info!("{}: send pending data size: {}", self.key, data.len());
+                        trace!("{}: send pending data size: {}", self.key, data.len());
                         self.send_data(tx, data);
 
                         window -= len;
                     } else {
                         let tail = data.split_off(window);
 
-                        info!("{}: send pending data size: {}", self.key, data.len());
+                        trace!("{}: send pending data size: {}", self.key, data.len());
                         self.send_data(tx, data);
 
                         window = 0;
@@ -735,13 +732,7 @@ impl Connection {
                 }
                 PendingData::Fin => {
                     if self.send_buffer.buffer.is_empty() {
-                        self.send_tcp_fin_packet(tx);
-
-                        match self.state {
-                            State::Estab => self.state = State::FinWait1,
-                            State::CloseWait => self.state = State::LastAck,
-                            _ => unreachable!(),
-                        }
+                        self.send_fin(tx);
                     } else {
                         self.send_buffer.pending.push_front(PendingData::Fin);
                     }
@@ -751,12 +742,23 @@ impl Connection {
         }
     }
 
+    fn send_fin(&mut self, tx: &mut Box<dyn DataLinkSender>) {
+        self.send_tcp_fin_packet(tx);
+
+        match self.state {
+            State::Estab => self.state = State::FinWait1,
+            State::CloseWait => self.state = State::LastAck,
+            _ => unreachable!(),
+        }
+    }
+
     fn update_remote_window(&mut self, request: &TcpPacket) {
         self.tcp_data.remote_window = request.get_window() as u32;
         self.tcp_data.remote_window <<= self.tcp_data.wscale;
-        info!(
+        trace!(
             "{}: update remote window size: {}",
-            self.key, self.tcp_data.remote_window
+            self.key,
+            self.tcp_data.remote_window
         );
     }
 
@@ -772,18 +774,6 @@ impl Connection {
 
         self.rto_vars.rttvar = (self.rto_vars.rttvar * 3 + delta) / 4;
         self.rto_vars.rto = self.rto_vars.srtt + 4 * self.rto_vars.rttvar;
-    }
-
-    fn process_timestamp_option(&mut self, opt: &TcpOptionPacket) {
-        let mut payload = [0u8; 4];
-        payload.copy_from_slice(&opt.payload()[0..4]);
-        self.tcp_data.remote_ts = u32::from_be_bytes(payload);
-
-        payload.copy_from_slice(&opt.payload()[4..8]);
-        let echo_ts = u32::from_be_bytes(payload);
-        if echo_ts != 0 {
-            self.update_rto(echo_ts);
-        }
     }
 
     fn timestamp(&self) -> u32 {
@@ -892,17 +882,17 @@ impl Connection {
         tx: &mut Box<dyn DataLinkSender>,
     ) {
         self.send_tcp_control_packet(tx, TcpFlags::ACK, seq_range);
-        info!("{}: send acknowledge ack: {}", self.key, self.tcp_data.ack);
+        trace!("{}: send acknowledge ack: {}", self.key, self.tcp_data.ack);
     }
 
     fn send_tcp_fin_packet(&self, tx: &mut Box<dyn DataLinkSender>) {
         self.send_tcp_control_packet(tx, TcpFlags::ACK | TcpFlags::FIN, None);
-        info!("{}: send FIN", self.key);
+        trace!("{}: send FIN", self.key);
     }
 
     fn send_tcp_rst_packet(&self, tx: &mut Box<dyn DataLinkSender>) {
         self.send_tcp_control_packet(tx, TcpFlags::ACK | TcpFlags::RST, None);
-        info!("{}: send RST", self.key);
+        trace!("{}: send RST", self.key);
     }
 
     fn send_tcp_control_packet(
@@ -985,9 +975,21 @@ impl Connection {
         tx.send_to(ethernet_packet.packet(), None);
     }
 
+    fn process_timestamp_option(&mut self, opt: &TcpOptionPacket) {
+        let mut payload = [0u8; 4];
+        payload.copy_from_slice(&opt.payload()[0..4]);
+        self.tcp_data.remote_ts = u32::from_be_bytes(payload);
+
+        payload.copy_from_slice(&opt.payload()[4..8]);
+        let echo_ts = u32::from_be_bytes(payload);
+        if echo_ts != 0 {
+            self.update_rto(echo_ts);
+        }
+    }
+
     fn process_acknowledgement(&mut self, request: &TcpPacket, tx: &mut Box<dyn DataLinkSender>) {
         let ack = request.get_acknowledgement();
-        info!("{}: process ack: {}", self.key, ack);
+        trace!("{}: process ack: {}", self.key, ack);
 
         while !self.send_buffer.buffer.is_empty() {
             let front = self.send_buffer.buffer.front_mut().unwrap();
