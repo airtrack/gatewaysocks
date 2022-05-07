@@ -44,19 +44,22 @@ impl TcpProcessor {
 
     pub fn heartbeat(&mut self, tx: &mut Box<dyn DataLinkSender>) {
         let now = Instant::now();
-        if (now - self.heartbeat).as_millis() < 2 {
+        if (now - self.heartbeat).as_millis() < 5 {
             return;
         }
 
         self.heartbeat = now;
         self.connections.retain(|key, connection| -> bool {
             let closed = connection.is_closed();
-            if closed {
+            let timeout = connection.is_timeout();
+
+            if closed || timeout {
                 info!("{}: removed by heartbeat", key);
             } else {
                 connection.heartbeat(tx);
             }
-            !closed
+
+            !closed && !timeout
         });
     }
 
@@ -85,11 +88,12 @@ impl TcpProcessor {
                 return connection.handle_tcp_packet(&tcp_request, tx);
             }
 
-            let mut connection = Connection::new(key.clone(), self.mac, source_mac, src, dst);
-            let result = connection.handle_tcp_packet(&tcp_request, tx);
-
-            self.connections.insert(key, connection);
-            return result;
+            if Connection::is_syn_packet(&tcp_request) {
+                let mut connection = Connection::new(key.clone(), self.mac, source_mac, src, dst);
+                let result = connection.handle_tcp_packet(&tcp_request, tx);
+                self.connections.insert(key, connection);
+                return result;
+            }
         }
 
         None
@@ -187,6 +191,70 @@ enum State {
     Closed,
 }
 
+struct Time {
+    init: Instant,
+    alive: Instant,
+}
+
+impl Time {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            init: now,
+            alive: now,
+        }
+    }
+}
+
+struct Address {
+    mac: MacAddr,
+    src_mac: MacAddr,
+    src_addr: SocketAddrV4,
+    dst_addr: SocketAddrV4,
+}
+
+impl Address {
+    fn new(mac: MacAddr, src_mac: MacAddr, src: SocketAddrV4, dst: SocketAddrV4) -> Self {
+        Self {
+            mac,
+            src_mac,
+            src_addr: src,
+            dst_addr: dst,
+        }
+    }
+}
+
+struct RtoVars {
+    rto: u32,
+    srtt: u32,
+    rttvar: u32,
+}
+
+impl RtoVars {
+    fn new() -> Self {
+        Self {
+            rto: DEFAULT_RTT,
+            srtt: DEFAULT_RTT,
+            rttvar: 0,
+        }
+    }
+}
+
+struct RecvBuffer {
+    buffer: VecDeque<u8>,
+    ranges: VecDeque<(u32, u32)>,
+}
+
+impl RecvBuffer {
+    fn new() -> Self {
+        let mut buffer = VecDeque::new();
+        buffer.resize(LOCAL_WINDOW as usize, 0);
+        let ranges = VecDeque::new();
+
+        Self { buffer, ranges }
+    }
+}
+
 struct SendingData {
     send_time: Instant,
     seq: u32,
@@ -208,46 +276,64 @@ enum PendingData {
     Fin,
 }
 
-struct RtoVars {
-    rto: u32,
-    srtt: u32,
-    rttvar: u32,
+struct SendBuffer {
+    size: usize,
+    buffer: VecDeque<SendingData>,
+    pending: VecDeque<PendingData>,
 }
 
-const LOCAL_WINDOW: u32 = 2 * 1024 * 1024;
-const MAX_TCP_HEADER_LEN: usize = 60;
-const DEFAULT_RTT: u32 = 100;
+impl SendBuffer {
+    fn new() -> Self {
+        Self {
+            size: 0,
+            buffer: VecDeque::new(),
+            pending: VecDeque::new(),
+        }
+    }
+}
 
-struct Connection {
-    handler: LayerHandler,
-
-    key: String,
-    state: State,
-    init_time: Instant,
-
-    mac: MacAddr,
-    src_mac: MacAddr,
-    src_addr: SocketAddrV4,
-    dst_addr: SocketAddrV4,
-
-    rto_vars: RtoVars,
-
-    recv_buffer: VecDeque<u8>,
-    recv_ranges: VecDeque<(u32, u32)>,
-
-    send_buffer_size: usize,
-    send_buffer: VecDeque<SendingData>,
-    pending_buffer: VecDeque<PendingData>,
-
+struct TcpData {
     seq: u32,
     ack: u32,
     local_window: u32,
     remote_window: u32,
 
-    mss: u16,
-    sack: bool,
-    wscale: u8,
     remote_ts: u32,
+    mss: u16,
+    wscale: u8,
+    sack: bool,
+}
+
+impl TcpData {
+    fn new() -> Self {
+        Self {
+            seq: 0,
+            ack: 0,
+            local_window: LOCAL_WINDOW,
+            remote_window: 0,
+            remote_ts: 0,
+            mss: 1400,
+            wscale: 0,
+            sack: false,
+        }
+    }
+}
+
+const CONNECTION_ALIVE_TIMEOUT: u128 = 30000;
+const MAX_TCP_HEADER_LEN: usize = 60;
+const LOCAL_WINDOW: u32 = 2 * 1024 * 1024;
+const DEFAULT_RTT: u32 = 100;
+
+struct Connection {
+    key: String,
+    state: State,
+    time: Time,
+    addr: Address,
+    rto_vars: RtoVars,
+    recv_buffer: RecvBuffer,
+    send_buffer: SendBuffer,
+    tcp_data: TcpData,
+    handler: LayerHandler,
 }
 
 impl Connection {
@@ -258,47 +344,29 @@ impl Connection {
         src_addr: SocketAddrV4,
         dst_addr: SocketAddrV4,
     ) -> Self {
-        let rto_vars = RtoVars {
-            rto: DEFAULT_RTT,
-            srtt: DEFAULT_RTT,
-            rttvar: 0,
-        };
-
-        let mut recv_buffer = VecDeque::new();
-        recv_buffer.resize(LOCAL_WINDOW as usize, 0);
-
-        let recv_ranges = VecDeque::new();
-        let send_buffer = VecDeque::new();
-        let pending_buffer = VecDeque::new();
-
         Self {
-            handler: LayerHandler::new(key.clone(), dst_addr),
-            key,
+            key: key.clone(),
             state: State::Listen,
-            init_time: Instant::now(),
-            mac,
-            src_mac,
-            src_addr,
-            dst_addr,
-            rto_vars,
-            recv_buffer,
-            recv_ranges,
-            send_buffer_size: 0,
-            send_buffer,
-            pending_buffer,
-            seq: 0,
-            ack: 0,
-            local_window: LOCAL_WINDOW,
-            remote_window: 0,
-            mss: 1400,
-            sack: false,
-            wscale: 0,
-            remote_ts: 0,
+            time: Time::new(),
+            addr: Address::new(mac, src_mac, src_addr, dst_addr),
+            rto_vars: RtoVars::new(),
+            recv_buffer: RecvBuffer::new(),
+            send_buffer: SendBuffer::new(),
+            tcp_data: TcpData::new(),
+            handler: LayerHandler::new(key, dst_addr),
         }
+    }
+
+    fn is_syn_packet(request: &TcpPacket) -> bool {
+        request.get_flags() & TcpFlags::SYN != 0
     }
 
     fn is_closed(&self) -> bool {
         self.state == State::Closed
+    }
+
+    fn is_timeout(&self) -> bool {
+        (Instant::now() - self.time.alive).as_millis() > CONNECTION_ALIVE_TIMEOUT
     }
 
     fn handle_tcp_packet(
@@ -311,6 +379,8 @@ impl Connection {
             self.state = State::Closed;
             return self.handler.handle_reset();
         }
+
+        self.time.alive = Instant::now();
 
         match self.state {
             State::Listen => self.state_listen(request, tx),
@@ -332,17 +402,17 @@ impl Connection {
         }
 
         let now = Instant::now();
-        for index in 0..self.send_buffer.len() {
-            let sending_data = &self.send_buffer[index];
+        for index in 0..self.send_buffer.buffer.len() {
+            let sending_data = &self.send_buffer.buffer[index];
             if (now - sending_data.send_time).as_millis() < self.rto_vars.rto as u128 {
                 break;
             }
 
             self.send_tcp_data_packet(tx, sending_data);
-            self.send_buffer[index].send_time = now;
+            self.send_buffer.buffer[index].send_time = now;
             info!(
                 "{}: resend data at seq: {}, rto: {}",
-                self.key, self.send_buffer[index].seq, self.rto_vars.rto
+                self.key, self.send_buffer.buffer[index].seq, self.rto_vars.rto
             );
         }
 
@@ -358,28 +428,29 @@ impl Connection {
 
     fn push(&mut self, mut data: Vec<u8>, tx: &mut Box<dyn DataLinkSender>) {
         if (self.state != State::Estab && self.state != State::CloseWait)
-            || !self.pending_buffer.is_empty()
+            || !self.send_buffer.pending.is_empty()
         {
             info!("{}: pending data size: {}", self.key, data.len());
-            return self.pending_buffer.push_back(PendingData::Data(data));
+            return self.send_buffer.pending.push_back(PendingData::Data(data));
         }
 
-        let remote_window = self.remote_window as usize;
-        if self.send_buffer_size >= remote_window {
+        let remote_window = self.tcp_data.remote_window as usize;
+        if self.send_buffer.size >= remote_window {
             info!("{}: pending data size: {}", self.key, data.len());
-            return self.pending_buffer.push_back(PendingData::Data(data));
+            return self.send_buffer.pending.push_back(PendingData::Data(data));
         }
 
-        if data.len() + self.send_buffer_size <= remote_window {
+        if data.len() + self.send_buffer.size <= remote_window {
             info!("{}: send data size: {}", self.key, data.len());
             return self.send_data(tx, data);
         }
 
-        let space = remote_window - self.send_buffer_size;
+        let space = remote_window - self.send_buffer.size;
         let pending_data = data.split_off(space);
 
         info!("{}: pending data size: {}", self.key, pending_data.len());
-        self.pending_buffer
+        self.send_buffer
+            .pending
             .push_back(PendingData::Data(pending_data));
 
         info!("{}: send data size: {}", self.key, data.len());
@@ -391,7 +462,7 @@ impl Connection {
             return error!("{}: shutdown error on state: {:?}", self.key, self.state);
         }
 
-        if self.send_buffer.is_empty() && self.pending_buffer.is_empty() {
+        if self.send_buffer.buffer.is_empty() && self.send_buffer.pending.is_empty() {
             self.send_tcp_fin_packet(tx);
 
             match self.state {
@@ -403,7 +474,7 @@ impl Connection {
         }
 
         info!("{}: pending FIN", self.key);
-        self.pending_buffer.push_back(PendingData::Fin);
+        self.send_buffer.pending.push_back(PendingData::Fin);
     }
 
     fn close(&mut self, tx: &mut Box<dyn DataLinkSender>) {
@@ -418,7 +489,7 @@ impl Connection {
     ) -> Option<TcpLayerPacket> {
         if request.get_flags() & TcpFlags::SYN != 0 {
             info!("{}: tcp SYN, ISN: {}", self.key, request.get_sequence());
-            self.ack = request.get_sequence() + 1;
+            self.tcp_data.ack = request.get_sequence() + 1;
             self.update_remote_window(request);
 
             for opt in request.get_options_iter() {
@@ -426,24 +497,24 @@ impl Connection {
                     TcpOptionNumbers::MSS => {
                         let mut payload = [0u8; 2];
                         payload.copy_from_slice(&opt.payload()[0..2]);
-                        self.mss = u16::from_be_bytes(payload);
-                        info!("tcp mss: {}", self.mss);
+                        self.tcp_data.mss = u16::from_be_bytes(payload);
+                        info!("tcp mss: {}", self.tcp_data.mss);
                     }
                     TcpOptionNumbers::SACK_PERMITTED => {
-                        self.sack = true;
+                        self.tcp_data.sack = true;
                         info!("tcp sack permitted");
                     }
                     TcpOptionNumbers::WSCALE => {
-                        self.wscale = opt.payload()[0];
-                        info!("tcp window scale: {}", self.wscale);
+                        self.tcp_data.wscale = opt.payload()[0];
+                        info!("tcp window scale: {}", self.tcp_data.wscale);
 
-                        self.wscale = std::cmp::min(self.wscale, 14);
+                        self.tcp_data.wscale = std::cmp::min(self.tcp_data.wscale, 14);
                         self.update_remote_window(request);
-                        info!("tcp window size: {}", self.remote_window);
+                        info!("tcp window size: {}", self.tcp_data.remote_window);
                     }
                     TcpOptionNumbers::TIMESTAMPS => {
                         self.process_timestamp_option(&opt);
-                        info!("tcp remote ts: {}", self.remote_ts);
+                        info!("tcp remote ts: {}", self.tcp_data.remote_ts);
                     }
                     TcpOptionNumbers::NOP | TcpOptionNumbers::EOL => {}
                     _ => {
@@ -468,13 +539,13 @@ impl Connection {
         }
 
         if request.get_flags() & TcpFlags::ACK != 0 {
-            if request.get_acknowledgement() == self.seq + 1 {
+            if request.get_acknowledgement() == self.tcp_data.seq + 1 {
                 info!(
                     "{}: change state to Estab, payload size: {}",
                     self.key,
                     request.payload().len()
                 );
-                self.seq += 1;
+                self.tcp_data.seq += 1;
                 self.state = State::Estab;
 
                 self.process_payload(request, tx);
@@ -509,7 +580,7 @@ impl Connection {
         self.process_acknowledgement(request, tx);
 
         if request.get_flags() & TcpFlags::FIN != 0 {
-            if request.get_sequence() == self.ack {
+            if request.get_sequence() == self.tcp_data.ack {
                 info!("{}: recv FIN, change state to CloseWait", self.key);
                 return self.process_fin(request, tx);
             }
@@ -524,14 +595,14 @@ impl Connection {
         tx: &mut Box<dyn DataLinkSender>,
     ) -> Option<TcpLayerPacket> {
         if request.get_flags() & TcpFlags::FIN != 0 {
-            if request.get_sequence() == self.ack {
+            if request.get_sequence() == self.tcp_data.ack {
                 info!("{}: recv FIN, change state to Closing", self.key);
                 return self.process_fin(request, tx);
             }
         }
 
         if request.get_flags() & TcpFlags::ACK != 0 {
-            if request.get_acknowledgement() == self.seq + 1 {
+            if request.get_acknowledgement() == self.tcp_data.seq + 1 {
                 self.state = State::FinWait2;
             }
         }
@@ -545,7 +616,7 @@ impl Connection {
         tx: &mut Box<dyn DataLinkSender>,
     ) -> Option<TcpLayerPacket> {
         if request.get_flags() & TcpFlags::FIN != 0 {
-            if request.get_sequence() == self.ack {
+            if request.get_sequence() == self.tcp_data.ack {
                 info!("{}: recv FIN, change state to TimeWait", self.key);
                 return self.process_fin(request, tx);
             }
@@ -564,7 +635,7 @@ impl Connection {
         }
 
         if request.get_flags() & TcpFlags::ACK != 0 {
-            if request.get_acknowledgement() == self.seq + 1 {
+            if request.get_acknowledgement() == self.tcp_data.seq + 1 {
                 info!("{}: recv FIN ack, change state to TimeWait", self.key);
                 self.state = State::TimeWait;
             }
@@ -606,7 +677,7 @@ impl Connection {
         _tx: &mut Box<dyn DataLinkSender>,
     ) -> Option<TcpLayerPacket> {
         if request.get_flags() & TcpFlags::ACK != 0 {
-            if request.get_acknowledgement() == self.seq + 1 {
+            if request.get_acknowledgement() == self.tcp_data.seq + 1 {
                 self.state = State::Closed;
                 info!("{}: recv last ack, change state to Closed", self.key);
             }
@@ -616,28 +687,28 @@ impl Connection {
     }
 
     fn send_data(&mut self, tx: &mut Box<dyn DataLinkSender>, data: Vec<u8>) {
-        let sending_data = SendingData::new(self.seq, data);
-        self.seq += sending_data.data.len() as u32;
-        self.send_buffer_size += sending_data.data.len();
+        let sending_data = SendingData::new(self.tcp_data.seq, data);
+        self.tcp_data.seq += sending_data.data.len() as u32;
+        self.send_buffer.size += sending_data.data.len();
 
         self.send_tcp_data_packet(tx, &sending_data);
-        self.send_buffer.push_back(sending_data);
+        self.send_buffer.buffer.push_back(sending_data);
     }
 
     fn send_pending_data(&mut self, tx: &mut Box<dyn DataLinkSender>) {
-        let remote_window = self.remote_window as usize;
+        let remote_window = self.tcp_data.remote_window as usize;
         let mut window;
 
-        if remote_window == 0 && self.send_buffer_size == 0 {
+        if remote_window == 0 && self.send_buffer.size == 0 {
             window = 1;
-        } else if remote_window > self.send_buffer_size {
-            window = remote_window - self.send_buffer_size;
+        } else if remote_window > self.send_buffer.size {
+            window = remote_window - self.send_buffer.size;
         } else {
             window = 0;
         }
 
-        while !self.pending_buffer.is_empty() && window > 0 {
-            let front = self.pending_buffer.pop_front().unwrap();
+        while !self.send_buffer.pending.is_empty() && window > 0 {
+            let front = self.send_buffer.pending.pop_front().unwrap();
 
             match front {
                 PendingData::Data(mut data) => {
@@ -654,11 +725,11 @@ impl Connection {
                         self.send_data(tx, data);
 
                         window = 0;
-                        self.pending_buffer.push_front(PendingData::Data(tail));
+                        self.send_buffer.pending.push_front(PendingData::Data(tail));
                     }
                 }
                 PendingData::Fin => {
-                    if self.send_buffer.is_empty() {
+                    if self.send_buffer.buffer.is_empty() {
                         self.send_tcp_fin_packet(tx);
 
                         match self.state {
@@ -667,7 +738,7 @@ impl Connection {
                             _ => unreachable!(),
                         }
                     } else {
-                        self.pending_buffer.push_front(PendingData::Fin);
+                        self.send_buffer.pending.push_front(PendingData::Fin);
                     }
                     break;
                 }
@@ -676,11 +747,11 @@ impl Connection {
     }
 
     fn update_remote_window(&mut self, request: &TcpPacket) {
-        self.remote_window = request.get_window() as u32;
-        self.remote_window <<= self.wscale;
+        self.tcp_data.remote_window = request.get_window() as u32;
+        self.tcp_data.remote_window <<= self.tcp_data.wscale;
         info!(
             "{}: update remote window size: {}",
-            self.key, self.remote_window
+            self.key, self.tcp_data.remote_window
         );
     }
 
@@ -701,7 +772,7 @@ impl Connection {
     fn process_timestamp_option(&mut self, opt: &TcpOptionPacket) {
         let mut payload = [0u8; 4];
         payload.copy_from_slice(&opt.payload()[0..4]);
-        self.remote_ts = u32::from_be_bytes(payload);
+        self.tcp_data.remote_ts = u32::from_be_bytes(payload);
 
         payload.copy_from_slice(&opt.payload()[4..8]);
         let echo_ts = u32::from_be_bytes(payload);
@@ -711,11 +782,14 @@ impl Connection {
     }
 
     fn timestamp(&self) -> u32 {
-        (Instant::now() - self.init_time).as_millis() as u32
+        (Instant::now() - self.time.init).as_millis() as u32
     }
 
     fn add_tcp_option_timestamp(&self, opts: &mut Vec<TcpOption>, opts_size: &mut usize) {
-        opts.push(TcpOption::timestamp(self.timestamp(), self.remote_ts));
+        opts.push(TcpOption::timestamp(
+            self.timestamp(),
+            self.tcp_data.remote_ts,
+        ));
         *opts_size += 10;
     }
 
@@ -729,14 +803,14 @@ impl Connection {
         let mut acks = Vec::new();
 
         if let Some(seq_range) = seq_range {
-            if ((self.ack - seq_range.0) as i32) < 0 {
+            if ((self.tcp_data.ack - seq_range.0) as i32) < 0 {
                 acks.push(seq_range.0);
                 acks.push(seq_range.1);
                 blocks -= 1;
             }
         }
 
-        for range in &self.recv_ranges {
+        for range in &self.recv_buffer.ranges {
             if blocks == 0 {
                 break;
             }
@@ -754,10 +828,10 @@ impl Connection {
         let mut opts_size = 0;
         let payload = [0u8; 0];
 
-        opts.push(TcpOption::mss(self.mss));
+        opts.push(TcpOption::mss(self.tcp_data.mss));
         opts_size += 4;
 
-        opts.push(TcpOption::wscale(self.wscale));
+        opts.push(TcpOption::wscale(self.tcp_data.wscale));
         opts.push(TcpOption::nop());
         opts_size += 4;
 
@@ -768,7 +842,7 @@ impl Connection {
 
         self.send_tcp_packet(
             tx,
-            self.seq,
+            self.tcp_data.seq,
             TcpFlags::SYN | TcpFlags::ACK,
             &opts,
             opts_size,
@@ -786,7 +860,7 @@ impl Connection {
         let mut index = 0;
         let mut seq = data.seq;
         let mut len = data.data.len();
-        let max_payload_len = self.mss as usize - MAX_TCP_HEADER_LEN;
+        let max_payload_len = self.tcp_data.mss as usize - MAX_TCP_HEADER_LEN;
 
         while len > 0 {
             let payload_len = std::cmp::min(len, max_payload_len);
@@ -813,7 +887,7 @@ impl Connection {
         tx: &mut Box<dyn DataLinkSender>,
     ) {
         self.send_tcp_control_packet(tx, TcpFlags::ACK, seq_range);
-        info!("{}: send acknowledge ack: {}", self.key, self.ack);
+        info!("{}: send acknowledge ack: {}", self.key, self.tcp_data.ack);
     }
 
     fn send_tcp_fin_packet(&self, tx: &mut Box<dyn DataLinkSender>) {
@@ -838,7 +912,7 @@ impl Connection {
 
         self.add_tcp_option_timestamp(&mut opts, &mut opts_size);
         self.add_tcp_option_sack(&mut opts, &mut opts_size, seq_range);
-        self.send_tcp_packet(tx, self.seq, flags, &opts, opts_size, &payload);
+        self.send_tcp_packet(tx, self.tcp_data.seq, flags, &opts, opts_size, &payload);
     }
 
     fn send_tcp_packet(
@@ -854,14 +928,14 @@ impl Connection {
         let mut tcp_buffer = vec![0u8; tcp_packet_len];
         let mut tcp_packet = MutableTcpPacket::new(&mut tcp_buffer).unwrap();
 
-        tcp_packet.set_source(self.dst_addr.port());
-        tcp_packet.set_destination(self.src_addr.port());
+        tcp_packet.set_source(self.addr.dst_addr.port());
+        tcp_packet.set_destination(self.addr.src_addr.port());
         tcp_packet.set_sequence(seq);
-        tcp_packet.set_acknowledgement(self.ack);
+        tcp_packet.set_acknowledgement(self.tcp_data.ack);
         tcp_packet.set_data_offset(((20 + opts_size) / 4) as u8);
         tcp_packet.set_reserved(0);
         tcp_packet.set_flags(flags);
-        tcp_packet.set_window((self.local_window >> self.wscale) as u16);
+        tcp_packet.set_window((self.tcp_data.local_window >> self.tcp_data.wscale) as u16);
         tcp_packet.set_checksum(0);
         tcp_packet.set_urgent_ptr(0);
         tcp_packet.set_options(opts);
@@ -869,8 +943,8 @@ impl Connection {
 
         tcp_packet.set_checksum(tcp::ipv4_checksum(
             &tcp_packet.to_immutable(),
-            self.dst_addr.ip(),
-            self.src_addr.ip(),
+            self.addr.dst_addr.ip(),
+            self.addr.src_addr.ip(),
         ));
 
         let ipv4_packet_len = 20 + tcp_packet_len;
@@ -888,8 +962,8 @@ impl Connection {
         ipv4_packet.set_ttl(64);
         ipv4_packet.set_next_level_protocol(IpNextHeaderProtocols::Tcp);
         ipv4_packet.set_checksum(0);
-        ipv4_packet.set_source(*self.dst_addr.ip());
-        ipv4_packet.set_destination(*self.src_addr.ip());
+        ipv4_packet.set_source(*self.addr.dst_addr.ip());
+        ipv4_packet.set_destination(*self.addr.src_addr.ip());
         ipv4_packet.set_payload(tcp_packet.packet());
 
         ipv4_packet.set_checksum(ipv4::checksum(&ipv4_packet.to_immutable()));
@@ -898,8 +972,8 @@ impl Connection {
         let mut ethernet_buffer = vec![0u8; ethernet_packet_len];
         let mut ethernet_packet = MutableEthernetPacket::new(&mut ethernet_buffer).unwrap();
 
-        ethernet_packet.set_destination(self.src_mac);
-        ethernet_packet.set_source(self.mac);
+        ethernet_packet.set_destination(self.addr.src_mac);
+        ethernet_packet.set_source(self.addr.mac);
         ethernet_packet.set_ethertype(EtherTypes::Ipv4);
         ethernet_packet.set_payload(ipv4_packet.packet());
 
@@ -910,8 +984,8 @@ impl Connection {
         let ack = request.get_acknowledgement();
         info!("{}: process ack: {}", self.key, ack);
 
-        while !self.send_buffer.is_empty() {
-            let front = self.send_buffer.front_mut().unwrap();
+        while !self.send_buffer.buffer.is_empty() {
+            let front = self.send_buffer.buffer.front_mut().unwrap();
             let begin_seq = front.seq;
             let end_seq = begin_seq + front.data.len() as u32;
 
@@ -920,15 +994,15 @@ impl Connection {
             }
 
             if ((end_seq - ack) as i32) <= 0 {
-                self.send_buffer_size -= front.data.len();
-                self.send_buffer.pop_front();
+                self.send_buffer.size -= front.data.len();
+                self.send_buffer.buffer.pop_front();
                 continue;
             }
 
             let len = (ack - begin_seq) as usize;
             front.data.drain(0..len);
             front.seq = ack;
-            self.send_buffer_size -= len;
+            self.send_buffer.size -= len;
         }
 
         self.send_pending_data(tx);
@@ -946,7 +1020,10 @@ impl Connection {
 
         let seq = request.get_sequence();
         let range = (seq, seq + payload.len() as u32);
-        let window = (self.ack, self.ack + self.local_window);
+        let window = (
+            self.tcp_data.ack,
+            self.tcp_data.ack + self.tcp_data.local_window,
+        );
 
         let range_left = ((range.0 - window.0) as i32, (range.1 - window.0) as i32);
         let range_right = ((range.0 - window.1) as i32, (range.1 - window.1) as i32);
@@ -989,7 +1066,7 @@ impl Connection {
         request: &TcpPacket,
         tx: &mut Box<dyn DataLinkSender>,
     ) -> Option<TcpLayerPacket> {
-        self.ack = request.get_sequence() + 1;
+        self.tcp_data.ack = request.get_sequence() + 1;
         self.send_tcp_acknowledge_packet(None, tx);
 
         match self.state {
@@ -1005,7 +1082,7 @@ impl Connection {
     }
 
     fn copy_to_recv_buffer(&mut self, mut index: usize, buffer: &[u8]) {
-        let slices = self.recv_buffer.as_mut_slices();
+        let slices = self.recv_buffer.buffer.as_mut_slices();
 
         let mut consumed = 0usize;
         let mut remain = buffer.len();
@@ -1028,29 +1105,29 @@ impl Connection {
     }
 
     fn update_recv_ranges(&mut self, seq_range: (u32, u32)) {
-        for index in 0..self.recv_ranges.len() {
-            let diff = (seq_range.0 - self.recv_ranges[index].0) as i32;
+        for index in 0..self.recv_buffer.ranges.len() {
+            let diff = (seq_range.0 - self.recv_buffer.ranges[index].0) as i32;
             if diff < 0 {
-                return self.recv_ranges.insert(index, seq_range);
+                return self.recv_buffer.ranges.insert(index, seq_range);
             }
         }
 
-        self.recv_ranges.push_back(seq_range);
+        self.recv_buffer.ranges.push_back(seq_range);
     }
 
     fn handle_recv_buffer(&mut self) -> Option<TcpLayerPacket> {
-        let mut range = self.recv_ranges.front().unwrap().clone();
-        if self.ack != range.0 {
+        let mut range = self.recv_buffer.ranges.front().unwrap().clone();
+        if self.tcp_data.ack != range.0 {
             return None;
         }
 
         loop {
-            self.recv_ranges.pop_front();
-            if self.recv_ranges.is_empty() {
+            self.recv_buffer.ranges.pop_front();
+            if self.recv_buffer.ranges.is_empty() {
                 break;
             }
 
-            let front = self.recv_ranges.front().unwrap().clone();
+            let front = self.recv_buffer.ranges.front().unwrap().clone();
             if ((front.0 - range.1) as i32) > 0 {
                 break;
             }
@@ -1060,11 +1137,13 @@ impl Connection {
             }
         }
 
-        self.ack = range.1;
+        self.tcp_data.ack = range.1;
 
         let len = (range.1 - range.0) as usize;
-        let data = self.recv_buffer.drain(0..len).collect();
-        self.recv_buffer.resize(self.local_window as usize, 0);
+        let data = self.recv_buffer.buffer.drain(0..len).collect();
+        self.recv_buffer
+            .buffer
+            .resize(self.tcp_data.local_window as usize, 0);
         self.handler.handle_recv(data)
     }
 }
