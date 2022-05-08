@@ -89,7 +89,7 @@ impl TcpProcessor {
             }
 
             if Connection::is_syn_packet(&tcp_request) {
-                info!("{}: new tcp connection", key);
+                info!("{}: add tcp connection", key);
                 let mut connection = Connection::new(key.clone(), self.mac, source_mac, src, dst);
                 connection.handle_tcp_packet(&tcp_request, tx, callback);
                 self.connections.insert(key, connection);

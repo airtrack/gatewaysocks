@@ -1,7 +1,9 @@
+use std::env;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::thread;
 use std::time::Duration;
 
+use getopts::Options;
 use log::info;
 use simple_logger::SimpleLogger;
 
@@ -207,6 +209,18 @@ fn gateway_main(
 }
 
 fn main() {
+    let args: Vec<String> = env::args().collect();
+    let mut opts = Options::new();
+
+    opts.optopt("s", "socks5", "socks5 address", "socks5");
+
+    let matches = match opts.parse(&args[1..]) {
+        Ok(m) => m,
+        Err(_) => return println!("{}", opts.short_usage(&args[0])),
+    };
+
+    let socks5_addr = matches.opt_str("s").unwrap_or("127.0.0.1:1080".to_string());
+
     SimpleLogger::new()
         .with_utc_timestamps()
         .with_level(log::LevelFilter::Info)
@@ -214,7 +228,7 @@ fn main() {
         .init()
         .unwrap();
 
-    let socks5 = "127.0.0.1:1080".parse::<SocketAddr>().unwrap();
+    let socks5 = socks5_addr.parse::<SocketAddr>().unwrap();
     let gateway = "10.6.0.1".parse::<Ipv4Addr>().unwrap();
     let subnet_mask = "255.255.255.0".parse::<Ipv4Addr>().unwrap();
     let interface = datalink::interfaces()
@@ -230,7 +244,10 @@ fn main() {
         .unwrap_or_else(|| panic!("Could not find local network interface."));
     let mac = interface.mac.unwrap();
 
-    info!("start gatewaysocks on {}({}) ...", gateway, subnet_mask);
+    info!(
+        "start gatewaysocks on {}({}), relay to socks5://{} ...",
+        gateway, subnet_mask, socks5
+    );
 
     let (tcp_channel, channel_tcp) = socks5_channel();
     let (udp_channel, channel_udp) = socks5_channel();

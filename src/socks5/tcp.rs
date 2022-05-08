@@ -35,7 +35,7 @@ impl TcpSocks5 {
         let (exited_tx, exited_rx) = unbounded_channel();
 
         Self {
-            socks5_addr: socks5_addr,
+            socks5_addr,
             channel,
             exited_tx,
             exited_rx,
