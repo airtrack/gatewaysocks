@@ -17,7 +17,7 @@ use pnet::util::MacAddr;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::error::TryRecvError;
 
-use gatewaysocks::gateway::arp::ArpHandler;
+use gatewaysocks::gateway::arp::ArpProcessor;
 use gatewaysocks::gateway::tcp::{TcpLayerPacket, TcpProcessor};
 use gatewaysocks::gateway::udp::{UdpLayerPacket, UdpProcessor};
 use gatewaysocks::socks5::tcp::{TcpSocks5, TcpSocks5Data};
@@ -173,7 +173,7 @@ fn gateway_main(
         Err(e) => panic!("Unable to create channel: {}", e),
     };
 
-    let arp_handler = ArpHandler::new(mac, gateway);
+    let mut arp_processor = ArpProcessor::new(mac, gateway);
     let mut tcp_processor = TcpProcessor::new(mac, gateway, subnet_mask);
     let mut udp_processor = UdpProcessor::new(mac, gateway, subnet_mask);
 
@@ -192,7 +192,7 @@ fn gateway_main(
                             &udp_channel,
                         );
                     }
-                    EtherTypes::Arp => arp_handler.handle_packet(&mut tx, &ethernet_packet),
+                    EtherTypes::Arp => arp_processor.handle_packet(&mut tx, &ethernet_packet),
                     _ => {}
                 }
             }
@@ -202,6 +202,7 @@ fn gateway_main(
         handle_tcp_from_socks5(&mut tcp_processor, &mut tcp_channel, &mut tx);
         handle_udp_from_socks5(&udp_processor, &mut udp_channel, &mut tx);
 
+        arp_processor.heartbeat(&mut tx);
         tcp_processor.heartbeat(&mut tx, |data| {
             send_tcp_data_to_socks5(&tcp_channel, data);
         });
