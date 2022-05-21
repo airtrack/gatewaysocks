@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddrV4};
 
+use log::trace;
 use pnet::datalink::DataLinkSender;
 use pnet::packet::ethernet::{EtherTypes, MutableEthernetPacket};
 use pnet::packet::ip::IpNextHeaderProtocols;
@@ -56,6 +57,7 @@ impl UdpProcessor {
             let key = src.to_string();
 
             if !self.slots.contains_key(&key) {
+                trace!("{}: insert slot {}[{}]", key, src, source_mac);
                 self.slots.insert(
                     key.clone(),
                     Slot {
@@ -65,6 +67,7 @@ impl UdpProcessor {
                 );
             }
 
+            trace!("{}: send data({}) to {}", key, data.len(), dst);
             callback(UdpLayerPacket {
                 key,
                 data,
@@ -75,6 +78,13 @@ impl UdpProcessor {
 
     pub fn handle_output_packet(&self, tx: &mut Box<dyn DataLinkSender>, packet: UdpLayerPacket) {
         if let Some(slot) = self.slots.get(&packet.key) {
+            trace!(
+                "{}: recv data({}) from {}",
+                packet.key,
+                packet.data.len(),
+                packet.addr
+            );
+
             let udp_packet_len = 8 + packet.data.len();
             let mut udp_buffer = vec![0u8; udp_packet_len];
             let mut udp_packet = MutableUdpPacket::new(&mut udp_buffer).unwrap();
