@@ -213,6 +213,7 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     let mut opts = Options::new();
 
+    opts.optopt("i", "interface", "ether interface", "interface");
     opts.optopt("s", "socks5", "socks5 address", "socks5");
 
     let matches = match opts.parse(&args[1..]) {
@@ -220,6 +221,7 @@ fn main() {
         Err(_) => return println!("{}", opts.short_usage(&args[0])),
     };
 
+    let iface_name = matches.opt_str("i").unwrap_or("".to_string());
     let socks5_addr = matches.opt_str("s").unwrap_or("127.0.0.1:1080".to_string());
 
     SimpleLogger::new()
@@ -235,19 +237,23 @@ fn main() {
     let interface = datalink::interfaces()
         .into_iter()
         .filter(|iface| {
-            !iface.is_loopback()
-                && iface.mac.is_some()
-                && !iface.mac.as_ref().unwrap().is_zero()
-                && !iface.ips.is_empty()
-                && iface.ips.as_slice().into_iter().any(|ip| ip.is_ipv4())
+            if !iface_name.is_empty() {
+                iface_name == iface.name
+            } else {
+                !iface.is_loopback()
+                    && iface.mac.is_some()
+                    && !iface.mac.as_ref().unwrap().is_zero()
+                    && !iface.ips.is_empty()
+                    && iface.ips.as_slice().into_iter().any(|ip| ip.is_ipv4())
+            }
         })
         .next()
         .unwrap_or_else(|| panic!("Could not find local network interface."));
     let mac = interface.mac.unwrap();
 
     info!(
-        "start gatewaysocks on {}({}), relay to socks5://{} ...",
-        gateway, subnet_mask, socks5
+        "start gatewaysocks on {}: {}({}), relay to socks5://{} ...",
+        interface.name, gateway, subnet_mask, socks5
     );
 
     let (tcp_channel, channel_tcp) = socks5_channel();
