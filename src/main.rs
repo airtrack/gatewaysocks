@@ -215,6 +215,8 @@ fn main() {
 
     opts.optopt("i", "interface", "ether interface", "interface");
     opts.optopt("s", "socks5", "socks5 address", "socks5");
+    opts.optopt("", "gateway-ip", "gateway ip", "gateway");
+    opts.optopt("", "subnet-mask", "subnet mask", "subnet");
 
     let matches = match opts.parse(&args[1..]) {
         Ok(m) => m,
@@ -223,6 +225,12 @@ fn main() {
 
     let iface_name = matches.opt_str("i").unwrap_or("".to_string());
     let socks5_addr = matches.opt_str("s").unwrap_or("127.0.0.1:1080".to_string());
+    let gateway_addr = matches
+        .opt_str("gateway-ip")
+        .unwrap_or("10.6.0.1".to_string());
+    let subnet_addr = matches
+        .opt_str("subnet-mask")
+        .unwrap_or("255.255.255.0".to_string());
 
     SimpleLogger::new()
         .with_utc_timestamps()
@@ -232,8 +240,8 @@ fn main() {
         .unwrap();
 
     let socks5 = socks5_addr.parse::<SocketAddr>().unwrap();
-    let gateway = "10.6.0.1".parse::<Ipv4Addr>().unwrap();
-    let subnet_mask = "255.255.255.0".parse::<Ipv4Addr>().unwrap();
+    let gateway = gateway_addr.parse::<Ipv4Addr>().unwrap();
+    let subnet_mask = subnet_addr.parse::<Ipv4Addr>().unwrap();
     let interface = datalink::interfaces()
         .into_iter()
         .filter(|iface| {
