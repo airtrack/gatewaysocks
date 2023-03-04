@@ -15,7 +15,7 @@ Prepare a socks5 proxy(e.g. [stunnel](https://github.com/airtrack/stunnel)), whi
 
 Run `gatewaysocks` as root.
 
-    ./gatewaysocks [-s socks5-address(e.g. 127.0.0.1:1080)]
+    ./gatewaysocks [-s socks5-address(e.g. 127.0.0.1:1080)] [-i interface(e.g. en0)] [--gateway-ip ip(e.g. 10.6.0.1)] [--subnet-mask mask(e.g. 255.255.255.0)]
 
 By default, socks5 address is `127.0.0.1:1080`, gateway address is `10.6.0.1`, subnet mask is `255.255.255.0`.
 
