@@ -1001,7 +1001,7 @@ impl Connection {
     fn send_tcp_control_packet(
         &self,
         tx: &mut Box<dyn DataLinkSender>,
-        flags: u16,
+        flags: u8,
         seq_range: Option<(u32, u32)>,
     ) {
         let mut opts = Vec::new();
@@ -1017,7 +1017,7 @@ impl Connection {
         &self,
         tx: &mut Box<dyn DataLinkSender>,
         seq: u32,
-        flags: u16,
+        flags: u8,
         opts: &[TcpOption],
         opts_size: usize,
         payload: &[u8],

@@ -260,8 +260,8 @@ fn main() {
     let mac = interface.mac.unwrap();
 
     info!(
-        "start gatewaysocks on {}: {}({}), relay to socks5://{} ...",
-        interface.name, gateway, subnet_mask, socks5
+        "start gatewaysocks on {}[{}]: {}({}), relay to socks5://{} ...",
+        interface.name, mac, gateway, subnet_mask, socks5
     );
 
     let (tcp_channel, channel_tcp) = socks5_channel();
