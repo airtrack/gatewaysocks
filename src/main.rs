@@ -233,7 +233,7 @@ fn main() {
         .unwrap_or("255.255.255.0".to_string());
 
     SimpleLogger::new()
-        .with_utc_timestamps()
+        .without_timestamps()
         .with_level(log::LevelFilter::Info)
         .env()
         .init()
