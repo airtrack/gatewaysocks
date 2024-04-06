@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use log::{info, trace};
+use pnet::util::MacAddr;
 use tokio::io::AsyncReadExt;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{error::SendError, unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -14,18 +15,19 @@ use tokio::time::{interval, Interval};
 use super::{Handshaker, Socks5Channel};
 
 pub struct UdpSocks5Data {
-    pub key: String,
+    pub src: SocketAddrV4,
+    pub dst: SocketAddrV4,
+    pub mac: MacAddr,
     pub data: Vec<u8>,
-    pub addr: SocketAddrV4,
 }
 
 pub struct UdpSocks5 {
     server_addr: SocketAddr,
     channel: Socks5Channel<UdpSocks5Data>,
-    exited_tx: UnboundedSender<String>,
-    exited_rx: UnboundedReceiver<String>,
+    exited_tx: UnboundedSender<SocketAddrV4>,
+    exited_rx: UnboundedReceiver<SocketAddrV4>,
     timer: Interval,
-    clients: HashMap<String, Client>,
+    clients: HashMap<SocketAddrV4, Client>,
 }
 
 struct Client {
@@ -51,36 +53,37 @@ impl UdpSocks5 {
         loop {
             tokio::select! {
                 _ = self.timer.tick() => {
-                    self.clients.retain(|key, client| {
+                    self.clients.retain(|src, client| {
                         let timeout = client.is_timeout();
                         if timeout {
-                            trace!("{}: timeout to stop udp socks5", key);
+                            trace!("{}: timeout to stop udp socks5", src);
                             client.shutdown();
                         }
                         !timeout
                     });
                 }
-                key = self.exited_rx.recv() => {
-                    if let Some(key) = key {
-                        if let Some(client) = self.clients.get(&key) {
+                src = self.exited_rx.recv() => {
+                    if let Some(src) = src {
+                        if let Some(client) = self.clients.get(&src) {
                             client.shutdown();
                         }
-                        self.clients.remove(&key);
+                        self.clients.remove(&src);
                     }
                 }
                 result = self.channel.rx.recv() => {
                     if let Some(packet) = result {
-                        if !self.clients.contains_key(&packet.key) {
+                        if !self.clients.contains_key(&packet.src) {
                             let client = Client::new(
-                                packet.key.clone(),
+                                packet.src,
+                                packet.mac,
                                 self.server_addr,
                                 self.channel.tx.clone(),
                                 self.exited_tx.clone(),
                             );
-                            self.clients.insert(packet.key.clone(), client);
+                            self.clients.insert(packet.src, client);
                         }
 
-                        if let Some(client) = self.clients.get_mut(&packet.key) {
+                        if let Some(client) = self.clients.get_mut(&packet.src) {
                             let _ = client.send_to(packet);
                         }
                     }
@@ -92,19 +95,20 @@ impl UdpSocks5 {
 
 impl Client {
     fn new(
-        key: String,
+        src: SocketAddrV4,
+        mac: MacAddr,
         server_addr: SocketAddr,
         output_tx: UnboundedSender<UdpSocks5Data>,
-        exited_tx: UnboundedSender<String>,
+        exited_tx: UnboundedSender<SocketAddrV4>,
     ) -> Self {
         let (tx, rx) = unbounded_channel();
         let (shutdown_tx, shutdown_rx) = watch::channel(());
 
         tokio::spawn(async move {
-            info!("{}: start udp socks5", key);
-            let _ = Self::socks5_task(&key, shutdown_rx, server_addr, output_tx, rx).await;
-            info!("{}: stop udp socks5", key);
-            let _ = exited_tx.send(key);
+            info!("{}: start udp socks5", src);
+            let _ = Self::socks5_task(src, mac, shutdown_rx, server_addr, output_tx, rx).await;
+            info!("{}: stop udp socks5", src);
+            let _ = exited_tx.send(src);
         });
 
         Self {
@@ -131,7 +135,8 @@ impl Client {
     }
 
     async fn socks5_task(
-        key: &String,
+        src: SocketAddrV4,
+        mac: MacAddr,
         mut shutdown: Receiver<()>,
         server_addr: SocketAddr,
         output_tx: UnboundedSender<UdpSocks5Data>,
@@ -146,13 +151,11 @@ impl Client {
         let ssocket = Arc::new(socket);
         let rsocket = ssocket.clone();
 
-        let k = key.clone();
         let shutdown_rx = shutdown.clone();
-        let send_task = Self::send_to_socks5(k, shutdown_rx, input_rx, ssocket, relay_addr);
+        let send_task = Self::send_to_socks5(shutdown_rx, input_rx, ssocket, relay_addr);
 
-        let k = key.clone();
         let shutdown_rx = shutdown.clone();
-        let recv_task = Self::receive_from_socks5(k, shutdown_rx, output_tx, rsocket);
+        let recv_task = Self::receive_from_socks5(shutdown_rx, output_tx, rsocket, src, mac);
 
         let hold_task = async move {
             loop {
@@ -175,14 +178,11 @@ impl Client {
     }
 
     async fn send_to_socks5(
-        key: String,
         mut shutdown: Receiver<()>,
         mut input_rx: UnboundedReceiver<UdpSocks5Data>,
         udp_socket: Arc<UdpSocket>,
         relay_addr: SocketAddr,
     ) {
-        trace!("{}: start udp socks5 send task to {}", key, relay_addr);
-
         loop {
             tokio::select! {
                 result = input_rx.recv() => {
@@ -192,8 +192,8 @@ impl Client {
                         data[1] = 0;
                         data[2] = 0;
                         data[3] = super::ATYP_IPV4;
-                        data[4..8].copy_from_slice(&input.addr.ip().octets());
-                        data[8..10].copy_from_slice(&input.addr.port().to_be_bytes());
+                        data[4..8].copy_from_slice(&input.dst.ip().octets());
+                        data[8..10].copy_from_slice(&input.dst.port().to_be_bytes());
 
                         let len = std::cmp::min(input.data.len(), 1490);
                         data[10..10 + len].copy_from_slice(&input.data[0..len]);
@@ -204,18 +204,15 @@ impl Client {
                 _ = shutdown.changed() => break,
             }
         }
-
-        trace!("{}: stop udp socks5 send task to {}", key, relay_addr);
     }
 
     async fn receive_from_socks5(
-        key: String,
         mut shutdown: Receiver<()>,
         output_tx: UnboundedSender<UdpSocks5Data>,
         udp_socket: Arc<UdpSocket>,
+        src: SocketAddrV4,
+        mac: MacAddr,
     ) {
-        trace!("{}: start udp socks5 recv task", key);
-
         loop {
             let mut buffer = [0u8; 1500];
             tokio::select! {
@@ -232,9 +229,10 @@ impl Client {
                             data.extend_from_slice(&buffer[10..n]);
 
                             let _ = output_tx.send(UdpSocks5Data {
-                                key: key.clone(),
+                                src: SocketAddrV4::new(ip, port),
+                                dst: src,
+                                mac,
                                 data,
-                                addr: SocketAddrV4::new(ip, port),
                             });
                         }
                         Err(_) => {}
@@ -243,7 +241,5 @@ impl Client {
                 _ = shutdown.changed() => break,
             }
         }
-
-        trace!("{}: stop udp socks5 recv task", key);
     }
 }

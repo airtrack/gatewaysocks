@@ -60,9 +60,10 @@ fn send_tcp_data_to_socks5(tcp_channel: &Socks5Channel<TcpSocks5Data>, data: Tcp
 
 fn send_udp_data_to_socks5(udp_channel: &Socks5Channel<UdpSocks5Data>, data: UdpLayerPacket) {
     let _ = udp_channel.tx.send(UdpSocks5Data {
-        key: data.key,
+        src: data.src,
+        dst: data.dst,
+        mac: data.mac,
         data: data.data,
-        addr: data.addr,
     });
 }
 
@@ -132,9 +133,10 @@ fn handle_udp_from_socks5(
         match udp_channel.rx.try_recv() {
             Ok(data) => {
                 let udp_data = UdpLayerPacket {
-                    key: data.key,
+                    src: data.src,
+                    dst: data.dst,
+                    mac: data.mac,
                     data: data.data,
-                    addr: data.addr,
                 };
                 udp_processor.handle_output_packet(tx, udp_data);
             }
