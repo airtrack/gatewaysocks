@@ -153,17 +153,14 @@ impl Client {
         let k = key.clone();
         let s = shutdown.clone();
         let e = exited_tx.clone();
-        tokio::spawn(async move {
-            Self::send_to_socks5(k, s, e, input_rx, writer).await;
-        });
+        let send_task = Self::send_to_socks5(k, s, e, input_rx, writer);
 
         let k = key;
         let s = shutdown;
         let e = exited_tx;
-        tokio::spawn(async move {
-            Self::receive_from_socks5(k, s, e, output_tx, reader).await;
-        });
+        let recv_task = Self::receive_from_socks5(k, s, e, output_tx, reader);
 
+        futures::join!(send_task, recv_task);
         Ok(())
     }
 

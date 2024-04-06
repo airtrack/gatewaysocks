@@ -148,30 +148,29 @@ impl Client {
 
         let k = key.clone();
         let shutdown_rx = shutdown.clone();
-        tokio::spawn(async move {
-            Self::send_to_socks5(k, shutdown_rx, input_rx, ssocket, relay_addr).await;
-        });
+        let send_task = Self::send_to_socks5(k, shutdown_rx, input_rx, ssocket, relay_addr);
 
         let k = key.clone();
         let shutdown_rx = shutdown.clone();
-        tokio::spawn(async move {
-            Self::receive_from_socks5(k, shutdown_rx, output_tx, rsocket).await;
-        });
+        let recv_task = Self::receive_from_socks5(k, shutdown_rx, output_tx, rsocket);
 
-        loop {
-            let mut buffer = [0u8; 1024];
-            tokio::select! {
-                result = stream.read(&mut buffer) => {
-                    match result {
-                        Ok(0) => break,
-                        Ok(_) => {}
-                        Err(_) => break,
+        let hold_task = async move {
+            loop {
+                let mut buffer = [0u8; 1024];
+                tokio::select! {
+                    result = stream.read(&mut buffer) => {
+                        match result {
+                            Ok(0) => break,
+                            Ok(_) => {}
+                            Err(_) => break,
+                        }
                     }
+                    _ = shutdown.changed() => break,
                 }
-                _ = shutdown.changed() => break,
             }
-        }
+        };
 
+        futures::join!(send_task, recv_task, hold_task);
         Ok(())
     }
 

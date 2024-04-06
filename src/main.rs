@@ -32,13 +32,9 @@ fn socks5_main(
     let rt = Runtime::new().unwrap();
 
     rt.block_on(async move {
-        tokio::spawn(async move {
-            let mut tcp_socks5 = TcpSocks5::new(socks5, tcp_channel);
-            tcp_socks5.run().await;
-        });
-
+        let mut tcp_socks5 = TcpSocks5::new(socks5, tcp_channel);
         let mut udp_socks5 = UdpSocks5::new(socks5, udp_channel);
-        udp_socks5.run().await;
+        futures::join!(tcp_socks5.run(), udp_socks5.run());
     });
 }
 
