@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::Result;
+use std::io::{Error, ErrorKind, Result};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -9,7 +9,6 @@ use pnet::util::MacAddr;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc::{error::SendError, unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tokio::sync::watch::{self, Receiver, Sender};
 use tokio::time::{interval, Interval};
 
 use super::{Handshaker, Socks5Channel};
@@ -39,7 +38,6 @@ struct Exited {
 
 struct Client {
     input: UnboundedSender<UdpSocks5Data>,
-    shutdown: Sender<()>,
     alive_time: Instant,
 }
 
@@ -67,16 +65,12 @@ impl UdpSocks5 {
                         let timeout = client.is_timeout();
                         if timeout {
                             trace!("{} timeout to stop udp socks5", src);
-                            client.shutdown();
                         }
                         !timeout
                     });
                 }
                 src = self.exited.rx.recv() => {
                     if let Some(src) = src {
-                        if let Some(client) = self.clients.get(&src) {
-                            client.shutdown();
-                        }
                         self.clients.remove(&src);
                     }
                 }
@@ -112,29 +106,22 @@ impl Client {
         exit: UnboundedSender<SocketAddrV4>,
     ) -> Self {
         let (input, inbound) = unbounded_channel();
-        let (trigger, shutdown) = watch::channel(());
 
         tokio::spawn(async move {
             info!("{} start udp socks5", src);
-            let result =
-                Self::run_udp_socks5(src, mac, shutdown, socks5_addr, outbound, inbound).await;
+            let result = Self::run_udp_socks5(src, mac, socks5_addr, outbound, inbound).await;
             let _ = exit.send(src);
             info!("{} stop udp socks5: {:?}", src, result);
         });
 
         Self {
             input,
-            shutdown: trigger,
             alive_time: Instant::now(),
         }
     }
 
     fn is_timeout(&self) -> bool {
         (Instant::now() - self.alive_time) > Duration::new(CLIENT_TIMEOUT_SECS, 0)
-    }
-
-    fn shutdown(&self) {
-        let _ = self.shutdown.send(());
     }
 
     fn send_to(
@@ -148,7 +135,6 @@ impl Client {
     async fn run_udp_socks5(
         src: SocketAddrV4,
         mac: MacAddr,
-        shutdown: Receiver<()>,
         socks5_addr: SocketAddr,
         outbound: UnboundedSender<UdpSocks5Data>,
         inbound: UnboundedReceiver<UdpSocks5Data>,
@@ -161,92 +147,80 @@ impl Client {
         let sender = Arc::new(socket);
         let receiver = sender.clone();
 
-        let send_task = Self::send_to_socks5(shutdown.clone(), inbound, sender, destination);
-        let recv_task = Self::receive_from_socks5(shutdown.clone(), outbound, receiver, src, mac);
-        let hold_task = Self::holding_socks5(shutdown, stream);
+        let send_task = Self::send_to_socks5(inbound, sender, destination);
+        let recv_task = Self::receive_from_socks5(outbound, receiver, src, mac);
+        let hold_task = Self::holding_socks5(stream);
 
-        futures::join!(send_task, recv_task, hold_task);
+        futures::try_join!(send_task, recv_task, hold_task)?;
         Ok(())
     }
 
     async fn send_to_socks5(
-        mut shutdown: Receiver<()>,
         mut inbound: UnboundedReceiver<UdpSocks5Data>,
         sender: Arc<UdpSocket>,
         destination: SocketAddr,
-    ) {
+    ) -> Result<()> {
         loop {
-            tokio::select! {
-                result = inbound.recv() => {
-                    if let Some(packet) = result {
-                        let mut data = [0u8; 1500];
-                        data[0] = 0;
-                        data[1] = 0;
-                        data[2] = 0;
-                        data[3] = super::ATYP_IPV4;
-                        data[4..8].copy_from_slice(&packet.dst.ip().octets());
-                        data[8..10].copy_from_slice(&packet.dst.port().to_be_bytes());
+            let packet = inbound
+                .recv()
+                .await
+                .ok_or(Error::new(ErrorKind::Other, "inbound dropped"))?;
 
-                        let len = std::cmp::min(packet.data.len(), 1490);
-                        data[10..10 + len].copy_from_slice(&packet.data[0..len]);
+            let mut data = [0u8; 1500];
+            data[0] = 0;
+            data[1] = 0;
+            data[2] = 0;
+            data[3] = super::ATYP_IPV4;
+            data[4..8].copy_from_slice(&packet.dst.ip().octets());
+            data[8..10].copy_from_slice(&packet.dst.port().to_be_bytes());
 
-                        let _ = sender.send_to(&data[0..10 + len], destination).await;
-                    }
-                }
-                _ = shutdown.changed() => break,
-            }
+            let len = std::cmp::min(packet.data.len(), 1490);
+            data[10..10 + len].copy_from_slice(&packet.data[0..len]);
+
+            sender.send_to(&data[0..10 + len], destination).await?;
         }
     }
 
     async fn receive_from_socks5(
-        mut shutdown: Receiver<()>,
         outbound: UnboundedSender<UdpSocks5Data>,
         receiver: Arc<UdpSocket>,
         src: SocketAddrV4,
         mac: MacAddr,
-    ) {
+    ) -> Result<()> {
         loop {
             let mut buffer = [0u8; 1500];
-            tokio::select! {
-                result = receiver.recv_from(&mut buffer) => {
-                    match result {
-                        Ok((n, _)) => {
-                            if n <= 10 || buffer[3] != super::ATYP_IPV4 {
-                                continue;
-                            }
-
-                            let ip = Ipv4Addr::new(buffer[4], buffer[5], buffer[6], buffer[7]);
-                            let port = u16::from_be_bytes(buffer[8..10].try_into().unwrap());
-                            let mut data = Vec::with_capacity(n - 10);
-                            data.extend_from_slice(&buffer[10..n]);
-
-                            let _ = outbound.send(UdpSocks5Data {
-                                src: SocketAddrV4::new(ip, port),
-                                dst: src,
-                                mac,
-                                data,
-                            });
-                        }
-                        Err(_) => {}
-                    }
-                }
-                _ = shutdown.changed() => break,
+            let (n, _) = receiver.recv_from(&mut buffer).await?;
+            if n <= 10 || buffer[3] != super::ATYP_IPV4 {
+                continue;
             }
+
+            let ip = Ipv4Addr::new(buffer[4], buffer[5], buffer[6], buffer[7]);
+            let port = u16::from_be_bytes(buffer[8..10].try_into().unwrap());
+            let mut data = Vec::with_capacity(n - 10);
+            data.extend_from_slice(&buffer[10..n]);
+
+            let message = UdpSocks5Data {
+                src: SocketAddrV4::new(ip, port),
+                dst: src,
+                mac,
+                data,
+            };
+
+            outbound
+                .send(message)
+                .map_err(|_| Error::new(ErrorKind::Other, "send message error"))?;
         }
     }
 
-    async fn holding_socks5(mut shutdown: Receiver<()>, mut stream: TcpStream) {
+    async fn holding_socks5(mut stream: TcpStream) -> Result<()> {
         loop {
             let mut buffer = [0u8; 1024];
-            tokio::select! {
-                result = stream.read(&mut buffer) => {
-                    match result {
-                        Ok(0) => break,
-                        Ok(_) => {}
-                        Err(_) => break,
-                    }
-                }
-                _ = shutdown.changed() => break,
+            let size = stream.read(&mut buffer).await?;
+            if size == 0 {
+                return Err(Error::new(
+                    ErrorKind::ConnectionAborted,
+                    "holding tcp closed",
+                ));
             }
         }
     }
