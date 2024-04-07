@@ -1,9 +1,13 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::io::{Error, ErrorKind, Result};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
 use log::{info, trace};
 use pnet::util::MacAddr;
 use tokio::io::AsyncReadExt;
@@ -26,14 +30,9 @@ pub struct UdpSocks5Data {
 pub struct UdpSocks5 {
     socks5_addr: SocketAddr,
     timer: Interval,
-    exited: Exited,
     channel: Socks5Channel<UdpSocks5Data>,
     clients: HashMap<SocketAddrV4, Client>,
-}
-
-struct Exited {
-    tx: UnboundedSender<SocketAddrV4>,
-    rx: UnboundedReceiver<SocketAddrV4>,
+    futs: FuturesUnordered<Pin<Box<dyn Future<Output = SocketAddrV4>>>>,
 }
 
 struct Client {
@@ -44,16 +43,15 @@ struct Client {
 impl UdpSocks5 {
     pub fn new(socks5_addr: SocketAddr, channel: Socks5Channel<UdpSocks5Data>) -> Self {
         let timer = interval(Duration::from_millis(TIMER_INTERVAL_MS));
-        let (tx, rx) = unbounded_channel();
-        let exited = Exited { tx, rx };
         let clients = HashMap::new();
+        let futs = FuturesUnordered::new();
 
         Self {
             socks5_addr,
             timer,
-            exited,
             channel,
             clients,
+            futs,
         }
     }
 
@@ -69,27 +67,23 @@ impl UdpSocks5 {
                         !timeout
                     });
                 }
-                src = self.exited.rx.recv() => {
-                    if let Some(src) = src {
-                        self.clients.remove(&src);
-                    }
+                Some(src) = self.futs.next() => {
+                    self.clients.remove(&src);
                 }
-                result = self.channel.rx.recv() => {
-                    if let Some(packet) = result {
-                        if !self.clients.contains_key(&packet.src) {
-                            let client = Client::new(
-                                packet.src,
-                                packet.mac,
-                                self.socks5_addr,
-                                self.channel.tx.clone(),
-                                self.exited.tx.clone(),
-                            );
-                            self.clients.insert(packet.src, client);
-                        }
+                Some(packet) = self.channel.rx.recv() => {
+                    if !self.clients.contains_key(&packet.src) {
+                        let (client, fut) = Client::new(
+                            packet.src,
+                            packet.mac,
+                            self.socks5_addr,
+                            self.channel.tx.clone(),
+                        );
+                        self.clients.insert(packet.src, client);
+                        self.futs.push(Box::pin(fut));
+                    }
 
-                        if let Some(client) = self.clients.get_mut(&packet.src) {
-                            let _ = client.send_to(packet);
-                        }
+                    if let Some(client) = self.clients.get_mut(&packet.src) {
+                        let _ = client.send_to(packet);
                     }
                 }
             }
@@ -103,21 +97,18 @@ impl Client {
         mac: MacAddr,
         socks5_addr: SocketAddr,
         outbound: UnboundedSender<UdpSocks5Data>,
-        exit: UnboundedSender<SocketAddrV4>,
-    ) -> Self {
+    ) -> (Self, impl Future<Output = SocketAddrV4>) {
         let (input, inbound) = unbounded_channel();
+        let alive_time = Instant::now();
 
-        tokio::spawn(async move {
+        let fut = async move {
             info!("{} start udp socks5", src);
             let result = Self::run_udp_socks5(src, mac, socks5_addr, outbound, inbound).await;
-            let _ = exit.send(src);
             info!("{} stop udp socks5: {:?}", src, result);
-        });
+            src
+        };
 
-        Self {
-            input,
-            alive_time: Instant::now(),
-        }
+        (Self { input, alive_time }, fut)
     }
 
     fn is_timeout(&self) -> bool {
