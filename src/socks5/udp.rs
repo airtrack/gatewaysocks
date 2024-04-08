@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
-use log::{info, trace};
+use log::{error, info, trace};
 use pnet::util::MacAddr;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpStream, UdpSocket};
@@ -83,7 +83,13 @@ impl UdpSocks5 {
                     }
 
                     if let Some(client) = self.clients.get_mut(&packet.src) {
-                        let _ = client.send_to(packet);
+                        match client.send_to(packet) {
+                            Ok(_) => {},
+                            Err(SendError(packet)) => {
+                                self.clients.remove(&packet.src);
+                                error!("{} udp socks5 ended, send message error", packet.src);
+                            }
+                        }
                     }
                 }
             }
