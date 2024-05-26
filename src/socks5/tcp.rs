@@ -56,7 +56,7 @@ impl TcpSocks5 {
                     match data {
                         TcpSocks5Data::Connect((key, destination)) => {
                             let (client, fut) = Client::new(
-                                key.clone(),
+                                &key,
                                 self.socks5_addr,
                                 SocketAddr::V4(destination),
                                 self.channel.tx.clone(),
@@ -97,18 +97,18 @@ impl TcpSocks5 {
 
 impl Client {
     fn new(
-        key: String,
+        key: &str,
         socks5_addr: SocketAddr,
         destination: SocketAddr,
         outbound: UnboundedSender<TcpSocks5Data>,
     ) -> (Self, impl Future<Output = String>) {
         let (input, inbound) = unbounded_channel();
 
+        let key = key.to_string();
         let fut = async move {
             info!("{} start tcp socks5", key);
             let result =
-                Self::run_tcp_socks5(key.clone(), socks5_addr, destination, outbound, inbound)
-                    .await;
+                Self::run_tcp_socks5(&key, socks5_addr, destination, outbound, inbound).await;
             info!("{} stop tcp socks5: {:?}", key, result);
             key
         };
@@ -124,7 +124,7 @@ impl Client {
     }
 
     async fn run_tcp_socks5(
-        key: String,
+        key: &str,
         socks5_addr: SocketAddr,
         destination: SocketAddr,
         outbound: UnboundedSender<TcpSocks5Data>,
@@ -134,7 +134,7 @@ impl Client {
         handshaker.connect(destination).await?;
 
         outbound
-            .send(TcpSocks5Data::Established(key.clone()))
+            .send(TcpSocks5Data::Established(key.to_string()))
             .map_err(|_| Error::new(ErrorKind::Other, "send established error"))?;
 
         let (reader, writer) = handshaker.into_tcp_stream().into_split();
@@ -171,7 +171,7 @@ impl Client {
     }
 
     async fn receive_from_socks5(
-        key: String,
+        key: &str,
         outbound: UnboundedSender<TcpSocks5Data>,
         mut reader: OwnedReadHalf,
     ) -> Result<()> {
@@ -181,14 +181,14 @@ impl Client {
 
             if len == 0 {
                 outbound
-                    .send(TcpSocks5Data::Shutdown(key.clone()))
+                    .send(TcpSocks5Data::Shutdown(key.to_string()))
                     .map_err(|_| Error::new(ErrorKind::Other, "send shutdown error"))?;
                 break;
             }
 
             buffer.truncate(len);
             outbound
-                .send(TcpSocks5Data::Push((key.clone(), buffer)))
+                .send(TcpSocks5Data::Push((key.to_string(), buffer)))
                 .map_err(|_| Error::new(ErrorKind::Other, "send message error"))?;
         }
 
