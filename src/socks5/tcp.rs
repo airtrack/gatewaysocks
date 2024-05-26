@@ -3,15 +3,17 @@ use std::future::Future;
 use std::io::{Error, ErrorKind, Result};
 use std::net::{SocketAddr, SocketAddrV4};
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
-use log::{error, info};
+use log::info;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::mpsc::{error::SendError, unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::error::{SendError, TryRecvError};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-use super::{Handshaker, Socks5Channel};
+use super::Handshaker;
 
 pub enum TcpSocks5Data {
     Connect((String, SocketAddrV4)),
@@ -21,27 +23,107 @@ pub enum TcpSocks5Data {
     Close(String),
 }
 
-pub struct TcpSocks5 {
+pub struct TcpSocks5Handle {
     socks5_addr: SocketAddr,
-    channel: Socks5Channel<TcpSocks5Data>,
-    clients: HashMap<String, Client>,
-    futs: FuturesUnordered<Pin<Box<dyn Future<Output = String>>>>,
+    clients: Arc<Mutex<HashMap<String, Client>>>,
+    futs_tx: UnboundedSender<Box<dyn Future<Output = String> + Send>>,
+    message_tx: UnboundedSender<TcpSocks5Data>,
+    message_rx: UnboundedReceiver<TcpSocks5Data>,
+}
+
+pub struct TcpSocks5Service {
+    clients: Arc<Mutex<HashMap<String, Client>>>,
+    futs: FuturesUnordered<Pin<Box<dyn Future<Output = String> + Send>>>,
+    futs_rx: UnboundedReceiver<Box<dyn Future<Output = String> + Send>>,
+    message_tx: UnboundedSender<TcpSocks5Data>,
 }
 
 struct Client {
     input: UnboundedSender<TcpSocks5Data>,
 }
 
-impl TcpSocks5 {
-    pub fn new(socks5_addr: SocketAddr, channel: Socks5Channel<TcpSocks5Data>) -> Self {
-        let clients = HashMap::new();
+pub fn tcp_socks5(socks5_addr: SocketAddr) -> (TcpSocks5Handle, TcpSocks5Service) {
+    let clients = Arc::new(Mutex::new(HashMap::new()));
+    let (futs_tx, futs_rx) = unbounded_channel();
+    let (message_tx, message_rx) = unbounded_channel();
+    let handle = TcpSocks5Handle::new(
+        socks5_addr,
+        clients.clone(),
+        futs_tx,
+        message_tx.clone(),
+        message_rx,
+    );
+    let service = TcpSocks5Service::new(clients, futs_rx, message_tx);
+    (handle, service)
+}
+
+impl TcpSocks5Handle {
+    fn new(
+        socks5_addr: SocketAddr,
+        clients: Arc<Mutex<HashMap<String, Client>>>,
+        futs_tx: UnboundedSender<Box<dyn Future<Output = String> + Send>>,
+        message_tx: UnboundedSender<TcpSocks5Data>,
+        message_rx: UnboundedReceiver<TcpSocks5Data>,
+    ) -> Self {
+        Self {
+            socks5_addr,
+            clients,
+            futs_tx,
+            message_tx,
+            message_rx,
+        }
+    }
+
+    pub fn start_connection(&mut self, key: &str, destination: SocketAddrV4) {
+        let (client, fut) = Client::new(
+            key,
+            self.socks5_addr,
+            SocketAddr::V4(destination),
+            self.message_tx.clone(),
+        );
+
+        let _ = self.futs_tx.send(Box::new(fut));
+        self.clients.lock().unwrap().insert(key.to_string(), client);
+    }
+
+    pub fn close_connection(&mut self, key: &str) {
+        self.clients.lock().unwrap().remove(key);
+    }
+
+    pub fn send_socks5_message(&mut self, message: TcpSocks5Data) {
+        match message {
+            TcpSocks5Data::Push((ref key, _)) => {
+                if let Some(client) = self.clients.lock().unwrap().get(key) {
+                    let _ = client.send_to(message);
+                }
+            }
+            TcpSocks5Data::Shutdown(ref key) => {
+                if let Some(client) = self.clients.lock().unwrap().get(key) {
+                    let _ = client.send_to(message);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn try_recv_socks5_message(&mut self) -> core::result::Result<TcpSocks5Data, TryRecvError> {
+        self.message_rx.try_recv()
+    }
+}
+
+impl TcpSocks5Service {
+    fn new(
+        clients: Arc<Mutex<HashMap<String, Client>>>,
+        futs_rx: UnboundedReceiver<Box<dyn Future<Output = String> + Send>>,
+        message_tx: UnboundedSender<TcpSocks5Data>,
+    ) -> Self {
         let futs = FuturesUnordered::new();
 
         Self {
-            socks5_addr,
-            channel,
             clients,
             futs,
+            futs_rx,
+            message_tx,
         }
     }
 
@@ -49,46 +131,11 @@ impl TcpSocks5 {
         loop {
             tokio::select! {
                 Some(key) = self.futs.next() => {
-                    self.clients.remove(&key);
-                    let _ = self.channel.tx.send(TcpSocks5Data::Close(key));
+                    self.clients.lock().unwrap().remove(&key);
+                    let _ = self.message_tx.send(TcpSocks5Data::Close(key));
                 }
-                Some(data) = self.channel.rx.recv() => {
-                    match data {
-                        TcpSocks5Data::Connect((key, destination)) => {
-                            let (client, fut) = Client::new(
-                                &key,
-                                self.socks5_addr,
-                                SocketAddr::V4(destination),
-                                self.channel.tx.clone(),
-                            );
-                            self.clients.insert(key, client);
-                            self.futs.push(Box::pin(fut));
-                        }
-                        TcpSocks5Data::Push((key, buffer)) => {
-                            if let Some(client) = self.clients.get(&key) {
-                                match client.send_to(TcpSocks5Data::Push((key, buffer))) {
-                                    Err(SendError(TcpSocks5Data::Push((key, _)))) => {
-                                        error!("{} tcp socks5 ended, send message error", key);
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                        TcpSocks5Data::Shutdown(key) => {
-                            if let Some(client) = self.clients.get(&key) {
-                                match client.send_to(TcpSocks5Data::Shutdown(key)) {
-                                    Err(SendError(TcpSocks5Data::Shutdown(key))) => {
-                                        error!("{} tcp socks5 ended, send shutdown error", key);
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                        TcpSocks5Data::Close(key) => {
-                            self.clients.remove(&key);
-                        }
-                        _ => {}
-                    }
+                Some(fut) = self.futs_rx.recv() => {
+                    self.futs.push(Pin::from(fut));
                 }
             }
         }
