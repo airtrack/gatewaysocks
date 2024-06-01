@@ -22,7 +22,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 use gatewaysocks::gateway::arp::ArpProcessor;
 use gatewaysocks::gateway::tcp::{TcpConnectionHandler, TcpLayerPacket, TcpProcessor};
 use gatewaysocks::gateway::udp::{UdpLayerPacket, UdpProcessor};
-use gatewaysocks::socks5::tcp::{tcp_socks5, TcpSocks5Data, TcpSocks5Handle, TcpSocks5Service};
+use gatewaysocks::socks5::tcp::{tcp_socks5, TcpSocks5Handle, TcpSocks5Message, TcpSocks5Service};
 use gatewaysocks::socks5::udp::{UdpSocks5, UdpSocks5Data};
 use gatewaysocks::socks5::{socks5_channel, Socks5Channel};
 
@@ -44,12 +44,12 @@ impl TcpConnectionHandler for TcpConnectionToSocks5 {
             TcpLayerPacket::Push((key, data)) => {
                 self.socks5_handle
                     .borrow_mut()
-                    .send_socks5_message(TcpSocks5Data::Push((key, data)));
+                    .send_socks5_message(TcpSocks5Message::Push((key, data)));
             }
             TcpLayerPacket::Shutdown(key) => {
                 self.socks5_handle
                     .borrow_mut()
-                    .send_socks5_message(TcpSocks5Data::Shutdown(key));
+                    .send_socks5_message(TcpSocks5Message::Shutdown(key));
             }
             TcpLayerPacket::Close(key) => {
                 self.socks5_handle.borrow_mut().close_connection(&key);
@@ -125,11 +125,11 @@ fn handle_tcp_from_socks5(
         match tcp_socks5_handle.try_recv_socks5_message() {
             Ok(data) => {
                 let tcp_data = match data {
-                    TcpSocks5Data::Connect(v) => TcpLayerPacket::Connect(v),
-                    TcpSocks5Data::Established(v) => TcpLayerPacket::Established(v),
-                    TcpSocks5Data::Push(v) => TcpLayerPacket::Push(v),
-                    TcpSocks5Data::Shutdown(v) => TcpLayerPacket::Shutdown(v),
-                    TcpSocks5Data::Close(v) => TcpLayerPacket::Close(v),
+                    TcpSocks5Message::Connect(v) => TcpLayerPacket::Connect(v),
+                    TcpSocks5Message::Established(v) => TcpLayerPacket::Established(v),
+                    TcpSocks5Message::Push(v) => TcpLayerPacket::Push(v),
+                    TcpSocks5Message::Shutdown(v) => TcpLayerPacket::Shutdown(v),
+                    TcpSocks5Message::Close(v) => TcpLayerPacket::Close(v),
                 };
                 tcp_processor.handle_output_packet(tx, tcp_data);
             }
