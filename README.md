@@ -1,4 +1,4 @@
-gatewaysocks
+Gatewaysocks
 ============
 
 Relay TCP/UDP to SOCKS5.
@@ -43,4 +43,4 @@ Work with stunnel and autoproxy
 
 Status
 ------
-`gatewaysocks` was just tested on macOS(M1 chip).
+`gatewaysocks` was tested on macOS(M1 chip) and Linux.
