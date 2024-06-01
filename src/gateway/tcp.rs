@@ -32,7 +32,7 @@ pub struct TcpProcessor {
     gateway: Ipv4Addr,
     subnet_mask: Ipv4Addr,
     heartbeat: Instant,
-    connections: HashMap<String, Connection>,
+    connections: HashMap<String, TcpConnection>,
     new_conn_handler: Box<dyn FnMut() -> Box<dyn TcpConnectionHandler>>,
 }
 
@@ -94,11 +94,11 @@ impl TcpProcessor {
                 return connection.handle_tcp_packet(&tcp_request, tx);
             }
 
-            if Connection::is_syn_packet(&tcp_request) {
+            if TcpConnection::is_syn_packet(&tcp_request) {
                 info!("{}: add tcp connection", key);
                 let handler = (self.new_conn_handler)();
                 let mut connection =
-                    Connection::new(key.clone(), self.mac, source_mac, src, dst, handler);
+                    TcpConnection::new(&key, self.mac, source_mac, src, dst, handler);
                 connection.handle_tcp_packet(&tcp_request, tx);
                 self.connections.insert(key, connection);
             }
@@ -141,7 +141,7 @@ impl TcpProcessor {
     }
 }
 
-struct LayerHandler {
+struct TcpLayerHandler {
     key: String,
     dst_addr: SocketAddrV4,
     connect: bool,
@@ -149,10 +149,10 @@ struct LayerHandler {
     handler: Box<dyn TcpConnectionHandler>,
 }
 
-impl LayerHandler {
-    fn new(key: String, dst_addr: SocketAddrV4, handler: Box<dyn TcpConnectionHandler>) -> Self {
+impl TcpLayerHandler {
+    fn new(key: &str, dst_addr: SocketAddrV4, handler: Box<dyn TcpConnectionHandler>) -> Self {
         Self {
-            key,
+            key: key.to_string(),
             dst_addr,
             connect: false,
             shutdown: false,
@@ -352,7 +352,7 @@ const DEFAULT_RTT: u32 = 100;
 const MAX_RTO: u32 = 100;
 const MIN_RTO: u32 = 10;
 
-struct Connection {
+struct TcpConnection {
     key: String,
     state: State,
     time: Time,
@@ -361,12 +361,12 @@ struct Connection {
     recv_buffer: RecvBuffer,
     send_buffer: SendBuffer,
     tcp_data: TcpData,
-    handler: LayerHandler,
+    handler: TcpLayerHandler,
 }
 
-impl Connection {
+impl TcpConnection {
     fn new(
-        key: String,
+        key: &str,
         mac: MacAddr,
         src_mac: MacAddr,
         src_addr: SocketAddrV4,
@@ -374,7 +374,7 @@ impl Connection {
         handler: Box<dyn TcpConnectionHandler>,
     ) -> Self {
         Self {
-            key: key.clone(),
+            key: key.to_string(),
             state: State::Listen,
             time: Time::new(),
             addr: Address::new(mac, src_mac, src_addr, dst_addr),
@@ -382,7 +382,7 @@ impl Connection {
             recv_buffer: RecvBuffer::new(),
             send_buffer: SendBuffer::new(),
             tcp_data: TcpData::new(),
-            handler: LayerHandler::new(key, dst_addr, handler),
+            handler: TcpLayerHandler::new(key, dst_addr, handler),
         }
     }
 
