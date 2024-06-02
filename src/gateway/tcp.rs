@@ -24,7 +24,8 @@ pub enum TcpLayerPacket {
 }
 
 pub trait TcpConnectionHandler {
-    fn handle_tcp_packet(&mut self, packet: TcpLayerPacket);
+    fn handle_input_tcp_packet(&mut self) -> Option<Vec<TcpLayerPacket>>;
+    fn handle_output_tcp_packet(&mut self, packet: TcpLayerPacket);
 }
 
 pub struct TcpProcessor {
@@ -33,7 +34,7 @@ pub struct TcpProcessor {
     subnet_mask: Ipv4Addr,
     heartbeat: Instant,
     connections: HashMap<String, TcpConnection>,
-    new_conn_handler: Box<dyn FnMut() -> Box<dyn TcpConnectionHandler>>,
+    new_conn_handler: Box<dyn FnMut(&str, SocketAddrV4) -> Box<dyn TcpConnectionHandler>>,
 }
 
 impl TcpProcessor {
@@ -41,7 +42,7 @@ impl TcpProcessor {
         mac: MacAddr,
         gateway: Ipv4Addr,
         subnet_mask: Ipv4Addr,
-        new_conn_handler: impl FnMut() -> Box<dyn TcpConnectionHandler> + 'static,
+        new_conn_handler: impl FnMut(&str, SocketAddrV4) -> Box<dyn TcpConnectionHandler> + 'static,
     ) -> Self {
         Self {
             mac,
@@ -96,46 +97,11 @@ impl TcpProcessor {
 
             if TcpConnection::is_syn_packet(&tcp_request) {
                 info!("{}: add tcp connection", key);
-                let handler = (self.new_conn_handler)();
+                let handler = (self.new_conn_handler)(&key, dst);
                 let mut connection =
                     TcpConnection::new(&key, self.mac, source_mac, src, dst, handler);
                 connection.handle_tcp_packet(&tcp_request, tx);
                 self.connections.insert(key, connection);
-            }
-        }
-    }
-
-    pub fn handle_output_packet(
-        &mut self,
-        tx: &mut Box<dyn DataLinkSender>,
-        packet: TcpLayerPacket,
-    ) {
-        match packet {
-            TcpLayerPacket::Connect(_) => unreachable!(),
-            TcpLayerPacket::Established(key) => {
-                if let Some(connection) = self.connections.get_mut(&key) {
-                    connection.connected(tx);
-                }
-            }
-            TcpLayerPacket::Push((key, data)) => {
-                if let Some(connection) = self.connections.get_mut(&key) {
-                    connection.push(data, tx);
-                }
-            }
-            TcpLayerPacket::Shutdown(key) => {
-                if let Some(connection) = self.connections.get_mut(&key) {
-                    connection.shutdown(tx);
-                }
-            }
-            TcpLayerPacket::Close(key) => {
-                if let Some(connection) = self.connections.get_mut(&key) {
-                    info!(
-                        "{}[{}]: close to remove tcp connection",
-                        key, connection.state
-                    );
-                    connection.close(tx);
-                    self.connections.remove(&key);
-                }
             }
         }
     }
@@ -160,6 +126,10 @@ impl TcpLayerHandler {
         }
     }
 
+    fn handle_input_tcp_packet(&mut self) -> Option<Vec<TcpLayerPacket>> {
+        self.handler.handle_input_tcp_packet()
+    }
+
     fn handle_connect(&mut self) {
         if self.connect {
             return;
@@ -167,13 +137,13 @@ impl TcpLayerHandler {
 
         self.connect = true;
         self.handler
-            .handle_tcp_packet(TcpLayerPacket::Connect((self.key.clone(), self.dst_addr)));
+            .handle_output_tcp_packet(TcpLayerPacket::Connect((self.key.clone(), self.dst_addr)));
     }
 
     fn handle_recv(&mut self, data: Vec<u8>) {
         trace!("{}: recv data size: {}", self.key, data.len());
         self.handler
-            .handle_tcp_packet(TcpLayerPacket::Push((self.key.clone(), data)));
+            .handle_output_tcp_packet(TcpLayerPacket::Push((self.key.clone(), data)));
     }
 
     fn handle_recv_fin(&mut self) {
@@ -183,17 +153,12 @@ impl TcpLayerHandler {
 
         self.shutdown = true;
         self.handler
-            .handle_tcp_packet(TcpLayerPacket::Shutdown(self.key.clone()));
+            .handle_output_tcp_packet(TcpLayerPacket::Shutdown(self.key.clone()));
     }
 
     fn handle_reset(&mut self) {
         self.handler
-            .handle_tcp_packet(TcpLayerPacket::Close(self.key.clone()));
-    }
-
-    fn handle_close(&mut self) {
-        self.handler
-            .handle_tcp_packet(TcpLayerPacket::Close(self.key.clone()));
+            .handle_output_tcp_packet(TcpLayerPacket::Close(self.key.clone()));
     }
 }
 
@@ -421,14 +386,38 @@ impl TcpConnection {
         }
     }
 
+    fn handle_output_packet(&mut self, tx: &mut Box<dyn DataLinkSender>, packet: TcpLayerPacket) {
+        match packet {
+            TcpLayerPacket::Connect(_) => unreachable!(),
+            TcpLayerPacket::Established(_) => {
+                self.connected(tx);
+            }
+            TcpLayerPacket::Push((_, data)) => {
+                self.push(data, tx);
+            }
+            TcpLayerPacket::Shutdown(_) => {
+                self.shutdown(tx);
+            }
+            TcpLayerPacket::Close(_) => {
+                info!("{}[{}]: close tcp connection", self.key, self.state);
+                self.close(tx);
+            }
+        }
+    }
+
     fn heartbeat(&mut self, tx: &mut Box<dyn DataLinkSender>) -> bool {
+        if let Some(packets) = self.handler.handle_input_tcp_packet() {
+            for packet in packets {
+                self.handle_output_packet(tx, packet);
+            }
+        }
+
         if self.is_closed() {
             return false;
         }
 
         if self.is_timewait_timeout() {
             trace!("{}[{}]: TimeWait timeout", self.key, self.state);
-            self.handler.handle_close();
             self.state = State::Closed;
             return false;
         }

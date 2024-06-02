@@ -1,7 +1,5 @@
-use std::cell::RefCell;
 use std::env;
-use std::net::{Ipv4Addr, SocketAddr};
-use std::rc::Rc;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::thread;
 use std::time::Duration;
 
@@ -22,38 +20,50 @@ use tokio::sync::mpsc::error::TryRecvError;
 use gatewaysocks::gateway::arp::ArpProcessor;
 use gatewaysocks::gateway::tcp::{TcpConnectionHandler, TcpLayerPacket, TcpProcessor};
 use gatewaysocks::gateway::udp::{UdpLayerPacket, UdpProcessor};
-use gatewaysocks::socks5::tcp::{tcp_socks5, TcpSocks5Handle, TcpSocks5Message, TcpSocks5Service};
+use gatewaysocks::socks5::tcp::{
+    tcp_socks5, TcpSocks5Client, TcpSocks5Handle, TcpSocks5Message, TcpSocks5Service,
+};
 use gatewaysocks::socks5::udp::{UdpSocks5, UdpSocks5Data};
 use gatewaysocks::socks5::{socks5_channel, Socks5Channel};
 
 struct TcpConnectionToSocks5 {
-    socks5_handle: Rc<RefCell<TcpSocks5Handle>>,
+    socks5_client: TcpSocks5Client,
 }
 
 impl TcpConnectionHandler for TcpConnectionToSocks5 {
-    fn handle_tcp_packet(&mut self, packet: TcpLayerPacket) {
+    fn handle_input_tcp_packet(&mut self) -> Option<Vec<TcpLayerPacket>> {
+        if let Some(messages) = self.socks5_client.recv_socks5_messages() {
+            let packets = messages
+                .into_iter()
+                .map(|message| match message {
+                    TcpSocks5Message::Connect(v) => TcpLayerPacket::Connect(v),
+                    TcpSocks5Message::Established(v) => TcpLayerPacket::Established(v),
+                    TcpSocks5Message::Push(v) => TcpLayerPacket::Push(v),
+                    TcpSocks5Message::Shutdown(v) => TcpLayerPacket::Shutdown(v),
+                    TcpSocks5Message::Close(v) => TcpLayerPacket::Close(v),
+                })
+                .collect();
+            return Some(packets);
+        }
+
+        None
+    }
+
+    fn handle_output_tcp_packet(&mut self, packet: TcpLayerPacket) {
         match packet {
-            TcpLayerPacket::Connect((key, destination)) => {
-                self.socks5_handle
-                    .borrow_mut()
-                    .start_connection(&key, destination);
-            }
+            TcpLayerPacket::Connect(_) => {}
             TcpLayerPacket::Established(_) => {
                 unreachable!();
             }
             TcpLayerPacket::Push((key, data)) => {
-                self.socks5_handle
-                    .borrow_mut()
+                self.socks5_client
                     .send_socks5_message(TcpSocks5Message::Push((key, data)));
             }
             TcpLayerPacket::Shutdown(key) => {
-                self.socks5_handle
-                    .borrow_mut()
+                self.socks5_client
                     .send_socks5_message(TcpSocks5Message::Shutdown(key));
             }
-            TcpLayerPacket::Close(key) => {
-                self.socks5_handle.borrow_mut().close_connection(&key);
-            }
+            TcpLayerPacket::Close(_) => {}
         }
     }
 }
@@ -116,29 +126,6 @@ fn handle_ipv4_from_gateway(
     }
 }
 
-fn handle_tcp_from_socks5(
-    tcp_processor: &mut TcpProcessor,
-    tcp_socks5_handle: &mut TcpSocks5Handle,
-    tx: &mut Box<dyn DataLinkSender>,
-) {
-    loop {
-        match tcp_socks5_handle.try_recv_socks5_message() {
-            Ok(data) => {
-                let tcp_data = match data {
-                    TcpSocks5Message::Connect(v) => TcpLayerPacket::Connect(v),
-                    TcpSocks5Message::Established(v) => TcpLayerPacket::Established(v),
-                    TcpSocks5Message::Push(v) => TcpLayerPacket::Push(v),
-                    TcpSocks5Message::Shutdown(v) => TcpLayerPacket::Shutdown(v),
-                    TcpSocks5Message::Close(v) => TcpLayerPacket::Close(v),
-                };
-                tcp_processor.handle_output_packet(tx, tcp_data);
-            }
-            Err(TryRecvError::Empty) => break,
-            Err(_) => {}
-        }
-    }
-}
-
 fn handle_udp_from_socks5(
     udp_processor: &UdpProcessor,
     udp_channel: &mut Socks5Channel<UdpSocks5Data>,
@@ -166,7 +153,7 @@ fn gateway_main(
     gateway: Ipv4Addr,
     subnet_mask: Ipv4Addr,
     interface: &NetworkInterface,
-    tcp_socks5_handle: TcpSocks5Handle,
+    mut tcp_socks5_handle: TcpSocks5Handle,
     mut udp_channel: Socks5Channel<UdpSocks5Data>,
 ) {
     let config = Config {
@@ -186,13 +173,17 @@ fn gateway_main(
         Err(e) => panic!("Unable to create channel: {}", e),
     };
 
-    let socks5_handle = Rc::new(RefCell::new(tcp_socks5_handle));
-    let tcp_socks5_handle = socks5_handle.clone();
-    let mut tcp_processor = TcpProcessor::new(mac, gateway, subnet_mask, move || {
-        Box::new(TcpConnectionToSocks5 {
-            socks5_handle: socks5_handle.clone(),
-        })
-    });
+    let mut tcp_processor = TcpProcessor::new(
+        mac,
+        gateway,
+        subnet_mask,
+        move |key: &str, destination: SocketAddrV4| {
+            let client = tcp_socks5_handle.start_connection(key, destination);
+            Box::new(TcpConnectionToSocks5 {
+                socks5_client: client,
+            })
+        },
+    );
 
     let mut arp_processor = ArpProcessor::new(mac, gateway);
     let mut udp_processor = UdpProcessor::new(mac, gateway, subnet_mask);
@@ -218,11 +209,6 @@ fn gateway_main(
             Err(_) => {}
         }
 
-        handle_tcp_from_socks5(
-            &mut tcp_processor,
-            &mut tcp_socks5_handle.borrow_mut(),
-            &mut tx,
-        );
         handle_udp_from_socks5(&udp_processor, &mut udp_channel, &mut tx);
 
         arp_processor.heartbeat(&mut tx);
