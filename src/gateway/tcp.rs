@@ -56,16 +56,24 @@ impl TcpProcessor {
 
     pub fn heartbeat(&mut self, tx: &mut Box<dyn DataLinkSender>) {
         let now = Instant::now();
-        if (now - self.heartbeat).as_millis() < 5 {
+        if (now - self.heartbeat).as_micros() < 1000 {
             return;
         }
 
         self.heartbeat = now;
+
+        // 1000 Mbps ethenet, 120000 * 8 * 1000 = 960Mbps
+        let mut total_pacing = 120000;
         self.connections.retain(|key, connection| -> bool {
+            let pacing = std::cmp::min(20000, total_pacing);
+            connection.send_buffer.pacing = pacing;
+
             let alive = connection.heartbeat(tx);
             if !alive {
                 info!("{}[{}]: remove tcp connection", key, connection.state);
             }
+
+            total_pacing -= pacing - connection.send_buffer.pacing;
             alive
         });
     }
@@ -269,6 +277,7 @@ enum PendingData {
 
 struct SendBuffer {
     size: usize,
+    pacing: usize,
     buffer: VecDeque<SendingData>,
     pending: VecDeque<PendingData>,
 }
@@ -277,6 +286,7 @@ impl SendBuffer {
     fn new() -> Self {
         Self {
             size: 0,
+            pacing: 0,
             buffer: VecDeque::new(),
             pending: VecDeque::new(),
         }
@@ -312,10 +322,10 @@ impl TcpData {
 
 const MSL_2: u128 = 30000;
 const MAX_TCP_HEADER_LEN: usize = 60;
-const LOCAL_WINDOW: u32 = 2 * 1024 * 1024;
+const LOCAL_WINDOW: u32 = 256 * 1024;
 const DEFAULT_RTT: u32 = 100;
 const MAX_RTO: u32 = 100;
-const MIN_RTO: u32 = 10;
+const MIN_RTO: u32 = 1;
 
 struct TcpConnection {
     key: String,
@@ -406,9 +416,11 @@ impl TcpConnection {
     }
 
     fn heartbeat(&mut self, tx: &mut Box<dyn DataLinkSender>) -> bool {
-        if let Some(packets) = self.handler.handle_input_tcp_packet() {
-            for packet in packets {
-                self.handle_output_packet(tx, packet);
+        if self.send_buffer.pending.len() < 16 {
+            if let Some(packets) = self.handler.handle_input_tcp_packet() {
+                for packet in packets {
+                    self.handle_output_packet(tx, packet);
+                }
             }
         }
 
@@ -422,25 +434,7 @@ impl TcpConnection {
             return false;
         }
 
-        let now = Instant::now();
-        for index in 0..self.send_buffer.buffer.len() {
-            let sending_data = &self.send_buffer.buffer[index];
-            if (now - sending_data.send_time).as_millis() < self.rto_vars.rto as u128 {
-                break;
-            }
-
-            self.send_tcp_data_packet(tx, sending_data);
-            self.send_buffer.buffer[index].send_time = now;
-            trace!(
-                "{}[{}]: resend data at seq: {}, len: {}, rto: {}",
-                self.key,
-                self.state,
-                self.send_buffer.buffer[index].seq,
-                self.send_buffer.buffer[index].data.len(),
-                self.rto_vars.rto
-            );
-        }
-
+        self.resend_sending_data(tx);
         self.send_pending_data(tx);
         return true;
     }
@@ -479,7 +473,12 @@ impl TcpConnection {
             return self.send_buffer.pending.push_back(PendingData::Data(data));
         }
 
-        if data.len() + self.send_buffer.size <= remote_window {
+        let size = std::cmp::min(
+            remote_window - self.send_buffer.size,
+            self.send_buffer.pacing,
+        );
+
+        if data.len() <= size {
             trace!(
                 "{}[{}]: send data size: {}",
                 self.key,
@@ -489,8 +488,7 @@ impl TcpConnection {
             return self.send_data(tx, data);
         }
 
-        let space = remote_window - self.send_buffer.size;
-        let pending_data = data.split_off(space);
+        let pending_data = data.split_off(size);
 
         trace!(
             "{}[{}]: send data size: {}",
@@ -721,9 +719,36 @@ impl TcpConnection {
         let sending_data = SendingData::new(self.tcp_data.seq, data);
         self.tcp_data.seq += sending_data.data.len() as u32;
         self.send_buffer.size += sending_data.data.len();
+        self.send_buffer.pacing -= sending_data.data.len();
 
         self.send_tcp_data_packet(tx, &sending_data);
         self.send_buffer.buffer.push_back(sending_data);
+    }
+
+    fn resend_sending_data(&mut self, tx: &mut Box<dyn DataLinkSender>) {
+        let now = Instant::now();
+        for index in 0..self.send_buffer.buffer.len() {
+            let sending_data = &self.send_buffer.buffer[index];
+            if (now - sending_data.send_time).as_millis() < self.rto_vars.rto as u128 {
+                break;
+            }
+
+            if self.send_buffer.pacing < sending_data.data.len() {
+                break;
+            }
+
+            self.send_buffer.pacing -= sending_data.data.len();
+            self.send_tcp_data_packet(tx, sending_data);
+            self.send_buffer.buffer[index].send_time = now;
+            trace!(
+                "{}[{}]: resend data at seq: {}, len: {}, rto: {}",
+                self.key,
+                self.state,
+                self.send_buffer.buffer[index].seq,
+                self.send_buffer.buffer[index].data.len(),
+                self.rto_vars.rto
+            );
+        }
     }
 
     fn send_pending_data(&mut self, tx: &mut Box<dyn DataLinkSender>) {
@@ -738,7 +763,7 @@ impl TcpConnection {
             window = 0;
         }
 
-        while !self.send_buffer.pending.is_empty() && window > 0 {
+        while !self.send_buffer.pending.is_empty() && self.send_buffer.pacing > 0 && window > 0 {
             let front = self.send_buffer.pending.pop_front().unwrap();
 
             match front {
@@ -755,7 +780,8 @@ impl TcpConnection {
 
                         window -= len;
                     } else {
-                        let tail = data.split_off(window);
+                        let size = std::cmp::min(window, self.send_buffer.pacing);
+                        let tail = data.split_off(size);
 
                         trace!(
                             "{}[{}]: send pending data size: {}",
@@ -765,7 +791,7 @@ impl TcpConnection {
                         );
                         self.send_data(tx, data);
 
-                        window = 0;
+                        window -= size;
                         self.send_buffer.pending.push_front(PendingData::Data(tail));
                     }
                 }

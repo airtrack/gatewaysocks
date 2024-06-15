@@ -8,7 +8,9 @@ use futures::StreamExt;
 use log::info;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{
+    channel, unbounded_channel, Receiver, Sender, UnboundedReceiver, UnboundedSender,
+};
 
 use super::Handshaker;
 
@@ -77,7 +79,7 @@ impl TcpSocks5Service {
 
 pub struct TcpSocks5Client {
     input: UnboundedSender<TcpSocks5Message>,
-    output: UnboundedReceiver<TcpSocks5Message>,
+    output: Receiver<TcpSocks5Message>,
 }
 
 impl TcpSocks5Client {
@@ -87,7 +89,7 @@ impl TcpSocks5Client {
         destination: SocketAddr,
     ) -> (Self, impl Future<Output = ()>) {
         let (input, inbound) = unbounded_channel();
-        let (outbound, output) = unbounded_channel();
+        let (outbound, output) = channel(32);
 
         let key = key.to_string();
         let fut = async move {
@@ -131,7 +133,7 @@ impl TcpSocks5Client {
         key: &str,
         socks5_addr: SocketAddr,
         destination: SocketAddr,
-        outbound: UnboundedSender<TcpSocks5Message>,
+        outbound: Sender<TcpSocks5Message>,
         inbound: UnboundedReceiver<TcpSocks5Message>,
     ) -> Result<()> {
         let mut handshaker = Handshaker::new(socks5_addr).await?;
@@ -139,6 +141,7 @@ impl TcpSocks5Client {
 
         outbound
             .send(TcpSocks5Message::Established(key.to_string()))
+            .await
             .map_err(|_| Error::new(ErrorKind::Other, "send established error"))?;
 
         let (reader, writer) = handshaker.into_tcp_stream().into_split();
@@ -176,7 +179,7 @@ impl TcpSocks5Client {
 
     async fn receive_from_socks5(
         key: &str,
-        outbound: UnboundedSender<TcpSocks5Message>,
+        outbound: Sender<TcpSocks5Message>,
         mut reader: OwnedReadHalf,
     ) -> Result<()> {
         loop {
@@ -186,6 +189,7 @@ impl TcpSocks5Client {
             if len == 0 {
                 outbound
                     .send(TcpSocks5Message::Shutdown(key.to_string()))
+                    .await
                     .map_err(|_| Error::new(ErrorKind::Other, "send shutdown error"))?;
                 break;
             }
@@ -193,6 +197,7 @@ impl TcpSocks5Client {
             buffer.truncate(len);
             outbound
                 .send(TcpSocks5Message::Push((key.to_string(), buffer)))
+                .await
                 .map_err(|_| Error::new(ErrorKind::Other, "send message error"))?;
         }
 
