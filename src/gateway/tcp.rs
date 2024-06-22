@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::Instant;
 
-use log::{error, info, trace};
+use log::{error, info, trace, warn};
 use pnet::datalink::DataLinkSender;
 use pnet::packet::ethernet::{EtherTypes, MutableEthernetPacket};
 use pnet::packet::ip::IpNextHeaderProtocols;
@@ -1152,8 +1152,11 @@ impl TcpConnection {
         let range_left = ((range.0 - window.0) as i32, (range.1 - window.0) as i32);
         let range_right = ((range.0 - window.1) as i32, (range.1 - window.1) as i32);
         if range_left.1 <= 0 || range_right.0 >= 0 {
-            self.send_tcp_acknowledge_packet(None, tx);
-            return;
+            warn!(
+                "{}[{}]: payload [{}, {}) out of local window [{}, {})",
+                self.key, self.state, range.0, range.1, window.0, window.1
+            );
+            return self.send_tcp_acknowledge_packet(None, tx);
         }
 
         let mut data_index = 0usize;
@@ -1168,6 +1171,10 @@ impl TcpConnection {
         }
 
         let buffer_index = if range_left.0 > 0 {
+            warn!(
+                "{}[{}]: local window hole [{}, {})",
+                self.key, self.state, window.0, range.0
+            );
             range_left.0 as usize
         } else {
             0usize
