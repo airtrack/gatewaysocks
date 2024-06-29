@@ -13,52 +13,87 @@ use pnet::util::MacAddr;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc::{error::SendError, unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tokio::time::{interval, Interval};
+use tokio::time::interval;
 
-use super::{Handshaker, Socks5Channel};
+use super::Handshaker;
 
 const TIMER_INTERVAL_MS: u64 = 100;
 const CLIENT_TIMEOUT_SECS: u64 = 300;
 
-pub struct UdpSocks5Data {
+pub struct UdpSocks5Message {
     pub src: SocketAddrV4,
     pub dst: SocketAddrV4,
     pub mac: MacAddr,
     pub data: Vec<u8>,
 }
 
-pub struct UdpSocks5 {
+pub fn udp_socks5(socks5_addr: SocketAddr) -> (UdpSocks5Handle, UdpSocks5Service) {
+    let (input, inbound) = unbounded_channel();
+    let (outbound, output) = unbounded_channel();
+    let handle = UdpSocks5Handle::new(input, output);
+    let service = UdpSocks5Service::new(socks5_addr, inbound, outbound);
+    (handle, service)
+}
+
+pub struct UdpSocks5Handle {
+    input: UnboundedSender<UdpSocks5Message>,
+    output: UnboundedReceiver<UdpSocks5Message>,
+}
+
+impl UdpSocks5Handle {
+    fn new(
+        input: UnboundedSender<UdpSocks5Message>,
+        output: UnboundedReceiver<UdpSocks5Message>,
+    ) -> Self {
+        Self { input, output }
+    }
+}
+
+impl UdpSocks5Handle {
+    pub fn send_udp_message(&self, message: UdpSocks5Message) {
+        let _ = self.input.send(message);
+    }
+
+    pub fn recv_udp_message(&mut self) -> Option<UdpSocks5Message> {
+        match self.output.try_recv() {
+            Ok(message) => return Some(message),
+            Err(_) => return None,
+        }
+    }
+}
+
+pub struct UdpSocks5Service {
     socks5_addr: SocketAddr,
-    timer: Interval,
-    channel: Socks5Channel<UdpSocks5Data>,
-    clients: HashMap<SocketAddrV4, Client>,
-    futs: FuturesUnordered<Pin<Box<dyn Future<Output = SocketAddrV4>>>>,
+    inbound: UnboundedReceiver<UdpSocks5Message>,
+    outbound: UnboundedSender<UdpSocks5Message>,
+    clients: HashMap<SocketAddrV4, UdpSocks5Client>,
+    futs: FuturesUnordered<Pin<Box<dyn Future<Output = SocketAddrV4> + Send>>>,
 }
 
-struct Client {
-    input: UnboundedSender<UdpSocks5Data>,
-    alive_time: Instant,
-}
-
-impl UdpSocks5 {
-    pub fn new(socks5_addr: SocketAddr, channel: Socks5Channel<UdpSocks5Data>) -> Self {
-        let timer = interval(Duration::from_millis(TIMER_INTERVAL_MS));
+impl UdpSocks5Service {
+    fn new(
+        socks5_addr: SocketAddr,
+        inbound: UnboundedReceiver<UdpSocks5Message>,
+        outbound: UnboundedSender<UdpSocks5Message>,
+    ) -> Self {
         let clients = HashMap::new();
         let futs = FuturesUnordered::new();
 
         Self {
             socks5_addr,
-            timer,
-            channel,
+            inbound,
+            outbound,
             clients,
             futs,
         }
     }
 
     pub async fn run(&mut self) {
+        let mut timer = interval(Duration::from_millis(TIMER_INTERVAL_MS));
+
         loop {
             tokio::select! {
-                _ = self.timer.tick() => {
+                _ = timer.tick() => {
                     self.clients.retain(|src, client| {
                         let timeout = client.is_timeout();
                         if timeout {
@@ -70,13 +105,13 @@ impl UdpSocks5 {
                 Some(src) = self.futs.next() => {
                     self.clients.remove(&src);
                 }
-                Some(packet) = self.channel.rx.recv() => {
+                Some(packet) = self.inbound.recv() => {
                     if !self.clients.contains_key(&packet.src) {
-                        let (client, fut) = Client::new(
+                        let (client, fut) = UdpSocks5Client::new(
                             packet.src,
                             packet.mac,
                             self.socks5_addr,
-                            self.channel.tx.clone(),
+                            self.outbound.clone(),
                         );
                         self.clients.insert(packet.src, client);
                         self.futs.push(Box::pin(fut));
@@ -97,12 +132,17 @@ impl UdpSocks5 {
     }
 }
 
-impl Client {
+struct UdpSocks5Client {
+    input: UnboundedSender<UdpSocks5Message>,
+    alive_time: Instant,
+}
+
+impl UdpSocks5Client {
     fn new(
         src: SocketAddrV4,
         mac: MacAddr,
         socks5_addr: SocketAddr,
-        outbound: UnboundedSender<UdpSocks5Data>,
+        outbound: UnboundedSender<UdpSocks5Message>,
     ) -> (Self, impl Future<Output = SocketAddrV4>) {
         let (input, inbound) = unbounded_channel();
         let alive_time = Instant::now();
@@ -123,8 +163,8 @@ impl Client {
 
     fn send_to(
         &mut self,
-        packet: UdpSocks5Data,
-    ) -> core::result::Result<(), SendError<UdpSocks5Data>> {
+        packet: UdpSocks5Message,
+    ) -> core::result::Result<(), SendError<UdpSocks5Message>> {
         self.alive_time = Instant::now();
         self.input.send(packet)
     }
@@ -133,8 +173,8 @@ impl Client {
         src: SocketAddrV4,
         mac: MacAddr,
         socks5_addr: SocketAddr,
-        outbound: UnboundedSender<UdpSocks5Data>,
-        inbound: UnboundedReceiver<UdpSocks5Data>,
+        outbound: UnboundedSender<UdpSocks5Message>,
+        inbound: UnboundedReceiver<UdpSocks5Message>,
     ) -> Result<()> {
         let mut handshaker = Handshaker::new(socks5_addr).await?;
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
@@ -153,7 +193,7 @@ impl Client {
     }
 
     async fn send_to_socks5(
-        mut inbound: UnboundedReceiver<UdpSocks5Data>,
+        mut inbound: UnboundedReceiver<UdpSocks5Message>,
         sender: Arc<UdpSocket>,
         destination: SocketAddr,
     ) -> Result<()> {
@@ -179,7 +219,7 @@ impl Client {
     }
 
     async fn receive_from_socks5(
-        outbound: UnboundedSender<UdpSocks5Data>,
+        outbound: UnboundedSender<UdpSocks5Message>,
         receiver: Arc<UdpSocket>,
         src: SocketAddrV4,
         mac: MacAddr,
@@ -196,7 +236,7 @@ impl Client {
             let mut data = Vec::with_capacity(n - 10);
             data.extend_from_slice(&buffer[10..n]);
 
-            let message = UdpSocks5Data {
+            let message = UdpSocks5Message {
                 src: SocketAddrV4::new(ip, port),
                 dst: src,
                 mac,

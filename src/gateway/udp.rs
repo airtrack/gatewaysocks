@@ -11,12 +11,6 @@ use pnet::util::MacAddr;
 
 use super::is_to_gateway;
 
-pub struct UdpProcessor {
-    mac: MacAddr,
-    gateway: Ipv4Addr,
-    subnet_mask: Ipv4Addr,
-}
-
 pub struct UdpLayerPacket {
     pub src: SocketAddrV4,
     pub dst: SocketAddrV4,
@@ -24,21 +18,45 @@ pub struct UdpLayerPacket {
     pub data: Vec<u8>,
 }
 
+pub trait UdpPacketHandler {
+    fn handle_input_udp_packet(&mut self) -> Option<UdpLayerPacket>;
+    fn handle_output_udp_packet(&mut self, packet: UdpLayerPacket);
+}
+
+pub struct UdpProcessor {
+    mac: MacAddr,
+    gateway: Ipv4Addr,
+    subnet_mask: Ipv4Addr,
+    handler: Box<dyn UdpPacketHandler>,
+}
+
 impl UdpProcessor {
-    pub fn new(mac: MacAddr, gateway: Ipv4Addr, subnet_mask: Ipv4Addr) -> Self {
+    pub fn new(
+        mac: MacAddr,
+        gateway: Ipv4Addr,
+        subnet_mask: Ipv4Addr,
+        handler: impl UdpPacketHandler + 'static,
+    ) -> Self {
+        let handler = Box::new(handler);
         Self {
             mac,
             gateway,
             subnet_mask,
+            handler,
         }
     }
 
-    pub fn handle_input_packet(
-        &mut self,
-        mac: MacAddr,
-        request: &Ipv4Packet,
-        mut callback: impl FnMut(UdpLayerPacket),
-    ) {
+    pub fn heartbeat(&mut self, tx: &mut Box<dyn DataLinkSender>) {
+        loop {
+            if let Some(packet) = self.handler.handle_input_udp_packet() {
+                self.handle_output_packet(tx, packet);
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub fn handle_input_packet(&mut self, mac: MacAddr, request: &Ipv4Packet) {
         if !is_to_gateway(self.gateway, self.subnet_mask, request.get_source()) {
             return;
         }
@@ -49,7 +67,7 @@ impl UdpProcessor {
             let dst = SocketAddrV4::new(request.get_destination(), udp_request.get_destination());
 
             trace!("{} send data({}) to {}", src, data.len(), dst);
-            callback(UdpLayerPacket {
+            self.handler.handle_output_udp_packet(UdpLayerPacket {
                 src,
                 dst,
                 mac,
@@ -58,7 +76,7 @@ impl UdpProcessor {
         }
     }
 
-    pub fn handle_output_packet(&self, tx: &mut Box<dyn DataLinkSender>, packet: UdpLayerPacket) {
+    fn handle_output_packet(&self, tx: &mut Box<dyn DataLinkSender>, packet: UdpLayerPacket) {
         trace!(
             "{} recv data({}) from {}",
             packet.dst,
