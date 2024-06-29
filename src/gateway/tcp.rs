@@ -24,7 +24,7 @@ pub enum TcpLayerPacket {
 }
 
 pub trait TcpConnectionHandler {
-    fn handle_input_tcp_packet(&mut self) -> Option<Vec<TcpLayerPacket>>;
+    fn handle_input_tcp_packet(&mut self) -> Option<TcpLayerPacket>;
     fn handle_output_tcp_packet(&mut self, packet: TcpLayerPacket);
 }
 
@@ -134,7 +134,7 @@ impl TcpLayerHandler {
         }
     }
 
-    fn handle_input_tcp_packet(&mut self) -> Option<Vec<TcpLayerPacket>> {
+    fn handle_input_tcp_packet(&mut self) -> Option<TcpLayerPacket> {
         self.handler.handle_input_tcp_packet()
     }
 
@@ -417,9 +417,11 @@ impl TcpConnection {
 
     fn heartbeat(&mut self, tx: &mut Box<dyn DataLinkSender>) -> bool {
         if self.send_buffer.pending.len() < 16 {
-            if let Some(packets) = self.handler.handle_input_tcp_packet() {
-                for packet in packets {
+            loop {
+                if let Some(packet) = self.handler.handle_input_tcp_packet() {
                     self.handle_output_packet(tx, packet);
+                } else {
+                    break;
                 }
             }
         }

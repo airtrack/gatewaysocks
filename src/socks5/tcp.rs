@@ -108,25 +108,11 @@ impl TcpSocks5Client {
         let _ = self.input.send(message);
     }
 
-    pub fn recv_socks5_messages(&mut self) -> Option<Vec<TcpSocks5Message>> {
-        let size = self.output.len();
-        if size == 0 {
-            return None;
+    pub fn recv_socks5_message(&mut self) -> Option<TcpSocks5Message> {
+        match self.output.try_recv() {
+            Ok(message) => return Some(message),
+            Err(_) => return None,
         }
-
-        let mut messages = Vec::new();
-        messages.reserve(size);
-
-        loop {
-            match self.output.try_recv() {
-                Ok(message) => {
-                    messages.push(message);
-                }
-                Err(_) => break,
-            }
-        }
-
-        Some(messages)
     }
 
     async fn run_tcp_socks5(

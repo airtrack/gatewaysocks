@@ -55,22 +55,16 @@ struct TcpConnectionToSocks5 {
 }
 
 impl TcpConnectionHandler for TcpConnectionToSocks5 {
-    fn handle_input_tcp_packet(&mut self) -> Option<Vec<TcpLayerPacket>> {
-        if let Some(messages) = self.socks5_client.recv_socks5_messages() {
-            let packets = messages
-                .into_iter()
-                .map(|message| match message {
-                    TcpSocks5Message::Connect(v) => TcpLayerPacket::Connect(v),
-                    TcpSocks5Message::Established(v) => TcpLayerPacket::Established(v),
-                    TcpSocks5Message::Push(v) => TcpLayerPacket::Push(v),
-                    TcpSocks5Message::Shutdown(v) => TcpLayerPacket::Shutdown(v),
-                    TcpSocks5Message::Close(v) => TcpLayerPacket::Close(v),
-                })
-                .collect();
-            return Some(packets);
-        }
-
-        None
+    fn handle_input_tcp_packet(&mut self) -> Option<TcpLayerPacket> {
+        self.socks5_client
+            .recv_socks5_message()
+            .map(|message| match message {
+                TcpSocks5Message::Connect(v) => TcpLayerPacket::Connect(v),
+                TcpSocks5Message::Established(v) => TcpLayerPacket::Established(v),
+                TcpSocks5Message::Push(v) => TcpLayerPacket::Push(v),
+                TcpSocks5Message::Shutdown(v) => TcpLayerPacket::Shutdown(v),
+                TcpSocks5Message::Close(v) => TcpLayerPacket::Close(v),
+            })
     }
 
     fn handle_output_tcp_packet(&mut self, packet: TcpLayerPacket) {
