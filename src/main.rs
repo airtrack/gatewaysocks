@@ -19,6 +19,7 @@ use tokio::runtime::Runtime;
 use gatewaysocks::gateway::arp::ArpProcessor;
 use gatewaysocks::gateway::tcp::{TcpConnectionHandler, TcpLayerPacket, TcpProcessor};
 use gatewaysocks::gateway::udp::{UdpLayerPacket, UdpPacketHandler, UdpProcessor};
+use gatewaysocks::prometheus::Exporter;
 use gatewaysocks::socks5::tcp::{
     tcp_socks5, TcpSocks5Client, TcpSocks5Handle, TcpSocks5Message, TcpSocks5Service,
 };
@@ -86,17 +87,21 @@ impl TcpConnectionHandler for TcpConnectionToSocks5 {
     }
 }
 
-fn socks5_main(mut tcp_socks5_service: TcpSocks5Service, mut udp_socks5_service: UdpSocks5Service) {
-    let rt = Runtime::new().unwrap();
-
-    rt.block_on(async move {
-        futures::join!(tcp_socks5_service.run(), udp_socks5_service.run());
-    });
-}
-
-fn start_socks5(tcp_socks5_service: TcpSocks5Service, udp_socks5_service: UdpSocks5Service) {
+fn async_main(
+    mut tcp_socks5_service: TcpSocks5Service,
+    mut udp_socks5_service: UdpSocks5Service,
+    prometheus_exporter: Exporter,
+) {
     thread::spawn(move || {
-        socks5_main(tcp_socks5_service, udp_socks5_service);
+        let rt = Runtime::new().unwrap();
+
+        rt.block_on(async move {
+            futures::join!(
+                tcp_socks5_service.run(),
+                udp_socks5_service.run(),
+                prometheus_exporter.run()
+            );
+        });
     });
 }
 
@@ -200,6 +205,7 @@ fn main() {
     opts.optopt("s", "socks5", "socks5 address", "socks5");
     opts.optopt("", "gateway-ip", "gateway ip", "gateway");
     opts.optopt("", "subnet-mask", "subnet mask", "subnet");
+    opts.optopt("", "prometheus", "prometheus exporter", "prometheus");
 
     let matches = match opts.parse(&args[1..]) {
         Ok(m) => m,
@@ -214,6 +220,9 @@ fn main() {
     let subnet_addr = matches
         .opt_str("subnet-mask")
         .unwrap_or("255.255.255.0".to_string());
+    let prometheus_addr = matches
+        .opt_str("prometheus")
+        .unwrap_or("0.0.0.0:9000".to_string());
 
     SimpleLogger::new()
         .without_timestamps()
@@ -249,8 +258,9 @@ fn main() {
 
     let (tcp_socks5_handle, tcp_socks5_service) = tcp_socks5(socks5);
     let (udp_socks5_handle, udp_socks5_service) = udp_socks5(socks5);
+    let prometheus_exporter = Exporter::new(&prometheus_addr);
 
-    start_socks5(tcp_socks5_service, udp_socks5_service);
+    async_main(tcp_socks5_service, udp_socks5_service, prometheus_exporter);
     gateway_main(
         mac,
         gateway,
