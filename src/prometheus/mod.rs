@@ -41,10 +41,7 @@ impl Exporter {
 
         Response::builder()
             .status(StatusCode::OK)
-            .header(
-                CONTENT_TYPE,
-                "application/openmetrics-text; version=1.0.0; charset=utf-8",
-            )
+            .header(CONTENT_TYPE, encoder.format_type())
             .body(Body::from(buffer))
             .unwrap()
     }
