@@ -5,14 +5,11 @@ use axum::{
     routing::get,
     Router,
 };
-use lazy_static::lazy_static;
-use prometheus::{register_int_counter, Encoder, IntCounter, TextEncoder};
+use metrics::METRICS_COUNTER;
+use prometheus::{Encoder, TextEncoder};
 use tokio::net::TcpListener;
 
-lazy_static! {
-    static ref METRICS_COUNTER: IntCounter =
-        register_int_counter!("metrics_counter", "metrics pull counter").unwrap();
-}
+pub mod metrics;
 
 pub struct Exporter {
     listen: String,

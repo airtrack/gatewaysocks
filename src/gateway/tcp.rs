@@ -14,6 +14,7 @@ use pnet::packet::Packet;
 use pnet::util::MacAddr;
 
 use super::is_to_gateway;
+use crate::prometheus::metrics;
 
 pub enum TcpLayerPacket {
     Connect((String, SocketAddrV4)),
@@ -61,6 +62,7 @@ impl TcpProcessor {
         }
 
         self.heartbeat = now;
+        metrics::TCP_CONNS.set(self.connections.len() as i64);
 
         // 1000 Mbps ethenet, 120000 * 8 * 1000 = 960Mbps
         let mut total_pacing = 120000;
@@ -70,6 +72,16 @@ impl TcpProcessor {
 
             let alive = connection.heartbeat(tx);
             if !alive {
+                metrics::TCP_TX_BYTES
+                    .remove_label_values(&[&connection.key])
+                    .unwrap_or_else(|e| {
+                        error!("remove tcp_tx_bytes error: {}", e);
+                    });
+                metrics::TCP_RX_BYTES
+                    .remove_label_values(&[&connection.key])
+                    .unwrap_or_else(|e| {
+                        error!("remove tcp_rx_bytes error: {}", e);
+                    });
                 info!("{}[{}]: remove tcp connection", key, connection.state);
             }
 
@@ -97,7 +109,7 @@ impl TcpProcessor {
         if let Some(tcp_request) = TcpPacket::new(request.payload()) {
             let src = SocketAddrV4::new(request.get_source(), tcp_request.get_source());
             let dst = SocketAddrV4::new(request.get_destination(), tcp_request.get_destination());
-            let key = src.to_string() + "|" + &dst.to_string();
+            let key = src.to_string() + "-" + &dst.to_string();
 
             if let Some(connection) = self.connections.get_mut(&key) {
                 return connection.handle_tcp_packet(&tcp_request, tx);
@@ -374,8 +386,16 @@ impl TcpConnection {
     }
 
     fn handle_tcp_packet(&mut self, request: &TcpPacket, tx: &mut Box<dyn DataLinkSender>) {
+        metrics::TCP_TX_BYTES
+            .with_label_values(&[&self.key])
+            .inc_by(request.payload().len() as u64);
+
         if request.get_flags() & TcpFlags::RST != 0 {
-            trace!("{}[{}]: recv RST", self.key, self.state);
+            trace!(
+                "{}[{}]: recv RST, change state to Closed",
+                self.key,
+                self.state
+            );
             self.state = State::Closed;
             return self.handler.handle_reset();
         }
@@ -431,7 +451,11 @@ impl TcpConnection {
         }
 
         if self.is_timewait_timeout() {
-            trace!("{}[{}]: TimeWait timeout", self.key, self.state);
+            trace!(
+                "{}[{}]: TimeWait timeout, change state to Closed",
+                self.key,
+                self.state
+            );
             self.state = State::Closed;
             return false;
         }
@@ -709,7 +733,7 @@ impl TcpConnection {
             if request.get_acknowledgement() == self.tcp_data.seq + 1 {
                 self.state = State::Closed;
                 trace!(
-                    "{}[{}]: recv last ack, change state to Closed",
+                    "{}[{}]: recv last ACK, change state to Closed",
                     self.key,
                     self.state
                 );
@@ -1001,6 +1025,10 @@ impl TcpConnection {
         opts_size: usize,
         payload: &[u8],
     ) {
+        metrics::TCP_RX_BYTES
+            .with_label_values(&[&self.key])
+            .inc_by(payload.len() as u64);
+
         trace!(
             "{}:[{}]: send tcp packet {}[{}] -> {}[{}]",
             self.key,

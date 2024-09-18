@@ -10,6 +10,7 @@ use pnet::packet::Packet;
 use pnet::util::MacAddr;
 
 use super::is_to_gateway;
+use crate::prometheus::metrics;
 
 pub struct UdpLayerPacket {
     pub src: SocketAddrV4,
@@ -66,7 +67,10 @@ impl UdpProcessor {
             let src = SocketAddrV4::new(request.get_source(), udp_request.get_source());
             let dst = SocketAddrV4::new(request.get_destination(), udp_request.get_destination());
 
+            metrics::UDP_TX_PACKETS.inc();
+            metrics::UDP_TX_BYTES.inc_by(data.len() as u64);
             trace!("{} send data({}) to {}", src, data.len(), dst);
+
             self.handler.handle_output_udp_packet(UdpLayerPacket {
                 src,
                 dst,
@@ -77,6 +81,8 @@ impl UdpProcessor {
     }
 
     fn handle_output_packet(&self, tx: &mut Box<dyn DataLinkSender>, packet: UdpLayerPacket) {
+        metrics::UDP_RX_PACKETS.inc();
+        metrics::UDP_RX_BYTES.inc_by(packet.data.len() as u64);
         trace!(
             "{} recv data({}) from {}",
             packet.dst,
