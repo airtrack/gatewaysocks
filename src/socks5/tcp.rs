@@ -5,7 +5,7 @@ use std::pin::Pin;
 
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
-use log::info;
+use log::{error, info, trace};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc::{
@@ -49,7 +49,9 @@ impl TcpSocks5Handle {
         let (client, fut) =
             TcpSocks5Client::new(key, self.socks5_addr, SocketAddr::V4(destination));
 
-        let _ = self.futs_tx.send(Box::new(fut));
+        self.futs_tx.send(Box::new(fut)).unwrap_or_else(|e| {
+            error!("send tcp socks5 connection fut error: {:?}", e);
+        });
         client
     }
 }
@@ -98,14 +100,21 @@ impl TcpSocks5Client {
             let result =
                 Self::run_tcp_socks5(&key, socks5_addr, destination, outbound, inbound).await;
             info!("{} stop tcp socks5: {:?}", key, result);
-            let _ = sender.send(TcpSocks5Message::Close(key));
+            sender
+                .send(TcpSocks5Message::Close(key))
+                .await
+                .unwrap_or_else(|e| {
+                    trace!("send tcp socks5 exit close message error: {:?}", e);
+                });
         };
 
         (Self { input, output }, fut)
     }
 
     pub fn send_socks5_message(&self, message: TcpSocks5Message) {
-        let _ = self.input.send(message);
+        self.input.send(message).unwrap_or_else(|e| {
+            trace!("send tcp socks5 message error: {:?}", e);
+        });
     }
 
     pub fn recv_socks5_message(&mut self) -> Option<TcpSocks5Message> {

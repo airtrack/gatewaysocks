@@ -51,7 +51,9 @@ impl UdpSocks5Handle {
 
 impl UdpSocks5Handle {
     pub fn send_udp_message(&self, message: UdpSocks5Message) {
-        let _ = self.input.send(message);
+        self.input.send(message).unwrap_or_else(|e| {
+            error!("send udp socks5 message error: {:?}", e);
+        });
     }
 
     pub fn recv_udp_message(&mut self) -> Option<UdpSocks5Message> {
