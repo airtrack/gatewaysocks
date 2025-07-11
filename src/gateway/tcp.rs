@@ -10,7 +10,7 @@ use pnet::packet::ipv4::{self, Ipv4Packet, MutableIpv4Packet};
 use pnet::packet::tcp::{
     self, MutableTcpPacket, TcpFlags, TcpOption, TcpOptionNumbers, TcpOptionPacket, TcpPacket,
 };
-use pnet::packet::Packet;
+use pnet::packet::{MutablePacket, Packet};
 use pnet::util::MacAddr;
 
 use super::is_to_gateway;
@@ -1040,59 +1040,51 @@ impl TcpConnection {
         );
 
         let tcp_packet_len = 20 + opts_size + payload.len();
-        let mut tcp_buffer = vec![0u8; tcp_packet_len];
-        let mut tcp_packet = MutableTcpPacket::new(&mut tcp_buffer).unwrap();
-
-        tcp_packet.set_source(self.addr.dst_addr.port());
-        tcp_packet.set_destination(self.addr.src_addr.port());
-        tcp_packet.set_sequence(seq);
-        tcp_packet.set_acknowledgement(self.tcp_data.ack);
-        tcp_packet.set_data_offset(((20 + opts_size) / 4) as u8);
-        tcp_packet.set_reserved(0);
-        tcp_packet.set_flags(flags);
-        tcp_packet.set_window((self.tcp_data.local_window >> self.tcp_data.wscale) as u16);
-        tcp_packet.set_checksum(0);
-        tcp_packet.set_urgent_ptr(0);
-        tcp_packet.set_options(opts);
-        tcp_packet.set_payload(payload);
-
-        tcp_packet.set_checksum(tcp::ipv4_checksum(
-            &tcp_packet.to_immutable(),
-            self.addr.dst_addr.ip(),
-            self.addr.src_addr.ip(),
-        ));
-
         let ipv4_packet_len = 20 + tcp_packet_len;
-        let mut ipv4_buffer = vec![0u8; ipv4_packet_len];
-        let mut ipv4_packet = MutableIpv4Packet::new(&mut ipv4_buffer).unwrap();
-
-        ipv4_packet.set_version(4);
-        ipv4_packet.set_header_length(5);
-        ipv4_packet.set_dscp(0);
-        ipv4_packet.set_ecn(0);
-        ipv4_packet.set_total_length(ipv4_packet_len as u16);
-        ipv4_packet.set_identification(0);
-        ipv4_packet.set_flags(0);
-        ipv4_packet.set_fragment_offset(0);
-        ipv4_packet.set_ttl(64);
-        ipv4_packet.set_next_level_protocol(IpNextHeaderProtocols::Tcp);
-        ipv4_packet.set_checksum(0);
-        ipv4_packet.set_source(*self.addr.dst_addr.ip());
-        ipv4_packet.set_destination(*self.addr.src_addr.ip());
-        ipv4_packet.set_payload(tcp_packet.packet());
-
-        ipv4_packet.set_checksum(ipv4::checksum(&ipv4_packet.to_immutable()));
-
         let ethernet_packet_len = 14 + ipv4_packet_len;
-        let mut ethernet_buffer = vec![0u8; ethernet_packet_len];
-        let mut ethernet_packet = MutableEthernetPacket::new(&mut ethernet_buffer).unwrap();
 
-        ethernet_packet.set_destination(self.addr.src_mac);
-        ethernet_packet.set_source(self.addr.mac);
-        ethernet_packet.set_ethertype(EtherTypes::Ipv4);
-        ethernet_packet.set_payload(ipv4_packet.packet());
+        tx.build_and_send(1, ethernet_packet_len, &mut |buffer| {
+            let mut ethernet_packet = MutableEthernetPacket::new(buffer).unwrap();
+            ethernet_packet.set_destination(self.addr.src_mac);
+            ethernet_packet.set_source(self.addr.mac);
+            ethernet_packet.set_ethertype(EtherTypes::Ipv4);
 
-        tx.send_to(ethernet_packet.packet(), None);
+            let mut ipv4_packet = MutableIpv4Packet::new(ethernet_packet.payload_mut()).unwrap();
+            ipv4_packet.set_version(4);
+            ipv4_packet.set_header_length(5);
+            ipv4_packet.set_dscp(0);
+            ipv4_packet.set_ecn(0);
+            ipv4_packet.set_total_length(ipv4_packet_len as u16);
+            ipv4_packet.set_identification(0);
+            ipv4_packet.set_flags(0);
+            ipv4_packet.set_fragment_offset(0);
+            ipv4_packet.set_ttl(64);
+            ipv4_packet.set_next_level_protocol(IpNextHeaderProtocols::Tcp);
+            ipv4_packet.set_checksum(0);
+            ipv4_packet.set_source(*self.addr.dst_addr.ip());
+            ipv4_packet.set_destination(*self.addr.src_addr.ip());
+
+            let mut tcp_packet = MutableTcpPacket::new(ipv4_packet.payload_mut()).unwrap();
+            tcp_packet.set_source(self.addr.dst_addr.port());
+            tcp_packet.set_destination(self.addr.src_addr.port());
+            tcp_packet.set_sequence(seq);
+            tcp_packet.set_acknowledgement(self.tcp_data.ack);
+            tcp_packet.set_data_offset(((20 + opts_size) / 4) as u8);
+            tcp_packet.set_reserved(0);
+            tcp_packet.set_flags(flags);
+            tcp_packet.set_window((self.tcp_data.local_window >> self.tcp_data.wscale) as u16);
+            tcp_packet.set_checksum(0);
+            tcp_packet.set_urgent_ptr(0);
+            tcp_packet.set_options(opts);
+            tcp_packet.set_payload(payload);
+            tcp_packet.set_checksum(tcp::ipv4_checksum(
+                &tcp_packet.to_immutable(),
+                self.addr.dst_addr.ip(),
+                self.addr.src_addr.ip(),
+            ));
+
+            ipv4_packet.set_checksum(ipv4::checksum(&ipv4_packet.to_immutable()));
+        });
     }
 
     fn process_remote_timestamp(&mut self, opt: &TcpOptionPacket) {

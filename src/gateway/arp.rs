@@ -8,7 +8,7 @@ use pnet::packet::arp::{
     ArpHardwareTypes, ArpOperation, ArpOperations, ArpPacket, MutableArpPacket,
 };
 use pnet::packet::ethernet::{EtherTypes, EthernetPacket, MutableEthernetPacket};
-use pnet::packet::Packet;
+use pnet::packet::{MutablePacket, Packet};
 use pnet::util::MacAddr;
 
 pub struct ArpProcessor {
@@ -65,37 +65,33 @@ impl ArpProcessor {
         destination_ip: Ipv4Addr,
         operation: ArpOperation,
     ) {
-        let mut ethernet_buffer = [0u8; 42];
-        let mut ethernet_packet = MutableEthernetPacket::new(&mut ethernet_buffer).unwrap();
-
-        ethernet_packet.set_destination(destination_mac);
-        ethernet_packet.set_source(self.mac);
-        ethernet_packet.set_ethertype(EtherTypes::Arp);
-
-        let mut arp_buffer = [0u8; 28];
-        let mut arp_packet = MutableArpPacket::new(&mut arp_buffer).unwrap();
-        let target_hw_addr = if operation == ArpOperations::Request {
-            MacAddr::zero()
-        } else {
-            destination_mac
-        };
-
-        arp_packet.set_hardware_type(ArpHardwareTypes::Ethernet);
-        arp_packet.set_protocol_type(EtherTypes::Ipv4);
-        arp_packet.set_hw_addr_len(6);
-        arp_packet.set_proto_addr_len(4);
-        arp_packet.set_operation(operation);
-        arp_packet.set_sender_hw_addr(self.mac);
-        arp_packet.set_sender_proto_addr(self.gateway);
-        arp_packet.set_target_hw_addr(target_hw_addr);
-        arp_packet.set_target_proto_addr(destination_ip);
-
-        ethernet_packet.set_payload(arp_packet.packet());
-
         info!(
             "ARP {:?} to {}[{}]",
             operation, destination_ip, destination_mac
         );
-        tx.send_to(ethernet_packet.packet(), None);
+
+        tx.build_and_send(1, 42, &mut |buffer| {
+            let mut ethernet_packet = MutableEthernetPacket::new(buffer).unwrap();
+            ethernet_packet.set_destination(destination_mac);
+            ethernet_packet.set_source(self.mac);
+            ethernet_packet.set_ethertype(EtherTypes::Arp);
+
+            let mut arp_packet = MutableArpPacket::new(ethernet_packet.payload_mut()).unwrap();
+            let target_hw_addr = if operation == ArpOperations::Request {
+                MacAddr::zero()
+            } else {
+                destination_mac
+            };
+
+            arp_packet.set_hardware_type(ArpHardwareTypes::Ethernet);
+            arp_packet.set_protocol_type(EtherTypes::Ipv4);
+            arp_packet.set_hw_addr_len(6);
+            arp_packet.set_proto_addr_len(4);
+            arp_packet.set_operation(operation);
+            arp_packet.set_sender_hw_addr(self.mac);
+            arp_packet.set_sender_proto_addr(self.gateway);
+            arp_packet.set_target_hw_addr(target_hw_addr);
+            arp_packet.set_target_proto_addr(destination_ip);
+        });
     }
 }
