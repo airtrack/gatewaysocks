@@ -1,200 +1,158 @@
 use std::env;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::thread;
-use std::time::Duration;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use atomic_time::AtomicInstant;
+use gatewaysocks::gateway::new_gateway;
+use gatewaysocks::{gateway, socks5};
 use getopts::Options;
 use log::info;
 use simple_logger::SimpleLogger;
-
-use pnet::datalink::{self, Config, DataLinkSender, NetworkInterface};
-use pnet::packet::ethernet::{EtherTypes, EthernetPacket};
-use pnet::packet::ip::IpNextHeaderProtocols;
-use pnet::packet::ipv4::Ipv4Packet;
-use pnet::packet::Packet;
-use pnet::util::MacAddr;
-
+use tokio::io::AsyncReadExt;
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::runtime::Runtime;
+use tokio::time::sleep_until;
 
-use gatewaysocks::gateway::arp::ArpProcessor;
-use gatewaysocks::gateway::tcp::{TcpConnectionHandler, TcpLayerPacket, TcpProcessor};
-use gatewaysocks::gateway::udp::{UdpLayerPacket, UdpPacketHandler, UdpProcessor};
-use gatewaysocks::prometheus::Exporter;
-use gatewaysocks::socks5::tcp::{
-    tcp_socks5, TcpSocks5Client, TcpSocks5Handle, TcpSocks5Message, TcpSocks5Service,
-};
-use gatewaysocks::socks5::udp::{udp_socks5, UdpSocks5Handle, UdpSocks5Message, UdpSocks5Service};
+async fn gateway_udp_send(
+    socket: &gateway::UdpSocket,
+    osocket: &UdpSocket,
+    proxy_addr: SocketAddr,
+    t: Arc<AtomicInstant>,
+) -> std::io::Result<()> {
+    loop {
+        let mut buf = [0u8; 1500];
+        let (size, dst) = socket.recv(&mut buf[10..]).await?;
 
-struct UdpPacketToSocks5 {
-    udp_socks5_handle: UdpSocks5Handle,
-}
+        buf[0] = 0;
+        buf[1] = 0;
+        buf[2] = 0;
+        buf[3] = socks5::ATYP_IPV4;
+        buf[4..8].copy_from_slice(&dst.ip().octets());
+        buf[8..10].copy_from_slice(&dst.port().to_be_bytes());
 
-impl UdpPacketHandler for UdpPacketToSocks5 {
-    fn handle_input_udp_packet(&mut self) -> Option<UdpLayerPacket> {
-        self.udp_socks5_handle
-            .recv_udp_message()
-            .map(|message| UdpLayerPacket {
-                src: message.src,
-                dst: message.dst,
-                mac: message.mac,
-                data: message.data,
-            })
-    }
-
-    fn handle_output_udp_packet(&mut self, packet: UdpLayerPacket) {
-        self.udp_socks5_handle.send_udp_message(UdpSocks5Message {
-            src: packet.src,
-            dst: packet.dst,
-            mac: packet.mac,
-            data: packet.data,
-        });
+        osocket.send_to(&buf[..10 + size], proxy_addr).await?;
+        t.store(Instant::now(), Ordering::Relaxed);
     }
 }
 
-struct TcpConnectionToSocks5 {
-    socks5_client: TcpSocks5Client,
+async fn gateway_udp_recv(
+    socket: &gateway::UdpSocket,
+    osocket: &UdpSocket,
+    t: Arc<AtomicInstant>,
+) -> std::io::Result<()> {
+    loop {
+        let mut buf = [0u8; 1500];
+        let (n, _) = osocket.recv_from(&mut buf).await?;
+        if n <= 10 || buf[3] != socks5::ATYP_IPV4 {
+            continue;
+        }
+
+        let ip = Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]);
+        let port = u16::from_be_bytes(buf[8..10].try_into().unwrap());
+        let from = SocketAddrV4::new(ip, port);
+        socket.try_send(&buf[10..n], from)?;
+        t.store(Instant::now(), Ordering::Relaxed);
+    }
 }
 
-impl TcpConnectionHandler for TcpConnectionToSocks5 {
-    fn handle_input_tcp_packet(&mut self) -> Option<TcpLayerPacket> {
-        self.socks5_client
-            .recv_socks5_message()
-            .map(|message| match message {
-                TcpSocks5Message::Connect(v) => TcpLayerPacket::Connect(v),
-                TcpSocks5Message::Established(v) => TcpLayerPacket::Established(v),
-                TcpSocks5Message::Push(v) => TcpLayerPacket::Push(v),
-                TcpSocks5Message::Shutdown(v) => TcpLayerPacket::Shutdown(v),
-                TcpSocks5Message::Close(v) => TcpLayerPacket::Close(v),
-            })
-    }
+async fn gateway_udp_timeout(t: Arc<AtomicInstant>, timeout: Duration) -> std::io::Result<()> {
+    loop {
+        let deadline = t.load(Ordering::Relaxed) + timeout;
+        if deadline <= Instant::now() {
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout"));
+        }
 
-    fn handle_output_tcp_packet(&mut self, packet: TcpLayerPacket) {
-        match packet {
-            TcpLayerPacket::Connect(_) => {}
-            TcpLayerPacket::Established(_) => {
-                unreachable!();
-            }
-            TcpLayerPacket::Push((key, data)) => {
-                self.socks5_client
-                    .send_socks5_message(TcpSocks5Message::Push((key, data)));
-            }
-            TcpLayerPacket::Shutdown(key) => {
-                self.socks5_client
-                    .send_socks5_message(TcpSocks5Message::Shutdown(key));
-            }
-            TcpLayerPacket::Close(_) => {}
+        sleep_until(deadline.into()).await;
+    }
+}
+
+async fn gateway_udp_holder(mut holder: TcpStream) -> std::io::Result<()> {
+    loop {
+        let mut buffer = [0u8; 1024];
+        let size = holder.read(&mut buffer).await?;
+        if size == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "holding tcp closed",
+            ));
         }
     }
 }
 
-fn async_main(
-    mut tcp_socks5_service: TcpSocks5Service,
-    mut udp_socks5_service: UdpSocks5Service,
-    prometheus_exporter: Exporter,
-) {
-    thread::spawn(move || {
-        let rt = Runtime::new().unwrap();
+async fn gateway_udp_socket(socket: gateway::UdpSocket, socks5: SocketAddr) -> std::io::Result<()> {
+    let mut handshaker = socks5::Handshaker::new(socks5).await?;
+    let osocket = UdpSocket::bind("0.0.0.0:0").await?;
+    let proxy_addr = handshaker.udp_associate(osocket.local_addr()?).await?;
+    let holder = handshaker.into_tcp_stream();
+    let t = Arc::new(AtomicInstant::now());
+    let timeout = Duration::from_secs(60);
 
-        rt.block_on(async move {
-            futures::join!(
-                tcp_socks5_service.run(),
-                udp_socks5_service.run(),
-                prometheus_exporter.run()
-            );
-        });
-    });
+    futures::try_join!(
+        gateway_udp_send(&socket, &osocket, proxy_addr, t.clone()),
+        gateway_udp_recv(&socket, &osocket, t.clone()),
+        gateway_udp_timeout(t, timeout),
+        gateway_udp_holder(holder),
+    )?;
+
+    Ok(())
 }
 
-fn handle_ipv4_from_gateway(
-    ethernet_packet: &EthernetPacket,
-    tx: &mut Box<dyn DataLinkSender>,
-    tcp_processor: &mut TcpProcessor,
-    udp_processor: &mut UdpProcessor,
-) {
-    if let Some(ipv4_packet) = Ipv4Packet::new(ethernet_packet.payload()) {
-        match ipv4_packet.get_next_level_protocol() {
-            IpNextHeaderProtocols::Tcp => {
-                tcp_processor.handle_input_packet(tx, ethernet_packet.get_source(), &ipv4_packet);
-            }
-            IpNextHeaderProtocols::Udp => {
-                udp_processor.handle_input_packet(ethernet_packet.get_source(), &ipv4_packet);
-            }
-            _ => {}
-        }
-    }
+async fn gateway_tcp_stream(stream: gateway::TcpStream, socks5: SocketAddr) -> std::io::Result<()> {
+    let mut handshaker = socks5::Handshaker::new(socks5).await?;
+    handshaker.connect(stream.remote_addr()).await?;
+
+    let mut stream = stream;
+    let (mut reader, mut writer) = stream.split();
+
+    let mut ostream = handshaker.into_tcp_stream();
+    let (mut oreader, mut owriter) = ostream.split();
+
+    let _ = futures::join!(
+        tokio::io::copy(&mut reader, &mut owriter),
+        tokio::io::copy(&mut oreader, &mut writer),
+    );
+
+    Ok(())
 }
 
-fn gateway_main(
-    mac: MacAddr,
+fn gateway_async_main(
     gateway: Ipv4Addr,
     subnet_mask: Ipv4Addr,
-    interface: &NetworkInterface,
-    tcp_socks5_handle: TcpSocks5Handle,
-    udp_socks5_handle: UdpSocks5Handle,
+    iface_name: &str,
+    socks5: SocketAddr,
 ) {
-    let config = Config {
-        write_buffer_size: 4096,
-        read_buffer_size: 4096,
-        read_timeout: Some(Duration::from_millis(1)),
-        write_timeout: None,
-        channel_type: datalink::ChannelType::Layer2,
-        bpf_fd_attempts: 1000,
-        linux_fanout: None,
-        promiscuous: false,
-    };
-
-    let (mut tx, mut rx) = match datalink::channel(interface, config) {
-        Ok(datalink::Channel::Ethernet(tx, rx)) => (tx, rx),
-        Ok(_) => panic!("Unhandled channel type"),
-        Err(e) => panic!("Unable to create channel: {}", e),
-    };
-
-    let mut arp_processor = ArpProcessor::new(mac, gateway);
-
-    let mut tcp_socks5_handle = tcp_socks5_handle;
-    let mut tcp_processor = TcpProcessor::new(
-        mac,
-        gateway,
-        subnet_mask,
-        move |key: &str, destination: SocketAddrV4| {
-            let client = tcp_socks5_handle.start_connection(key, destination);
-            Box::new(TcpConnectionToSocks5 {
-                socks5_client: client,
-            })
-        },
+    info!(
+        "start gatewaysocks on {}: {}({}), relay to socks5://{} ...",
+        iface_name, gateway, subnet_mask, socks5
     );
 
-    let mut udp_processor = UdpProcessor::new(
-        mac,
-        gateway,
-        subnet_mask,
-        UdpPacketToSocks5 { udp_socks5_handle },
-    );
-
-    loop {
-        match rx.next() {
-            Ok(packet) => {
-                let ethernet_packet = EthernetPacket::new(packet).unwrap();
-                match ethernet_packet.get_ethertype() {
-                    EtherTypes::Ipv4 => {
-                        handle_ipv4_from_gateway(
-                            &ethernet_packet,
-                            &mut tx,
-                            &mut tcp_processor,
-                            &mut udp_processor,
-                        );
-                    }
-                    EtherTypes::Arp => arp_processor.handle_packet(&mut tx, &ethernet_packet),
-                    _ => {}
-                }
+    let rt = Runtime::new().unwrap();
+    rt.block_on(async move {
+        let (mut udp_binder, mut tcp_listener) =
+            new_gateway(gateway, subnet_mask, iface_name).unwrap();
+        let fut_udp = async {
+            loop {
+                let socket = udp_binder.accept().await.unwrap();
+                info!("UDP socket going out: {}", socket.local_addr());
+                tokio::spawn(gateway_udp_socket(socket, socks5));
             }
-            Err(_) => {}
-        }
+        };
+        let fut_tcp = async {
+            loop {
+                let stream = tcp_listener.accept().await.unwrap();
+                info!(
+                    "TCP stream going out: {} -> {}",
+                    stream.local_addr(),
+                    stream.remote_addr()
+                );
+                tokio::spawn(gateway_tcp_stream(stream, socks5));
+            }
+        };
 
-        arp_processor.heartbeat(&mut tx);
-        udp_processor.heartbeat(&mut tx);
-        tcp_processor.heartbeat(&mut tx);
-    }
+        futures::join!(fut_udp, fut_tcp);
+    });
 }
 
 fn main() {
@@ -220,9 +178,6 @@ fn main() {
     let subnet_addr = matches
         .opt_str("subnet-mask")
         .unwrap_or("255.255.255.0".to_string());
-    let prometheus_addr = matches
-        .opt_str("prometheus")
-        .unwrap_or("0.0.0.0:9000".to_string());
 
     SimpleLogger::new()
         .without_timestamps()
@@ -234,39 +189,6 @@ fn main() {
     let socks5 = socks5_addr.parse::<SocketAddr>().unwrap();
     let gateway = gateway_addr.parse::<Ipv4Addr>().unwrap();
     let subnet_mask = subnet_addr.parse::<Ipv4Addr>().unwrap();
-    let interface = datalink::interfaces()
-        .into_iter()
-        .filter(|iface| {
-            if !iface_name.is_empty() {
-                iface_name == iface.name
-            } else {
-                !iface.is_loopback()
-                    && iface.mac.is_some()
-                    && !iface.mac.as_ref().unwrap().is_zero()
-                    && !iface.ips.is_empty()
-                    && iface.ips.as_slice().into_iter().any(|ip| ip.is_ipv4())
-            }
-        })
-        .next()
-        .unwrap_or_else(|| panic!("Could not find local network interface."));
-    let mac = interface.mac.unwrap();
 
-    info!(
-        "start gatewaysocks on {}[{}]: {}({}), relay to socks5://{} ...",
-        interface.name, mac, gateway, subnet_mask, socks5
-    );
-
-    let (tcp_socks5_handle, tcp_socks5_service) = tcp_socks5(socks5);
-    let (udp_socks5_handle, udp_socks5_service) = udp_socks5(socks5);
-    let prometheus_exporter = Exporter::new(&prometheus_addr);
-
-    async_main(tcp_socks5_service, udp_socks5_service, prometheus_exporter);
-    gateway_main(
-        mac,
-        gateway,
-        subnet_mask,
-        &interface,
-        tcp_socks5_handle,
-        udp_socks5_handle,
-    );
+    gateway_async_main(gateway, subnet_mask, &iface_name, socks5);
 }

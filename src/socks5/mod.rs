@@ -4,22 +4,19 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-pub mod tcp;
-pub mod udp;
-
-const ATYP_IPV4: u8 = 1;
+pub const ATYP_IPV4: u8 = 1;
 const VER: u8 = 5;
 const NO_AUTH: u8 = 0;
 const CMD_CONNECT: u8 = 1;
 const CMD_UDP_ASSOCIATE: u8 = 3;
 
-struct Handshaker {
+pub struct Handshaker {
     server: SocketAddr,
     stream: TcpStream,
 }
 
 impl Handshaker {
-    async fn new(server: SocketAddr) -> Result<Self> {
+    pub async fn new(server: SocketAddr) -> Result<Self> {
         let stream = TcpStream::connect(server).await?;
         let mut handshaker = Self { server, stream };
 
@@ -27,15 +24,15 @@ impl Handshaker {
         Ok(handshaker)
     }
 
-    fn into_tcp_stream(self) -> TcpStream {
+    pub fn into_tcp_stream(self) -> TcpStream {
         self.stream
     }
 
-    async fn connect(&mut self, destination: SocketAddr) -> Result<SocketAddr> {
+    pub async fn connect(&mut self, destination: SocketAddr) -> Result<SocketAddr> {
         self.handshake(destination, CMD_CONNECT).await
     }
 
-    async fn udp_associate(&mut self, local_addr: SocketAddr) -> Result<SocketAddr> {
+    pub async fn udp_associate(&mut self, local_addr: SocketAddr) -> Result<SocketAddr> {
         let addr = self.handshake(local_addr, CMD_UDP_ASSOCIATE).await?;
         Ok(SocketAddr::new(self.server.ip(), addr.port()))
     }
