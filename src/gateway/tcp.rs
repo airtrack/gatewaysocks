@@ -26,11 +26,10 @@ use tokio::time::{sleep_until, Sleep};
 use crate::gateway::GatewaySender;
 
 const MSL_2: Duration = Duration::from_millis(30000);
+const DEFAULT_RTO: Duration = Duration::from_millis(100);
+const GRANULARITY: Duration = Duration::from_millis(1);
 const MAX_TCP_HEADER_LEN: usize = 60;
 const LOCAL_WINDOW: u32 = 256 * 1024;
-const DEFAULT_RTT: u32 = 100;
-const MAX_RTO: u32 = 100;
-const MIN_RTO: u32 = 1;
 
 #[derive(PartialEq, Debug)]
 enum State {
@@ -89,36 +88,36 @@ impl StreamTime {
 }
 
 struct RttEstimator {
-    rto: u32,
-    srtt: u32,
-    rttvar: u32,
+    srtt: Option<Duration>,
+    var: Duration,
+    rto: Duration,
 }
 
 impl RttEstimator {
     fn new() -> Self {
         Self {
-            rto: MAX_RTO,
-            srtt: DEFAULT_RTT,
-            rttvar: 0,
+            srtt: None,
+            var: Duration::default(),
+            rto: DEFAULT_RTO,
         }
     }
 
-    fn get(&self) -> u32 {
+    fn rto(&self) -> Duration {
         self.rto
     }
 
-    fn update(&mut self, rtt: u32) {
-        self.srtt = (self.srtt * 7 + rtt) / 8;
-
-        let delta = if rtt > self.srtt {
-            rtt - self.srtt
+    fn update(&mut self, rtt: Duration) {
+        // According to RFC6298.
+        if let Some(srtt) = self.srtt {
+            let var = if rtt > srtt { rtt - srtt } else { srtt - rtt };
+            self.var = (3 * self.var + var) / 4;
+            self.srtt = Some((7 * srtt + rtt) / 8);
         } else {
-            self.srtt - rtt
-        };
+            self.srtt = Some(rtt);
+            self.var = rtt / 2;
+        }
 
-        self.rttvar = (self.rttvar * 3 + delta) / 4;
-        let rto = self.srtt + 4 * self.rttvar;
-        self.rto = std::cmp::min(std::cmp::max(rto, MIN_RTO), MAX_RTO);
+        self.rto = self.srtt.unwrap() + GRANULARITY.max(4 * self.var);
     }
 }
 
@@ -953,7 +952,7 @@ impl TcpStreamCore {
         let now = Instant::now();
         for index in 0..self.send_buffer.buffer.len() {
             let sending_data = &self.send_buffer.buffer[index];
-            if (now - sending_data.send_time).as_millis() < self.rtt.get() as u128 {
+            if now - sending_data.send_time < self.rtt.rto() {
                 break;
             }
 
@@ -970,7 +969,7 @@ impl TcpStreamCore {
                 self.state,
                 self.send_buffer.buffer[index].seq,
                 self.send_buffer.buffer[index].data.len(),
-                self.rtt.get()
+                self.rtt.rto().as_millis()
             );
         }
     }
@@ -1288,7 +1287,7 @@ impl TcpStreamCore {
                 let echo_ts = u32::from_be_bytes(payload);
                 if echo_ts != 0 {
                     let rtt = self.timestamp() - echo_ts;
-                    self.rtt.update(rtt);
+                    self.rtt.update(Duration::from_millis(rtt as u64));
                 }
             }
         }
