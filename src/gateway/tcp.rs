@@ -25,7 +25,7 @@ use tokio::time::{sleep_until, Sleep};
 
 use crate::gateway::GatewaySender;
 
-const MSL_2: u128 = 30000;
+const MSL_2: Duration = Duration::from_millis(30000);
 const MAX_TCP_HEADER_LEN: usize = 60;
 const LOCAL_WINDOW: u32 = 256 * 1024;
 const DEFAULT_RTT: u32 = 100;
@@ -61,12 +61,12 @@ impl Display for AddrPair {
     }
 }
 
-struct Time {
+struct StreamTime {
     init: Instant,
     alive: Instant,
 }
 
-impl Time {
+impl StreamTime {
     fn new() -> Self {
         let now = Instant::now();
         Self {
@@ -74,21 +74,51 @@ impl Time {
             alive: now,
         }
     }
+
+    fn timestamp_millis(&self) -> u32 {
+        (Instant::now() - self.init).as_millis() as u32
+    }
+
+    fn alive_elapsed(&self) -> Duration {
+        Instant::now() - self.alive
+    }
+
+    fn update_alive(&mut self) {
+        self.alive = Instant::now();
+    }
 }
 
-struct RtoVars {
+struct RttEstimator {
     rto: u32,
     srtt: u32,
     rttvar: u32,
 }
 
-impl RtoVars {
+impl RttEstimator {
     fn new() -> Self {
         Self {
             rto: MAX_RTO,
             srtt: DEFAULT_RTT,
             rttvar: 0,
         }
+    }
+
+    fn get(&self) -> u32 {
+        self.rto
+    }
+
+    fn update(&mut self, rtt: u32) {
+        self.srtt = (self.srtt * 7 + rtt) / 8;
+
+        let delta = if rtt > self.srtt {
+            rtt - self.srtt
+        } else {
+            self.srtt - rtt
+        };
+
+        self.rttvar = (self.rttvar * 3 + delta) / 4;
+        let rto = self.srtt + 4 * self.rttvar;
+        self.rto = std::cmp::min(std::cmp::max(rto, MIN_RTO), MAX_RTO);
     }
 }
 
@@ -152,7 +182,7 @@ impl SendBuffer {
     }
 }
 
-struct TcpData {
+struct StateData {
     seq: u32,
     ack: u32,
     local_window: u32,
@@ -164,7 +194,7 @@ struct TcpData {
     sack: bool,
 }
 
-impl TcpData {
+impl StateData {
     fn new() -> Self {
         Self {
             seq: 0,
@@ -459,9 +489,9 @@ struct TcpStreamCore {
     timer: Pin<Box<Sleep>>,
     shutdown: bool,
     state: State,
-    time: Time,
-    rto_vars: RtoVars,
-    tcp_data: TcpData,
+    time: StreamTime,
+    rtt: RttEstimator,
+    state_data: StateData,
     recv_buffer: RecvBuffer,
     send_buffer: SendBuffer,
     read_waker: Option<Waker>,
@@ -484,9 +514,9 @@ impl TcpStreamCore {
             timer: Box::pin(sleep_until(deadline.into())),
             shutdown: false,
             state: State::Listen,
-            time: Time::new(),
-            rto_vars: RtoVars::new(),
-            tcp_data: TcpData::new(),
+            time: StreamTime::new(),
+            rtt: RttEstimator::new(),
+            state_data: StateData::new(),
             recv_buffer: RecvBuffer::new(),
             send_buffer: SendBuffer::new(),
             read_waker: None,
@@ -503,7 +533,7 @@ impl TcpStreamCore {
     }
 
     fn is_timewait_timeout(&self) -> bool {
-        self.state == State::TimeWait && (Instant::now() - self.time.alive).as_millis() >= MSL_2
+        self.state == State::TimeWait && self.time.alive_elapsed() >= MSL_2
     }
 
     fn handle_tcp_packet(&mut self, request: &TcpPacket) {
@@ -516,7 +546,7 @@ impl TcpStreamCore {
             self.state = State::Closed;
         }
 
-        self.time.alive = Instant::now();
+        self.time.update_alive();
 
         match self.state {
             State::Listen => self.state_listen(request),
@@ -663,7 +693,7 @@ impl TcpStreamCore {
     }
 
     fn push(&mut self, mut data: Vec<u8>) {
-        let remote_window = self.tcp_data.remote_window as usize;
+        let remote_window = self.state_data.remote_window as usize;
         if self.send_buffer.size >= remote_window {
             trace!(
                 "{}[{}]: pending data size: {}",
@@ -718,7 +748,7 @@ impl TcpStreamCore {
                 self.state,
                 request.get_sequence()
             );
-            self.tcp_data.ack = request.get_sequence() + 1;
+            self.state_data.ack = request.get_sequence() + 1;
             self.update_remote_window(request);
 
             for opt in request.get_options_iter() {
@@ -726,24 +756,24 @@ impl TcpStreamCore {
                     TcpOptionNumbers::MSS => {
                         let mut payload = [0u8; 2];
                         payload.copy_from_slice(&opt.payload()[0..2]);
-                        self.tcp_data.mss = u16::from_be_bytes(payload);
-                        trace!("tcp mss: {}", self.tcp_data.mss);
+                        self.state_data.mss = u16::from_be_bytes(payload);
+                        trace!("tcp mss: {}", self.state_data.mss);
                     }
                     TcpOptionNumbers::SACK_PERMITTED => {
-                        self.tcp_data.sack = true;
+                        self.state_data.sack = true;
                         trace!("tcp sack permitted");
                     }
                     TcpOptionNumbers::WSCALE => {
-                        self.tcp_data.wscale = opt.payload()[0];
-                        trace!("tcp window scale: {}", self.tcp_data.wscale);
+                        self.state_data.wscale = opt.payload()[0];
+                        trace!("tcp window scale: {}", self.state_data.wscale);
 
-                        self.tcp_data.wscale = std::cmp::min(self.tcp_data.wscale, 14);
+                        self.state_data.wscale = std::cmp::min(self.state_data.wscale, 14);
                         self.update_remote_window(request);
-                        trace!("tcp window size: {}", self.tcp_data.remote_window);
+                        trace!("tcp window size: {}", self.state_data.remote_window);
                     }
                     TcpOptionNumbers::TIMESTAMPS => {
                         self.process_remote_timestamp(&opt);
-                        trace!("tcp remote ts: {}", self.tcp_data.remote_ts);
+                        trace!("tcp remote ts: {}", self.state_data.remote_ts);
                     }
                     TcpOptionNumbers::NOP | TcpOptionNumbers::EOL => {}
                     _ => {
@@ -768,14 +798,14 @@ impl TcpStreamCore {
         }
 
         if request.get_flags() & TcpFlags::ACK != 0 {
-            if request.get_acknowledgement() == self.tcp_data.seq + 1 {
+            if request.get_acknowledgement() == self.state_data.seq + 1 {
                 trace!(
                     "{}[{}]: change state to Estab, payload size: {}",
                     self.addr_pair,
                     self.state,
                     request.payload().len()
                 );
-                self.tcp_data.seq += 1;
+                self.state_data.seq += 1;
                 self.state = State::Estab;
 
                 self.process_payload(request);
@@ -806,7 +836,7 @@ impl TcpStreamCore {
         self.process_acknowledgement(request);
 
         if request.get_flags() & TcpFlags::FIN != 0 {
-            if request.get_sequence() == self.tcp_data.ack {
+            if request.get_sequence() == self.state_data.ack {
                 trace!(
                     "{}[{}]: recv FIN, change state to CloseWait",
                     self.addr_pair,
@@ -821,7 +851,7 @@ impl TcpStreamCore {
 
     fn state_fin_wait1(&mut self, request: &TcpPacket) {
         if request.get_flags() & TcpFlags::FIN != 0 {
-            if request.get_sequence() == self.tcp_data.ack {
+            if request.get_sequence() == self.state_data.ack {
                 trace!(
                     "{}[{}]: recv FIN, change state to Closing",
                     self.addr_pair,
@@ -832,7 +862,7 @@ impl TcpStreamCore {
         }
 
         if request.get_flags() & TcpFlags::ACK != 0 {
-            if request.get_acknowledgement() == self.tcp_data.seq + 1 {
+            if request.get_acknowledgement() == self.state_data.seq + 1 {
                 self.state = State::FinWait2;
             }
         }
@@ -842,7 +872,7 @@ impl TcpStreamCore {
 
     fn state_fin_wait2(&mut self, request: &TcpPacket) {
         if request.get_flags() & TcpFlags::FIN != 0 {
-            if request.get_sequence() == self.tcp_data.ack {
+            if request.get_sequence() == self.state_data.ack {
                 trace!(
                     "{}[{}]: recv FIN, change state to TimeWait",
                     self.addr_pair,
@@ -861,7 +891,7 @@ impl TcpStreamCore {
         }
 
         if request.get_flags() & TcpFlags::ACK != 0 {
-            if request.get_acknowledgement() == self.tcp_data.seq + 1 {
+            if request.get_acknowledgement() == self.state_data.seq + 1 {
                 trace!(
                     "{}[{}]: recv FIN ack, change state to TimeWait",
                     self.addr_pair,
@@ -889,7 +919,7 @@ impl TcpStreamCore {
 
     fn state_last_ack(&mut self, request: &TcpPacket) {
         if request.get_flags() & TcpFlags::ACK != 0 {
-            if request.get_acknowledgement() == self.tcp_data.seq + 1 {
+            if request.get_acknowledgement() == self.state_data.seq + 1 {
                 self.state = State::Closed;
                 trace!(
                     "{}[{}]: recv last ACK, change state to Closed",
@@ -910,8 +940,8 @@ impl TcpStreamCore {
     }
 
     fn send_data(&mut self, data: Vec<u8>) {
-        let sending_data = SendingData::new(self.tcp_data.seq, data);
-        self.tcp_data.seq += sending_data.data.len() as u32;
+        let sending_data = SendingData::new(self.state_data.seq, data);
+        self.state_data.seq += sending_data.data.len() as u32;
         self.send_buffer.size += sending_data.data.len();
         self.send_buffer.pacing -= sending_data.data.len();
 
@@ -923,7 +953,7 @@ impl TcpStreamCore {
         let now = Instant::now();
         for index in 0..self.send_buffer.buffer.len() {
             let sending_data = &self.send_buffer.buffer[index];
-            if (now - sending_data.send_time).as_millis() < self.rto_vars.rto as u128 {
+            if (now - sending_data.send_time).as_millis() < self.rtt.get() as u128 {
                 break;
             }
 
@@ -940,13 +970,13 @@ impl TcpStreamCore {
                 self.state,
                 self.send_buffer.buffer[index].seq,
                 self.send_buffer.buffer[index].data.len(),
-                self.rto_vars.rto
+                self.rtt.get()
             );
         }
     }
 
     fn send_pending_data(&mut self) {
-        let remote_window = self.tcp_data.remote_window as usize;
+        let remote_window = self.state_data.remote_window as usize;
         let mut window;
 
         if remote_window == 0 && self.send_buffer.size == 0 {
@@ -1022,33 +1052,18 @@ impl TcpStreamCore {
     }
 
     fn update_remote_window(&mut self, request: &TcpPacket) {
-        self.tcp_data.remote_window = request.get_window() as u32;
-        self.tcp_data.remote_window <<= self.tcp_data.wscale;
+        self.state_data.remote_window = request.get_window() as u32;
+        self.state_data.remote_window <<= self.state_data.wscale;
         trace!(
             "{}[{}]: update remote window size: {}",
             self.addr_pair,
             self.state,
-            self.tcp_data.remote_window
+            self.state_data.remote_window
         );
     }
 
-    fn update_rto(&mut self, echo_ts: u32) {
-        let rtt = self.timestamp() - echo_ts;
-        self.rto_vars.srtt = (self.rto_vars.srtt * 9 + rtt) / 10;
-
-        let delta = if rtt > self.rto_vars.srtt {
-            rtt - self.rto_vars.srtt
-        } else {
-            self.rto_vars.srtt - rtt
-        };
-
-        self.rto_vars.rttvar = (self.rto_vars.rttvar * 3 + delta) / 4;
-        let rto = self.rto_vars.srtt + 4 * self.rto_vars.rttvar;
-        self.rto_vars.rto = std::cmp::min(std::cmp::max(rto, MIN_RTO), MAX_RTO);
-    }
-
     fn timestamp(&self) -> u32 {
-        (Instant::now() - self.time.init).as_millis() as u32
+        self.time.timestamp_millis()
     }
 
     fn add_tcp_option_timestamp(&self, opts: &mut Vec<TcpOption>, opts_size: &mut usize) {
@@ -1056,7 +1071,7 @@ impl TcpStreamCore {
         opts.push(TcpOption::nop());
         opts.push(TcpOption::timestamp(
             self.timestamp(),
-            self.tcp_data.remote_ts,
+            self.state_data.remote_ts,
         ));
         *opts_size += 12;
     }
@@ -1071,7 +1086,7 @@ impl TcpStreamCore {
         let mut acks = Vec::new();
 
         if let Some(seq_range) = seq_range {
-            if ((self.tcp_data.ack - seq_range.0) as i32) < 0 {
+            if ((self.state_data.ack - seq_range.0) as i32) < 0 {
                 acks.push(seq_range.0);
                 acks.push(seq_range.1);
                 blocks -= 1;
@@ -1100,10 +1115,10 @@ impl TcpStreamCore {
         let mut opts_size = 0;
         let payload = [0u8; 0];
 
-        opts.push(TcpOption::mss(self.tcp_data.mss));
+        opts.push(TcpOption::mss(self.state_data.mss));
         opts_size += 4;
 
-        opts.push(TcpOption::wscale(self.tcp_data.wscale));
+        opts.push(TcpOption::wscale(self.state_data.wscale));
         opts.push(TcpOption::nop());
         opts_size += 4;
 
@@ -1115,7 +1130,7 @@ impl TcpStreamCore {
         self.add_tcp_option_timestamp(&mut opts, &mut opts_size);
 
         self.send_tcp_packet(
-            self.tcp_data.seq,
+            self.state_data.seq,
             TcpFlags::SYN | TcpFlags::ACK,
             &opts,
             opts_size,
@@ -1133,7 +1148,7 @@ impl TcpStreamCore {
         let mut index = 0;
         let mut seq = data.seq;
         let mut len = data.data.len();
-        let max_payload_len = self.tcp_data.mss as usize - MAX_TCP_HEADER_LEN;
+        let max_payload_len = self.state_data.mss as usize - MAX_TCP_HEADER_LEN;
 
         while len > 0 {
             let payload_len = std::cmp::min(len, max_payload_len);
@@ -1159,7 +1174,7 @@ impl TcpStreamCore {
             "{}[{}]: send acknowledge ack: {}",
             self.addr_pair,
             self.state,
-            self.tcp_data.ack
+            self.state_data.ack
         );
     }
 
@@ -1180,7 +1195,7 @@ impl TcpStreamCore {
 
         self.add_tcp_option_timestamp(&mut opts, &mut opts_size);
         self.add_tcp_option_sack(&mut opts, &mut opts_size, seq_range);
-        self.send_tcp_packet(self.tcp_data.seq, flags, &opts, opts_size, &payload);
+        self.send_tcp_packet(self.state_data.seq, flags, &opts, opts_size, &payload);
     }
 
     fn send_tcp_packet(
@@ -1232,11 +1247,12 @@ impl TcpStreamCore {
                 tcp_packet.set_source(self.addr_pair.1.port());
                 tcp_packet.set_destination(self.addr_pair.0.port());
                 tcp_packet.set_sequence(seq);
-                tcp_packet.set_acknowledgement(self.tcp_data.ack);
+                tcp_packet.set_acknowledgement(self.state_data.ack);
                 tcp_packet.set_data_offset(((20 + opts_size) / 4) as u8);
                 tcp_packet.set_reserved(0);
                 tcp_packet.set_flags(flags);
-                tcp_packet.set_window((self.tcp_data.local_window >> self.tcp_data.wscale) as u16);
+                tcp_packet
+                    .set_window((self.state_data.local_window >> self.state_data.wscale) as u16);
                 tcp_packet.set_checksum(0);
                 tcp_packet.set_urgent_ptr(0);
                 tcp_packet.set_options(opts);
@@ -1254,12 +1270,12 @@ impl TcpStreamCore {
     fn process_remote_timestamp(&mut self, opt: &TcpOptionPacket) {
         let mut payload = [0u8; 4];
         payload.copy_from_slice(&opt.payload()[0..4]);
-        self.tcp_data.remote_ts = u32::from_be_bytes(payload);
+        self.state_data.remote_ts = u32::from_be_bytes(payload);
         trace!(
             "{}[{}]: remote timestamp: {}",
             self.addr_pair,
             self.state,
-            self.tcp_data.remote_ts
+            self.state_data.remote_ts
         );
     }
 
@@ -1271,7 +1287,8 @@ impl TcpStreamCore {
 
                 let echo_ts = u32::from_be_bytes(payload);
                 if echo_ts != 0 {
-                    self.update_rto(echo_ts);
+                    let rtt = self.timestamp() - echo_ts;
+                    self.rtt.update(rtt);
                 }
             }
         }
@@ -1311,7 +1328,7 @@ impl TcpStreamCore {
     }
 
     fn process_payload(&mut self, request: &TcpPacket) {
-        if request.get_sequence() == (self.tcp_data.ack - 1) {
+        if request.get_sequence() == (self.state_data.ack - 1) {
             trace!(
                 "{}[{}]: keep-alive request, payload size: {}",
                 self.addr_pair,
@@ -1331,8 +1348,8 @@ impl TcpStreamCore {
         let seq = request.get_sequence();
         let range = (seq, seq + payload.len() as u32);
         let window = (
-            self.tcp_data.ack,
-            self.tcp_data.ack + self.tcp_data.local_window,
+            self.state_data.ack,
+            self.state_data.ack + self.state_data.local_window,
         );
 
         let range_left = ((range.0 - window.0) as i32, (range.1 - window.0) as i32);
@@ -1379,7 +1396,7 @@ impl TcpStreamCore {
     }
 
     fn process_fin(&mut self, request: &TcpPacket) {
-        self.tcp_data.ack = request.get_sequence() + 1;
+        self.state_data.ack = request.get_sequence() + 1;
         self.send_tcp_acknowledge_packet(None);
 
         match self.state {
@@ -1435,7 +1452,7 @@ impl TcpStreamCore {
 
     fn handle_recv_buffer(&mut self) {
         let mut range = self.recv_buffer.ranges.front().unwrap().clone();
-        if self.tcp_data.ack != range.0 {
+        if self.state_data.ack != range.0 {
             return;
         }
 
@@ -1455,14 +1472,14 @@ impl TcpStreamCore {
             }
         }
 
-        self.tcp_data.ack = range.1;
+        self.state_data.ack = range.1;
 
         let len = (range.1 - range.0) as usize;
         let mut data: VecDeque<u8> = self.recv_buffer.buffer.drain(0..len).collect();
         self.recv_buffer.recved.append(&mut data);
         self.recv_buffer
             .buffer
-            .resize(self.tcp_data.local_window as usize, 0);
+            .resize(self.state_data.local_window as usize, 0);
 
         if !self.recv_buffer.recved.is_empty() {
             if let Some(waker) = self.read_waker.take() {
