@@ -12,9 +12,7 @@ use log::{error, trace, warn};
 use pnet::packet::ethernet::{EtherTypes, EthernetPacket, MutableEthernetPacket};
 use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::packet::ipv4::{self, Ipv4Packet, MutableIpv4Packet};
-use pnet::packet::tcp::{
-    self, MutableTcpPacket, TcpFlags, TcpOption, TcpOptionNumbers, TcpOptionPacket, TcpPacket,
-};
+use pnet::packet::tcp::{self, MutableTcpPacket, TcpFlags, TcpOption, TcpOptionNumbers, TcpPacket};
 use pnet::packet::{MutablePacket, Packet};
 use pnet::util::MacAddr;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -89,6 +87,7 @@ impl StreamTime {
 
 struct RttEstimator {
     srtt: Option<Duration>,
+    latest: Duration,
     var: Duration,
     rto: Duration,
 }
@@ -97,16 +96,26 @@ impl RttEstimator {
     fn new() -> Self {
         Self {
             srtt: None,
+            latest: Duration::default(),
             var: Duration::default(),
             rto: DEFAULT_RTO,
         }
+    }
+
+    fn get(&self) -> Option<Duration> {
+        self.srtt
     }
 
     fn rto(&self) -> Duration {
         self.rto
     }
 
+    fn latest(&self) -> Duration {
+        self.latest
+    }
+
     fn update(&mut self, rtt: Duration) {
+        self.latest = rtt;
         // According to RFC6298.
         if let Some(srtt) = self.srtt {
             let var = if rtt > srtt { rtt - srtt } else { srtt - rtt };
@@ -143,15 +152,17 @@ impl RecvBuffer {
 }
 
 struct SendingData {
-    send_time: Instant,
+    sent: Instant,
+    rto: Duration,
     seq: u32,
     data: Vec<u8>,
 }
 
 impl SendingData {
-    fn new(seq: u32, data: Vec<u8>) -> Self {
+    fn new(rto: Duration, seq: u32, data: Vec<u8>) -> Self {
         Self {
-            send_time: Instant::now(),
+            sent: Instant::now(),
+            rto,
             seq,
             data,
         }
@@ -206,6 +217,30 @@ impl StateData {
             sack: false,
         }
     }
+}
+
+trait CController: Send {
+    fn window(&self) -> usize;
+    fn on_ack(&mut self, now: Instant, sent: Instant, bytes: usize, rtt: &RttEstimator);
+    fn on_congestion(&mut self, now: Instant, sent: Instant, persistent: bool);
+}
+
+struct Cubic {}
+
+impl Cubic {
+    fn new() -> Box<Self> {
+        Box::new(Self {})
+    }
+}
+
+impl CController for Cubic {
+    fn window(&self) -> usize {
+        0
+    }
+
+    fn on_ack(&mut self, _now: Instant, _sent: Instant, _bytes: usize, _rtt: &RttEstimator) {}
+
+    fn on_congestion(&mut self, _now: Instant, _sent: Instant, _persistent: bool) {}
 }
 
 pub(super) fn new_tcp(
@@ -493,6 +528,7 @@ struct TcpStreamCore {
     state_data: StateData,
     recv_buffer: RecvBuffer,
     send_buffer: SendBuffer,
+    congestion: Box<dyn CController>,
     read_waker: Option<Waker>,
     write_waker: Option<Waker>,
 }
@@ -518,6 +554,7 @@ impl TcpStreamCore {
             state_data: StateData::new(),
             recv_buffer: RecvBuffer::new(),
             send_buffer: SendBuffer::new(),
+            congestion: Cubic::new(),
             read_waker: None,
             write_waker: None,
         }
@@ -759,8 +796,8 @@ impl TcpStreamCore {
                         trace!("tcp mss: {}", self.state_data.mss);
                     }
                     TcpOptionNumbers::SACK_PERMITTED => {
-                        self.state_data.sack = true;
-                        trace!("tcp sack permitted");
+                        self.state_data.sack = false;
+                        trace!("tcp sack permitted {}", self.state_data.sack);
                     }
                     TcpOptionNumbers::WSCALE => {
                         self.state_data.wscale = opt.payload()[0];
@@ -771,7 +808,9 @@ impl TcpStreamCore {
                         trace!("tcp window size: {}", self.state_data.remote_window);
                     }
                     TcpOptionNumbers::TIMESTAMPS => {
-                        self.process_remote_timestamp(&opt);
+                        let mut payload = [0u8; 4];
+                        payload.copy_from_slice(&opt.payload()[0..4]);
+                        self.state_data.remote_ts = u32::from_be_bytes(payload);
                         trace!("tcp remote ts: {}", self.state_data.remote_ts);
                     }
                     TcpOptionNumbers::NOP | TcpOptionNumbers::EOL => {}
@@ -821,15 +860,6 @@ impl TcpStreamCore {
             request.get_sequence(),
             request.payload().len()
         );
-
-        for opt in request.get_options_iter() {
-            match opt.get_number() {
-                TcpOptionNumbers::TIMESTAMPS => {
-                    self.process_remote_timestamp(&opt);
-                }
-                _ => {}
-            }
-        }
 
         self.update_remote_window(request);
         self.process_acknowledgement(request);
@@ -939,7 +969,7 @@ impl TcpStreamCore {
     }
 
     fn send_data(&mut self, data: Vec<u8>) {
-        let sending_data = SendingData::new(self.state_data.seq, data);
+        let sending_data = SendingData::new(self.rtt.rto(), self.state_data.seq, data);
         self.state_data.seq += sending_data.data.len() as u32;
         self.send_buffer.size += sending_data.data.len();
         self.send_buffer.pacing -= sending_data.data.len();
@@ -950,9 +980,11 @@ impl TcpStreamCore {
 
     fn resend_sending_data(&mut self) {
         let now = Instant::now();
+        let mut latest_loss_sent = None;
+
         for index in 0..self.send_buffer.buffer.len() {
             let sending_data = &self.send_buffer.buffer[index];
-            if now - sending_data.send_time < self.rtt.rto() {
+            if now - sending_data.sent < sending_data.rto {
                 break;
             }
 
@@ -960,17 +992,31 @@ impl TcpStreamCore {
                 break;
             }
 
-            self.send_buffer.pacing -= sending_data.data.len();
-            self.send_tcp_data_packet(sending_data);
-            self.send_buffer.buffer[index].send_time = now;
             trace!(
                 "{}[{}]: resend data at seq: {}, len: {}, rto: {}",
                 self.addr_pair,
                 self.state,
-                self.send_buffer.buffer[index].seq,
-                self.send_buffer.buffer[index].data.len(),
-                self.rtt.rto().as_millis()
+                sending_data.seq,
+                sending_data.data.len(),
+                sending_data.rto.as_millis()
             );
+
+            if let Some(sent) = latest_loss_sent {
+                if sending_data.sent > sent {
+                    latest_loss_sent = Some(sending_data.sent);
+                }
+            } else {
+                latest_loss_sent = Some(sending_data.sent);
+            }
+
+            self.send_buffer.pacing -= sending_data.data.len();
+            self.send_tcp_data_packet(sending_data);
+            self.send_buffer.buffer[index].sent = now;
+            self.send_buffer.buffer[index].rto = self.rtt.rto();
+        }
+
+        if let Some(sent) = latest_loss_sent {
+            self.congestion.on_congestion(now, sent, false);
         }
     }
 
@@ -985,6 +1031,15 @@ impl TcpStreamCore {
         } else {
             window = 0;
         }
+
+        trace!(
+            "{}[{}]: remote wnd: {}, wnd: {}, congestion wnd: {}",
+            self.addr_pair,
+            self.state,
+            remote_window,
+            window,
+            self.congestion.window()
+        );
 
         while !self.send_buffer.pending.is_empty() && self.send_buffer.pacing > 0 && window > 0 {
             let front = self.send_buffer.pending.pop_front().unwrap();
@@ -1081,6 +1136,10 @@ impl TcpStreamCore {
         opts_size: &mut usize,
         seq_range: Option<(u32, u32)>,
     ) {
+        if !self.state_data.sack {
+            return;
+        }
+
         let mut blocks = 3;
         let mut acks = Vec::new();
 
@@ -1121,10 +1180,12 @@ impl TcpStreamCore {
         opts.push(TcpOption::nop());
         opts_size += 4;
 
-        opts.push(TcpOption::nop());
-        opts.push(TcpOption::nop());
-        opts.push(TcpOption::sack_perm());
-        opts_size += 4;
+        if self.state_data.sack {
+            opts.push(TcpOption::nop());
+            opts.push(TcpOption::nop());
+            opts.push(TcpOption::sack_perm());
+            opts_size += 4;
+        }
 
         self.add_tcp_option_timestamp(&mut opts, &mut opts_size);
 
@@ -1206,13 +1267,12 @@ impl TcpStreamCore {
         payload: &[u8],
     ) {
         trace!(
-            "{}:[{}]: send tcp packet {}[{}] -> {}[{}]",
+            "{}[{}]: send packet flags: {:b}, seq: {}, payload size: {}",
             self.addr_pair,
             self.state,
-            self.addr_pair.1,
-            self.gw_sender.info.mac,
-            self.addr_pair.0,
-            self.src_mac
+            flags,
+            seq,
+            payload.len()
         );
 
         let tcp_packet_len = 20 + opts_size + payload.len();
@@ -1266,16 +1326,24 @@ impl TcpStreamCore {
             });
     }
 
-    fn process_remote_timestamp(&mut self, opt: &TcpOptionPacket) {
-        let mut payload = [0u8; 4];
-        payload.copy_from_slice(&opt.payload()[0..4]);
-        self.state_data.remote_ts = u32::from_be_bytes(payload);
-        trace!(
-            "{}[{}]: remote timestamp: {}",
-            self.addr_pair,
-            self.state,
-            self.state_data.remote_ts
-        );
+    fn process_remote_timestamp(&mut self, request: &TcpPacket) {
+        for opt in request.get_options_iter() {
+            if opt.get_number() == TcpOptionNumbers::TIMESTAMPS {
+                let mut payload = [0u8; 4];
+                payload.copy_from_slice(&opt.payload()[0..4]);
+
+                let new_ts = u32::from_be_bytes(payload);
+                if (new_ts - self.state_data.remote_ts) as i32 >= 0 {
+                    self.state_data.remote_ts = new_ts;
+                    trace!(
+                        "{}[{}]: update remote timestamp: {}",
+                        self.addr_pair,
+                        self.state,
+                        self.state_data.remote_ts
+                    );
+                }
+            }
+        }
     }
 
     fn process_echo_timestamp(&mut self, request: &TcpPacket) {
@@ -1288,12 +1356,21 @@ impl TcpStreamCore {
                 if echo_ts != 0 {
                     let rtt = self.timestamp() - echo_ts;
                     self.rtt.update(Duration::from_millis(rtt as u64));
+                    trace!(
+                        "{}[{}]: rtt {}ms, srtt {}ms, rto {}ms",
+                        self.addr_pair,
+                        self.state,
+                        self.rtt.latest().as_millis(),
+                        self.rtt.get().unwrap_or_default().as_millis(),
+                        self.rtt.rto().as_millis(),
+                    );
                 }
             }
         }
     }
 
     fn process_acknowledgement(&mut self, request: &TcpPacket) {
+        let now = Instant::now();
         let ack = request.get_acknowledgement();
         let send_buffer_size = self.send_buffer.size;
         trace!("{}[{}]: process ack: {}", self.addr_pair, self.state, ack);
@@ -1308,21 +1385,24 @@ impl TcpStreamCore {
             }
 
             if ((end_seq - ack) as i32) <= 0 {
-                self.send_buffer.size -= front.data.len();
+                let bytes = front.data.len();
+                self.congestion.on_ack(now, front.sent, bytes, &self.rtt);
                 self.send_buffer.buffer.pop_front();
-                continue;
+                self.send_buffer.size -= bytes;
+            } else {
+                let bytes = (ack - begin_seq) as usize;
+                self.congestion.on_ack(now, front.sent, bytes, &self.rtt);
+                front.seq = ack;
+                front.data.drain(0..bytes);
+                self.send_buffer.size -= bytes;
             }
-
-            let len = (ack - begin_seq) as usize;
-            front.data.drain(0..len);
-            front.seq = ack;
-            self.send_buffer.size -= len;
         }
 
         if send_buffer_size != self.send_buffer.size {
             self.process_echo_timestamp(request);
         }
 
+        self.resend_sending_data();
         self.send_pending_data();
     }
 
@@ -1390,7 +1470,7 @@ impl TcpStreamCore {
         );
 
         self.update_recv_ranges(seq_range);
-        self.handle_recv_buffer();
+        self.handle_recv_buffer(request);
         self.send_tcp_acknowledge_packet(Some(seq_range));
     }
 
@@ -1449,7 +1529,7 @@ impl TcpStreamCore {
         self.recv_buffer.ranges.push_back(seq_range);
     }
 
-    fn handle_recv_buffer(&mut self) {
+    fn handle_recv_buffer(&mut self, request: &TcpPacket) {
         let mut range = self.recv_buffer.ranges.front().unwrap().clone();
         if self.state_data.ack != range.0 {
             return;
@@ -1472,6 +1552,7 @@ impl TcpStreamCore {
         }
 
         self.state_data.ack = range.1;
+        self.process_remote_timestamp(request);
 
         let len = (range.1 - range.0) as usize;
         let mut data: VecDeque<u8> = self.recv_buffer.buffer.drain(0..len).collect();
