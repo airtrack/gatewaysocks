@@ -6,6 +6,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::Waker;
 use std::time::{Duration, Instant};
+use std::usize;
 
 use bytes::Bytes;
 use log::{error, trace, warn};
@@ -28,6 +29,7 @@ const DEFAULT_RTO: Duration = Duration::from_millis(100);
 const GRANULARITY: Duration = Duration::from_millis(1);
 const MAX_TCP_HEADER_LEN: usize = 60;
 const LOCAL_WINDOW: u32 = 256 * 1024;
+const DEFAULT_MSS: usize = 1400;
 
 #[derive(PartialEq, Debug)]
 enum State {
@@ -212,7 +214,7 @@ impl StateData {
             local_window: LOCAL_WINDOW,
             remote_window: 0,
             remote_ts: 0,
-            mss: 1400,
+            mss: DEFAULT_MSS as u16,
             wscale: 0,
             sack: false,
         }
@@ -225,22 +227,137 @@ trait CController: Send {
     fn on_congestion(&mut self, now: Instant, sent: Instant, persistent: bool);
 }
 
-struct Cubic {}
+const BETA_CUBIC: f64 = 0.7;
+const C: f64 = 0.4;
+
+#[derive(Default)]
+struct CubicState {
+    k: f64,
+    w_max: f64,
+    cwnd_inc: usize,
+}
+
+impl CubicState {
+    fn cubic_k(&self, max_datagram_size: usize) -> f64 {
+        let w_max = self.w_max / max_datagram_size as f64;
+        (w_max * (1.0 - BETA_CUBIC) / C).cbrt()
+    }
+
+    fn w_cubic(&self, t: Duration, max_datagram_size: usize) -> f64 {
+        let w_max = self.w_max / max_datagram_size as f64;
+        (C * (t.as_secs_f64() - self.k).powi(3) + w_max) * max_datagram_size as f64
+    }
+
+    fn w_est(&self, t: Duration, rtt: Duration, max_datagram_size: usize) -> f64 {
+        let w_max = self.w_max / max_datagram_size as f64;
+        (w_max * BETA_CUBIC
+            + 3.0 * (1.0 - BETA_CUBIC) / (1.0 + BETA_CUBIC) * t.as_secs_f64() / rtt.as_secs_f64())
+            * max_datagram_size as f64
+    }
+}
+
+struct Cubic {
+    mtu: usize,
+    window: usize,
+    ssthresh: usize,
+    state: CubicState,
+    recovery_start_time: Option<Instant>,
+}
 
 impl Cubic {
     fn new() -> Box<Self> {
-        Box::new(Self {})
+        Box::new(Self {
+            mtu: DEFAULT_MSS,
+            window: 20 * DEFAULT_MSS,
+            ssthresh: usize::MAX,
+            state: CubicState::default(),
+            recovery_start_time: None,
+        })
+    }
+
+    fn minimum_window(&self) -> usize {
+        10 * self.mtu
     }
 }
 
 impl CController for Cubic {
     fn window(&self) -> usize {
-        0
+        self.window
     }
 
-    fn on_ack(&mut self, _now: Instant, _sent: Instant, _bytes: usize, _rtt: &RttEstimator) {}
+    fn on_ack(&mut self, now: Instant, sent: Instant, bytes: usize, rtt: &RttEstimator) {
+        if self.recovery_start_time.map(|t| sent <= t).unwrap_or(false) {
+            return;
+        }
 
-    fn on_congestion(&mut self, _now: Instant, _sent: Instant, _persistent: bool) {}
+        if self.window < self.ssthresh {
+            self.window += bytes;
+        } else {
+            let start_time = match self.recovery_start_time {
+                Some(t) => t,
+                None => {
+                    self.recovery_start_time = Some(now);
+                    self.state.w_max = self.window as f64;
+                    self.state.k = 0.0;
+                    now
+                }
+            };
+
+            let t = now - start_time;
+            let rtt = rtt.get().unwrap_or(Duration::from_millis(10));
+            let w_cubic = self.state.w_cubic(t + rtt, self.mtu);
+            let w_est = self.state.w_est(t, rtt, self.mtu);
+
+            let mut cubic_cwnd = self.window;
+            if w_cubic < w_est {
+                cubic_cwnd = std::cmp::max(cubic_cwnd, w_est as usize);
+            } else if cubic_cwnd < w_cubic as usize {
+                let cubic_inc = (w_cubic - cubic_cwnd as f64) / cubic_cwnd as f64 * self.mtu as f64;
+                cubic_cwnd += cubic_inc as usize;
+            }
+
+            self.state.cwnd_inc += cubic_cwnd - self.window;
+            if self.state.cwnd_inc >= self.mtu {
+                self.window += self.mtu;
+                self.state.cwnd_inc = 0;
+            }
+        }
+    }
+
+    fn on_congestion(&mut self, now: Instant, sent: Instant, persistent: bool) {
+        if self.recovery_start_time.map(|t| sent <= t).unwrap_or(false) {
+            return;
+        }
+
+        self.recovery_start_time = Some(now);
+
+        if (self.window as f64) < self.state.w_max {
+            self.state.w_max = self.window as f64 * (1.0 + BETA_CUBIC) / 2.0;
+        } else {
+            self.state.w_max = self.window as f64;
+        }
+
+        self.ssthresh = std::cmp::max(
+            (self.state.w_max * BETA_CUBIC) as usize,
+            self.minimum_window(),
+        );
+
+        self.window = self.ssthresh;
+        self.state.k = self.state.cubic_k(self.mtu);
+        self.state.cwnd_inc = (self.state.cwnd_inc as f64 * BETA_CUBIC) as usize;
+
+        if persistent {
+            self.recovery_start_time = None;
+            self.state.w_max = self.window as f64;
+            self.ssthresh = std::cmp::max(
+                (self.window as f64 * BETA_CUBIC) as usize,
+                self.minimum_window(),
+            );
+
+            self.state.cwnd_inc = 0;
+            self.window = self.minimum_window();
+        }
+    }
 }
 
 pub(super) fn new_tcp(
