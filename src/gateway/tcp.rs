@@ -26,6 +26,7 @@ use crate::gateway::GatewaySender;
 
 const MSL_2: Duration = Duration::from_millis(30000);
 const DEFAULT_RTO: Duration = Duration::from_millis(100);
+const DEFAULT_RTT: Duration = Duration::from_millis(10);
 const GRANULARITY: Duration = Duration::from_millis(1);
 const MAX_TCP_HEADER_LEN: usize = 60;
 const LOCAL_WINDOW: u32 = 256 * 1024;
@@ -78,8 +79,8 @@ impl StreamTime {
         (Instant::now() - self.init).as_millis() as u32
     }
 
-    fn alive_elapsed(&self) -> Duration {
-        Instant::now() - self.alive
+    fn alive_time(&self) -> Instant {
+        self.alive
     }
 
     fn update_alive(&mut self) {
@@ -104,12 +105,12 @@ impl RttEstimator {
         }
     }
 
-    fn get(&self) -> Option<Duration> {
-        self.srtt
+    fn get(&self) -> Duration {
+        self.srtt.unwrap_or(DEFAULT_RTT)
     }
 
     fn rto(&self) -> Duration {
-        self.rto
+        self.rto.max(DEFAULT_RTO / 2)
     }
 
     fn latest(&self) -> Duration {
@@ -155,19 +156,21 @@ impl RecvBuffer {
 
 struct SendingData {
     sent: Instant,
-    rto: Duration,
     seq: u32,
     data: Vec<u8>,
 }
 
 impl SendingData {
-    fn new(rto: Duration, seq: u32, data: Vec<u8>) -> Self {
+    fn new(seq: u32, data: Vec<u8>) -> Self {
         Self {
             sent: Instant::now(),
-            rto,
             seq,
             data,
         }
+    }
+
+    fn timeout(&self, rto: Duration) -> Instant {
+        self.sent + rto
     }
 }
 
@@ -178,7 +181,6 @@ enum PendingData {
 
 struct SendBuffer {
     size: usize,
-    pacing: usize,
     buffer: VecDeque<SendingData>,
     pending: VecDeque<PendingData>,
 }
@@ -187,7 +189,6 @@ impl SendBuffer {
     fn new() -> Self {
         Self {
             size: 0,
-            pacing: 0,
             buffer: VecDeque::new(),
             pending: VecDeque::new(),
         }
@@ -256,6 +257,7 @@ impl CubicState {
     }
 }
 
+#[allow(unused)]
 struct Cubic {
     mtu: usize,
     window: usize,
@@ -264,11 +266,12 @@ struct Cubic {
     recovery_start_time: Option<Instant>,
 }
 
+#[allow(unused)]
 impl Cubic {
     fn new() -> Box<Self> {
         Box::new(Self {
             mtu: DEFAULT_MSS,
-            window: 20 * DEFAULT_MSS,
+            window: 200 * DEFAULT_MSS,
             ssthresh: usize::MAX,
             state: CubicState::default(),
             recovery_start_time: None,
@@ -276,10 +279,11 @@ impl Cubic {
     }
 
     fn minimum_window(&self) -> usize {
-        10 * self.mtu
+        200 * self.mtu
     }
 }
 
+#[allow(unused)]
 impl CController for Cubic {
     fn window(&self) -> usize {
         self.window
@@ -304,7 +308,7 @@ impl CController for Cubic {
             };
 
             let t = now - start_time;
-            let rtt = rtt.get().unwrap_or(Duration::from_millis(10));
+            let rtt = rtt.get();
             let w_cubic = self.state.w_cubic(t + rtt, self.mtu);
             let w_est = self.state.w_est(t, rtt, self.mtu);
 
@@ -357,6 +361,117 @@ impl CController for Cubic {
             self.state.cwnd_inc = 0;
             self.window = self.minimum_window();
         }
+    }
+}
+
+struct FixBandwidth;
+
+impl FixBandwidth {
+    fn new() -> Box<Self> {
+        Box::new(Self {})
+    }
+}
+
+#[allow(unused)]
+impl CController for FixBandwidth {
+    fn window(&self) -> usize {
+        128000
+    }
+
+    fn on_ack(&mut self, now: Instant, sent: Instant, bytes: usize, rtt: &RttEstimator) {}
+
+    fn on_congestion(&mut self, now: Instant, sent: Instant, persistent: bool) {}
+}
+
+struct Pacer {
+    granu: usize,
+    bytes: usize,
+    window: usize,
+    srtt: Duration,
+    prev: Instant,
+}
+
+impl Pacer {
+    fn new(srtt: Duration, window: usize) -> Self {
+        let granu = Self::granularity(srtt, window);
+        Self {
+            granu,
+            bytes: granu,
+            window,
+            srtt,
+            prev: Instant::now(),
+        }
+    }
+
+    fn granularity(srtt: Duration, window: usize) -> usize {
+        let srtt = srtt.as_secs_f64();
+        let unit = GRANULARITY.as_secs_f64();
+        ((unit * window as f64) / srtt) as usize
+    }
+
+    fn consume(&mut self, bytes: usize) {
+        self.bytes = self.bytes.saturating_sub(bytes);
+    }
+
+    fn delay(
+        &mut self,
+        send_bytes: usize,
+        now: Instant,
+        srtt: Duration,
+        window: usize,
+    ) -> Option<Instant> {
+        if self.window != window {
+            self.granu = Self::granularity(srtt, window);
+            self.bytes = self.granu.min(self.bytes);
+            self.srtt = srtt;
+            self.window = window;
+        }
+
+        if self.bytes >= send_bytes {
+            return None;
+        }
+
+        let inc_rtts = (now - self.prev).as_secs_f64() / self.srtt.as_secs_f64();
+        let inc_bytes = (inc_rtts * window as f64) as usize;
+        self.bytes = self
+            .bytes
+            .saturating_add(inc_bytes as usize)
+            .min(self.granu);
+        self.prev = now;
+
+        if self.bytes >= send_bytes {
+            return None;
+        }
+
+        let diff = (send_bytes.max(self.granu) - self.bytes) as f64;
+        let duration = diff * self.srtt.as_secs_f64() / self.window as f64;
+        let delay = Duration::from_secs_f64(duration);
+        Some(now + delay)
+    }
+}
+
+enum TimerType {
+    Rto = 0,
+    Pacing = 1,
+    TimeWait = 2,
+}
+
+#[derive(Default)]
+struct TimerTable {
+    table: [Option<Instant>; 3],
+}
+
+impl TimerTable {
+    fn set(&mut self, index: TimerType, deadline: Instant) {
+        self.table[index as usize] = Some(deadline);
+    }
+
+    fn stop(&mut self, index: TimerType) {
+        self.table[index as usize] = None;
+    }
+
+    fn next_deadline(&self) -> Option<Instant> {
+        self.table.iter().filter_map(|&x| x).min()
     }
 }
 
@@ -570,13 +685,14 @@ impl Future for TcpStreamDriver {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        match self.packets.poll_recv(cx) {
-            std::task::Poll::Ready(Some(packet)) => {
-                self.inner.handle_tcp_packet(packet);
-                self.inner.poll_state(cx)
+        loop {
+            match self.packets.poll_recv(cx) {
+                std::task::Poll::Ready(Some(packet)) => {
+                    self.inner.handle_tcp_packet(packet);
+                }
+                std::task::Poll::Ready(None) => return std::task::Poll::Ready(()),
+                std::task::Poll::Pending => return self.inner.poll_state(cx),
             }
-            std::task::Poll::Ready(None) => return std::task::Poll::Ready(()),
-            std::task::Poll::Pending => self.inner.poll_state(cx),
         }
     }
 }
@@ -638,8 +754,10 @@ struct TcpStreamCore {
     addr_pair: AddrPair,
     gw_sender: GatewaySender,
     timer: Pin<Box<Sleep>>,
+    timers: TimerTable,
     shutdown: bool,
     state: State,
+    pacing: Pacer,
     time: StreamTime,
     rtt: RttEstimator,
     state_data: StateData,
@@ -648,6 +766,7 @@ struct TcpStreamCore {
     congestion: Box<dyn CController>,
     read_waker: Option<Waker>,
     write_waker: Option<Waker>,
+    driver_waker: Option<Waker>,
 }
 
 impl TcpStreamCore {
@@ -657,36 +776,34 @@ impl TcpStreamCore {
         addr_pair: AddrPair,
         gw_sender: GatewaySender,
     ) -> Self {
-        let deadline = Instant::now() + Duration::from_millis(1);
+        let deadline = Instant::now();
+        let congestion = FixBandwidth::new();
+        let srtt = DEFAULT_RTT;
+
         Self {
             close_stream,
             src_mac,
             addr_pair,
             gw_sender,
             timer: Box::pin(sleep_until(deadline.into())),
+            timers: TimerTable::default(),
             shutdown: false,
             state: State::Listen,
+            pacing: Pacer::new(srtt, congestion.window()),
             time: StreamTime::new(),
             rtt: RttEstimator::new(),
             state_data: StateData::new(),
             recv_buffer: RecvBuffer::new(),
             send_buffer: SendBuffer::new(),
-            congestion: Cubic::new(),
+            congestion: congestion,
             read_waker: None,
             write_waker: None,
+            driver_waker: None,
         }
     }
 
     fn is_syn_packet(request: &TcpPacket) -> bool {
         request.get_flags() & TcpFlags::SYN != 0
-    }
-
-    fn is_closed(&self) -> bool {
-        self.state == State::Closed
-    }
-
-    fn is_timewait_timeout(&self) -> bool {
-        self.state == State::TimeWait && self.time.alive_elapsed() >= MSL_2
     }
 
     fn handle_tcp_packet(&mut self, request: &TcpPacket) {
@@ -732,24 +849,25 @@ impl TcpStreamCore {
             return std::task::Poll::Ready(());
         }
 
-        if Future::poll(self.timer.as_mut(), cx).is_pending() {
+        if self.driver_waker.is_none() {
+            self.driver_waker = Some(cx.waker().clone());
+        }
+
+        if self.state == State::Estab || self.state == State::CloseWait {
+            self.send_packets();
+        }
+
+        let deadline = self.timers.next_deadline();
+        if deadline.is_none() {
             return std::task::Poll::Pending;
         }
 
-        self.send_buffer.pacing = 20000;
-        if self.state == State::Estab || self.state == State::CloseWait {
-            self.resend_sending_data();
-            self.send_pending_data();
+        let deadline = deadline.unwrap();
+        if self.timer.deadline().into_std() != deadline {
+            Sleep::reset(self.timer.as_mut(), deadline.into());
         }
 
-        let deadline = Instant::now() + Duration::from_millis(1);
-        Sleep::reset(self.timer.as_mut(), deadline.into());
-
         if Future::poll(self.timer.as_mut(), cx).is_ready() {
-            warn!(
-                "{}[{}]: timer is ready after reset",
-                self.addr_pair, self.state
-            );
             cx.waker().wake_by_ref();
         }
 
@@ -802,7 +920,10 @@ impl TcpStreamCore {
         }
 
         let size = buf.len();
-        self.push(buf.into());
+        self.send_buffer
+            .pending
+            .push_back(PendingData::Data(buf.into()));
+        self.driver_waker.as_ref().map(|waker| waker.wake_by_ref());
         std::task::Poll::Ready(Ok(size))
     }
 
@@ -842,55 +963,41 @@ impl TcpStreamCore {
             self.send_tcp_rst_packet();
             self.state = State::Closed;
             self.state_closed();
+            self.driver_waker.as_ref().map(|waker| waker.wake_by_ref());
         }
     }
 
-    fn push(&mut self, mut data: Vec<u8>) {
-        let remote_window = self.state_data.remote_window as usize;
-        if self.send_buffer.size >= remote_window {
-            trace!(
-                "{}[{}]: pending data size: {}",
-                self.addr_pair,
-                self.state,
-                data.len()
-            );
-            return self.send_buffer.pending.push_back(PendingData::Data(data));
+    fn is_closed(&self) -> bool {
+        self.state == State::Closed
+    }
+
+    fn is_timewait_timeout(&mut self) -> bool {
+        if self.state != State::TimeWait {
+            return false;
         }
 
-        let size = std::cmp::min(
-            remote_window - self.send_buffer.size,
-            self.send_buffer.pacing,
-        );
+        let deadline = self.time.alive_time() + MSL_2;
+        self.timers.set(TimerType::TimeWait, deadline);
 
-        if data.len() <= size {
-            trace!(
-                "{}[{}]: send data size: {}",
-                self.addr_pair,
-                self.state,
-                data.len()
-            );
-            return self.send_data(data);
+        Instant::now() >= deadline
+    }
+
+    fn send_packets(&mut self) {
+        if let Some(delay) = self.resend_sending_data() {
+            self.timers.set(TimerType::Pacing, delay);
+        } else if let Some(delay) = self.send_pending_data() {
+            self.timers.set(TimerType::Pacing, delay);
+        } else {
+            self.timers.stop(TimerType::Pacing);
         }
 
-        let pending_data = data.split_off(size);
-
-        trace!(
-            "{}[{}]: send data size: {}",
-            self.addr_pair,
-            self.state,
-            data.len()
-        );
-        self.send_data(data);
-
-        trace!(
-            "{}[{}]: pending data size: {}",
-            self.addr_pair,
-            self.state,
-            pending_data.len()
-        );
-        self.send_buffer
-            .pending
-            .push_back(PendingData::Data(pending_data));
+        if self.send_buffer.buffer.is_empty() {
+            self.timers.stop(TimerType::Rto);
+        } else {
+            let front = self.send_buffer.buffer.front().unwrap();
+            self.timers
+                .set(TimerType::Rto, front.timeout(self.rtt.rto()));
+        }
     }
 
     fn state_listen(&mut self, request: &TcpPacket) {
@@ -1086,26 +1193,34 @@ impl TcpStreamCore {
     }
 
     fn send_data(&mut self, data: Vec<u8>) {
-        let sending_data = SendingData::new(self.rtt.rto(), self.state_data.seq, data);
-        self.state_data.seq += sending_data.data.len() as u32;
-        self.send_buffer.size += sending_data.data.len();
-        self.send_buffer.pacing -= sending_data.data.len();
+        let sending_data = SendingData::new(self.state_data.seq, data);
+        let bytes = sending_data.data.len();
+
+        self.state_data.seq += bytes as u32;
+        self.send_buffer.size += bytes;
+        self.pacing.consume(bytes);
 
         self.send_tcp_data_packet(&sending_data);
         self.send_buffer.buffer.push_back(sending_data);
     }
 
-    fn resend_sending_data(&mut self) {
+    fn resend_sending_data(&mut self) -> Option<Instant> {
         let now = Instant::now();
+        let mut delay = None;
         let mut latest_loss_sent = None;
 
         for index in 0..self.send_buffer.buffer.len() {
             let sending_data = &self.send_buffer.buffer[index];
-            if now - sending_data.sent < sending_data.rto {
+            if now < sending_data.timeout(self.rtt.rto()) {
                 break;
             }
 
-            if self.send_buffer.pacing < sending_data.data.len() {
+            let send_bytes = sending_data.data.len();
+            if let Some(t) =
+                self.pacing
+                    .delay(send_bytes, now, self.rtt.get(), self.congestion.window())
+            {
+                delay = Some(t);
                 break;
             }
 
@@ -1115,7 +1230,7 @@ impl TcpStreamCore {
                 self.state,
                 sending_data.seq,
                 sending_data.data.len(),
-                sending_data.rto.as_millis()
+                self.rtt.rto().as_millis()
             );
 
             if let Some(sent) = latest_loss_sent {
@@ -1126,69 +1241,63 @@ impl TcpStreamCore {
                 latest_loss_sent = Some(sending_data.sent);
             }
 
-            self.send_buffer.pacing -= sending_data.data.len();
+            self.pacing.consume(send_bytes);
             self.send_tcp_data_packet(sending_data);
             self.send_buffer.buffer[index].sent = now;
-            self.send_buffer.buffer[index].rto = self.rtt.rto();
         }
 
         if let Some(sent) = latest_loss_sent {
             self.congestion.on_congestion(now, sent, false);
         }
+
+        delay
     }
 
-    fn send_pending_data(&mut self) {
-        let remote_window = self.state_data.remote_window as usize;
-        let mut window;
-
-        if remote_window == 0 && self.send_buffer.size == 0 {
-            window = 1;
-        } else if remote_window > self.send_buffer.size {
-            window = remote_window - self.send_buffer.size;
-        } else {
-            window = 0;
-        }
+    fn send_pending_data(&mut self) -> Option<Instant> {
+        let now = Instant::now();
+        let mut delay = None;
+        let mut window = self
+            .congestion
+            .window()
+            .saturating_sub(self.send_buffer.size);
 
         trace!(
-            "{}[{}]: remote wnd: {}, wnd: {}, congestion wnd: {}",
+            "{}[{}]: remote wnd: {}, congestion wnd: {}, inflight: {}",
             self.addr_pair,
             self.state,
-            remote_window,
-            window,
-            self.congestion.window()
+            self.state_data.remote_window,
+            self.congestion.window(),
+            self.send_buffer.size,
         );
 
-        while !self.send_buffer.pending.is_empty() && self.send_buffer.pacing > 0 && window > 0 {
+        while !self.send_buffer.pending.is_empty() && window > 0 {
             let front = self.send_buffer.pending.pop_front().unwrap();
 
             match front {
                 PendingData::Data(mut data) => {
-                    let len = data.len();
-                    if len <= window {
-                        trace!(
-                            "{}[{}]: send pending data size: {}",
-                            self.addr_pair,
-                            self.state,
-                            data.len()
-                        );
-                        self.send_data(data);
+                    let send_bytes = data.len().min(window);
+                    if let Some(t) =
+                        self.pacing
+                            .delay(send_bytes, now, self.rtt.get(), self.congestion.window())
+                    {
+                        delay = Some(t);
+                        self.send_buffer.pending.push_front(PendingData::Data(data));
+                        break;
+                    }
 
-                        window -= len;
-                    } else {
-                        let size = std::cmp::min(window, self.send_buffer.pacing);
-                        let tail = data.split_off(size);
-
-                        trace!(
-                            "{}[{}]: send pending data size: {}",
-                            self.addr_pair,
-                            self.state,
-                            data.len()
-                        );
-                        self.send_data(data);
-
-                        window -= size;
+                    if data.len() > send_bytes {
+                        let tail = data.split_off(send_bytes);
                         self.send_buffer.pending.push_front(PendingData::Data(tail));
                     }
+
+                    trace!(
+                        "{}[{}]: send pending data size: {}",
+                        self.addr_pair,
+                        self.state,
+                        send_bytes
+                    );
+                    self.send_data(data);
+                    window -= send_bytes;
                 }
                 PendingData::Fin => {
                     if self.send_buffer.buffer.is_empty() {
@@ -1210,6 +1319,8 @@ impl TcpStreamCore {
                 }
             }
         }
+
+        delay
     }
 
     fn send_fin(&mut self) {
@@ -1478,7 +1589,7 @@ impl TcpStreamCore {
                         self.addr_pair,
                         self.state,
                         self.rtt.latest().as_millis(),
-                        self.rtt.get().unwrap_or_default().as_millis(),
+                        self.rtt.get().as_millis(),
                         self.rtt.rto().as_millis(),
                     );
                 }
@@ -1518,9 +1629,6 @@ impl TcpStreamCore {
         if send_buffer_size != self.send_buffer.size {
             self.process_echo_timestamp(request);
         }
-
-        self.resend_sending_data();
-        self.send_pending_data();
     }
 
     fn process_payload(&mut self, request: &TcpPacket) {
