@@ -1,36 +1,107 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::fmt::Display;
 use std::future::Future;
-use std::net::{SocketAddr, SocketAddrV4};
+use std::net::SocketAddrV4;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::task::Waker;
 use std::time::{Duration, Instant};
 use std::usize;
 
 use bytes::Bytes;
 use log::{error, trace, warn};
-use pnet::packet::ethernet::{EtherTypes, EthernetPacket, MutableEthernetPacket};
+use pnet::packet::ethernet::{EtherTypes, MutableEthernetPacket};
 use pnet::packet::ip::IpNextHeaderProtocols;
-use pnet::packet::ipv4::{self, Ipv4Packet, MutableIpv4Packet};
+use pnet::packet::ipv4::{self, MutableIpv4Packet};
 use pnet::packet::tcp::{self, MutableTcpPacket, TcpFlags, TcpOption, TcpOptionNumbers, TcpPacket};
 use pnet::packet::{MutablePacket, Packet};
 use pnet::util::MacAddr;
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc::{
-    channel, unbounded_channel, Receiver, Sender, UnboundedReceiver, UnboundedSender,
-};
 use tokio::time::{sleep_until, Sleep};
 
+use crate::gateway::tcp::congestion::{Controller, FixBandwidth};
+use crate::gateway::tcp::pacing::Pacer;
+use crate::gateway::tcp::rtt::RttEstimator;
+use crate::gateway::tcp::{AddrPair, StreamCloser};
 use crate::gateway::GatewaySender;
 
 const MSL_2: Duration = Duration::from_millis(30000);
-const DEFAULT_RTO: Duration = Duration::from_millis(100);
+const DEFAULT_RTO: Duration = Duration::from_millis(50);
 const DEFAULT_RTT: Duration = Duration::from_millis(10);
 const GRANULARITY: Duration = Duration::from_millis(1);
 const MAX_TCP_HEADER_LEN: usize = 60;
 const LOCAL_WINDOW: u32 = 256 * 1024;
 const DEFAULT_MSS: usize = 1400;
+
+pub(super) fn is_syn_packet(request: &TcpPacket) -> bool {
+    request.get_flags() & TcpFlags::SYN != 0
+}
+
+pub(super) struct TcpStreamInner {
+    cb: Mutex<TcpStreamControlBlock>,
+}
+
+impl TcpStreamInner {
+    pub(super) fn new(
+        mac: MacAddr,
+        pair: AddrPair,
+        stream_closer: StreamCloser,
+        gw_sender: GatewaySender,
+    ) -> Self {
+        TcpStreamInner {
+            cb: Mutex::new(TcpStreamControlBlock::new(
+                mac,
+                pair,
+                stream_closer,
+                gw_sender,
+            )),
+        }
+    }
+
+    pub(super) fn local_addr(&self) -> SocketAddrV4 {
+        self.cb.lock().unwrap().addr_pair.0
+    }
+
+    pub(super) fn remote_addr(&self) -> SocketAddrV4 {
+        self.cb.lock().unwrap().addr_pair.1
+    }
+
+    pub(super) fn close(&self) {
+        self.cb.lock().unwrap().close();
+    }
+
+    pub(super) fn poll_read(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.cb.lock().unwrap().poll_read(cx, buf)
+    }
+
+    pub(super) fn poll_write(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        self.cb.lock().unwrap().poll_write(cx, buf)
+    }
+
+    pub(super) fn poll_shutdown(
+        &self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        self.cb.lock().unwrap().poll_shutdown(cx)
+    }
+
+    pub(super) fn poll_state(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        self.cb.lock().unwrap().poll_state(cx)
+    }
+
+    pub(super) fn handle_tcp_packet(&self, packet: Bytes) -> Option<()> {
+        let request = TcpPacket::new(&packet)?;
+        self.cb.lock().unwrap().handle_tcp_packet(&request);
+        Some(())
+    }
+}
 
 #[derive(PartialEq, Debug)]
 enum State {
@@ -49,15 +120,6 @@ enum State {
 impl Display for State {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Debug::fmt(self, f)
-    }
-}
-
-#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
-struct AddrPair(SocketAddrV4, SocketAddrV4);
-
-impl Display for AddrPair {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!("({}, {})", self.0, self.1))
     }
 }
 
@@ -85,51 +147,6 @@ impl StreamTime {
 
     fn update_alive(&mut self) {
         self.alive = Instant::now();
-    }
-}
-
-struct RttEstimator {
-    srtt: Option<Duration>,
-    latest: Duration,
-    var: Duration,
-    rto: Duration,
-}
-
-impl RttEstimator {
-    fn new() -> Self {
-        Self {
-            srtt: None,
-            latest: Duration::default(),
-            var: Duration::default(),
-            rto: DEFAULT_RTO,
-        }
-    }
-
-    fn get(&self) -> Duration {
-        self.srtt.unwrap_or(DEFAULT_RTT)
-    }
-
-    fn rto(&self) -> Duration {
-        self.rto.max(DEFAULT_RTO / 2)
-    }
-
-    fn latest(&self) -> Duration {
-        self.latest
-    }
-
-    fn update(&mut self, rtt: Duration) {
-        self.latest = rtt;
-        // According to RFC6298.
-        if let Some(srtt) = self.srtt {
-            let var = if rtt > srtt { rtt - srtt } else { srtt - rtt };
-            self.var = (3 * self.var + var) / 4;
-            self.srtt = Some((7 * srtt + rtt) / 8);
-        } else {
-            self.srtt = Some(rtt);
-            self.var = rtt / 2;
-        }
-
-        self.rto = self.srtt.unwrap() + GRANULARITY.max(4 * self.var);
     }
 }
 
@@ -170,7 +187,11 @@ impl SendingData {
     }
 
     fn timeout(&self, rto: Duration) -> Instant {
-        self.sent + rto
+        self.sent + self.adjust_rto(rto)
+    }
+
+    fn adjust_rto(&self, rto: Duration) -> Duration {
+        rto.max(DEFAULT_RTO)
     }
 }
 
@@ -222,243 +243,16 @@ impl StateData {
     }
 }
 
-trait CController: Send {
-    fn window(&self) -> usize;
-    fn on_ack(&mut self, now: Instant, sent: Instant, bytes: usize, rtt: &RttEstimator);
-    fn on_congestion(&mut self, now: Instant, sent: Instant, persistent: bool);
-}
-
-const BETA_CUBIC: f64 = 0.7;
-const C: f64 = 0.4;
-
-#[derive(Default)]
-struct CubicState {
-    k: f64,
-    w_max: f64,
-    cwnd_inc: usize,
-}
-
-impl CubicState {
-    fn cubic_k(&self, max_datagram_size: usize) -> f64 {
-        let w_max = self.w_max / max_datagram_size as f64;
-        (w_max * (1.0 - BETA_CUBIC) / C).cbrt()
-    }
-
-    fn w_cubic(&self, t: Duration, max_datagram_size: usize) -> f64 {
-        let w_max = self.w_max / max_datagram_size as f64;
-        (C * (t.as_secs_f64() - self.k).powi(3) + w_max) * max_datagram_size as f64
-    }
-
-    fn w_est(&self, t: Duration, rtt: Duration, max_datagram_size: usize) -> f64 {
-        let w_max = self.w_max / max_datagram_size as f64;
-        (w_max * BETA_CUBIC
-            + 3.0 * (1.0 - BETA_CUBIC) / (1.0 + BETA_CUBIC) * t.as_secs_f64() / rtt.as_secs_f64())
-            * max_datagram_size as f64
-    }
-}
-
-#[allow(unused)]
-struct Cubic {
-    mtu: usize,
-    window: usize,
-    ssthresh: usize,
-    state: CubicState,
-    recovery_start_time: Option<Instant>,
-}
-
-#[allow(unused)]
-impl Cubic {
-    fn new() -> Box<Self> {
-        Box::new(Self {
-            mtu: DEFAULT_MSS,
-            window: 200 * DEFAULT_MSS,
-            ssthresh: usize::MAX,
-            state: CubicState::default(),
-            recovery_start_time: None,
-        })
-    }
-
-    fn minimum_window(&self) -> usize {
-        200 * self.mtu
-    }
-}
-
-#[allow(unused)]
-impl CController for Cubic {
-    fn window(&self) -> usize {
-        self.window
-    }
-
-    fn on_ack(&mut self, now: Instant, sent: Instant, bytes: usize, rtt: &RttEstimator) {
-        if self.recovery_start_time.map(|t| sent <= t).unwrap_or(false) {
-            return;
-        }
-
-        if self.window < self.ssthresh {
-            self.window += bytes;
-        } else {
-            let start_time = match self.recovery_start_time {
-                Some(t) => t,
-                None => {
-                    self.recovery_start_time = Some(now);
-                    self.state.w_max = self.window as f64;
-                    self.state.k = 0.0;
-                    now
-                }
-            };
-
-            let t = now - start_time;
-            let rtt = rtt.get();
-            let w_cubic = self.state.w_cubic(t + rtt, self.mtu);
-            let w_est = self.state.w_est(t, rtt, self.mtu);
-
-            let mut cubic_cwnd = self.window;
-            if w_cubic < w_est {
-                cubic_cwnd = std::cmp::max(cubic_cwnd, w_est as usize);
-            } else if cubic_cwnd < w_cubic as usize {
-                let cubic_inc = (w_cubic - cubic_cwnd as f64) / cubic_cwnd as f64 * self.mtu as f64;
-                cubic_cwnd += cubic_inc as usize;
-            }
-
-            self.state.cwnd_inc += cubic_cwnd - self.window;
-            if self.state.cwnd_inc >= self.mtu {
-                self.window += self.mtu;
-                self.state.cwnd_inc = 0;
-            }
-        }
-    }
-
-    fn on_congestion(&mut self, now: Instant, sent: Instant, persistent: bool) {
-        if self.recovery_start_time.map(|t| sent <= t).unwrap_or(false) {
-            return;
-        }
-
-        self.recovery_start_time = Some(now);
-
-        if (self.window as f64) < self.state.w_max {
-            self.state.w_max = self.window as f64 * (1.0 + BETA_CUBIC) / 2.0;
-        } else {
-            self.state.w_max = self.window as f64;
-        }
-
-        self.ssthresh = std::cmp::max(
-            (self.state.w_max * BETA_CUBIC) as usize,
-            self.minimum_window(),
-        );
-
-        self.window = self.ssthresh;
-        self.state.k = self.state.cubic_k(self.mtu);
-        self.state.cwnd_inc = (self.state.cwnd_inc as f64 * BETA_CUBIC) as usize;
-
-        if persistent {
-            self.recovery_start_time = None;
-            self.state.w_max = self.window as f64;
-            self.ssthresh = std::cmp::max(
-                (self.window as f64 * BETA_CUBIC) as usize,
-                self.minimum_window(),
-            );
-
-            self.state.cwnd_inc = 0;
-            self.window = self.minimum_window();
-        }
-    }
-}
-
-struct FixBandwidth;
-
-impl FixBandwidth {
-    fn new() -> Box<Self> {
-        Box::new(Self {})
-    }
-}
-
-#[allow(unused)]
-impl CController for FixBandwidth {
-    fn window(&self) -> usize {
-        128000
-    }
-
-    fn on_ack(&mut self, now: Instant, sent: Instant, bytes: usize, rtt: &RttEstimator) {}
-
-    fn on_congestion(&mut self, now: Instant, sent: Instant, persistent: bool) {}
-}
-
-struct Pacer {
-    granu: usize,
-    bytes: usize,
-    window: usize,
-    srtt: Duration,
-    prev: Instant,
-}
-
-impl Pacer {
-    fn new(srtt: Duration, window: usize) -> Self {
-        let granu = Self::granularity(srtt, window);
-        Self {
-            granu,
-            bytes: granu,
-            window,
-            srtt,
-            prev: Instant::now(),
-        }
-    }
-
-    fn granularity(srtt: Duration, window: usize) -> usize {
-        let srtt = srtt.as_secs_f64();
-        let unit = GRANULARITY.as_secs_f64();
-        ((unit * window as f64) / srtt) as usize
-    }
-
-    fn consume(&mut self, bytes: usize) {
-        self.bytes = self.bytes.saturating_sub(bytes);
-    }
-
-    fn delay(
-        &mut self,
-        send_bytes: usize,
-        now: Instant,
-        srtt: Duration,
-        window: usize,
-    ) -> Option<Instant> {
-        if self.window != window {
-            self.granu = Self::granularity(srtt, window);
-            self.bytes = self.granu.min(self.bytes);
-            self.srtt = srtt;
-            self.window = window;
-        }
-
-        if self.bytes >= send_bytes {
-            return None;
-        }
-
-        let inc_rtts = (now - self.prev).as_secs_f64() / self.srtt.as_secs_f64();
-        let inc_bytes = (inc_rtts * window as f64) as usize;
-        self.bytes = self
-            .bytes
-            .saturating_add(inc_bytes as usize)
-            .min(self.granu);
-        self.prev = now;
-
-        if self.bytes >= send_bytes {
-            return None;
-        }
-
-        let diff = (send_bytes.max(self.granu) - self.bytes) as f64;
-        let duration = diff * self.srtt.as_secs_f64() / self.window as f64;
-        let delay = Duration::from_secs_f64(duration);
-        Some(now + delay)
-    }
-}
-
 enum TimerType {
     Rto = 0,
     Pacing = 1,
     TimeWait = 2,
+    Count,
 }
 
 #[derive(Default)]
 struct TimerTable {
-    table: [Option<Instant>; 3],
+    table: [Option<Instant>; TimerType::Count as usize],
 }
 
 impl TimerTable {
@@ -475,283 +269,10 @@ impl TimerTable {
     }
 }
 
-pub(super) fn new_tcp(
-    channel: UnboundedReceiver<Bytes>,
-    gw_sender: GatewaySender,
-) -> (TcpHandler, TcpListener) {
-    let (new_stream, streams) = unbounded_channel();
-    let (close_stream, close_streams) = unbounded_channel();
-    let handler = TcpHandler {
-        channel,
-        gw_sender,
-        new_stream,
-        close_stream,
-        close_streams,
-        streams: HashMap::new(),
-    };
-    let listener = TcpListener { streams };
-    (handler, listener)
-}
-
-pub struct TcpHandler {
-    channel: UnboundedReceiver<Bytes>,
-    gw_sender: GatewaySender,
-    new_stream: UnboundedSender<TcpStream>,
-    close_stream: UnboundedSender<AddrPair>,
-    close_streams: UnboundedReceiver<AddrPair>,
-    streams: HashMap<AddrPair, Sender<Bytes>>,
-}
-
-impl TcpHandler {
-    pub fn start(mut self) {
-        tokio::spawn(async move {
-            self.handle_loop().await;
-        });
-    }
-
-    async fn handle_loop(&mut self) -> Option<()> {
-        loop {
-            tokio::select! {
-                Some(addr_pair) = self.close_streams.recv() => {
-                    self.remove_stream(addr_pair);
-                }
-                Some(packet) = self.channel.recv() => {
-                    self.handle_packet(packet);
-                }
-            }
-        }
-    }
-
-    fn remove_stream(&mut self, addr_pair: AddrPair) {
-        self.streams.remove(&addr_pair);
-    }
-
-    fn handle_packet(&mut self, packet: Bytes) -> Option<()> {
-        let ethernet_packet = EthernetPacket::new(&packet)?;
-        let ipv4_packet = Ipv4Packet::new(ethernet_packet.payload())?;
-        let tcp_request = TcpPacket::new(ipv4_packet.payload())?;
-        let mac = ethernet_packet.get_source();
-        let src = SocketAddrV4::new(ipv4_packet.get_source(), tcp_request.get_source());
-        let dst = SocketAddrV4::new(ipv4_packet.get_destination(), tcp_request.get_destination());
-        let pair = AddrPair(src, dst);
-        let data = packet.slice_ref(ipv4_packet.payload());
-
-        match self.streams.get(&pair) {
-            Some(sender) => sender.try_send(data).ok()?,
-            None => {
-                if TcpStreamCore::is_syn_packet(&tcp_request) {
-                    let (packets_tx, packets_rx) = channel(32);
-                    let inner = Arc::new(TcpStreamInner {
-                        core: Mutex::new(TcpStreamCore::new(
-                            self.close_stream.clone(),
-                            mac,
-                            pair,
-                            self.gw_sender.clone(),
-                        )),
-                    });
-                    let driver = TcpStreamDriver {
-                        packets: packets_rx,
-                        inner: inner.clone(),
-                    };
-                    let stream = TcpStream { inner };
-
-                    packets_tx.try_send(data).ok()?;
-                    self.streams.insert(pair, packets_tx);
-                    self.new_stream.send(stream).ok()?;
-                    driver.start();
-                }
-            }
-        }
-
-        Some(())
-    }
-}
-
-pub struct TcpListener {
-    streams: UnboundedReceiver<TcpStream>,
-}
-
-impl TcpListener {
-    pub async fn accept(&mut self) -> std::io::Result<TcpStream> {
-        self.streams.recv().await.ok_or(std::io::Error::new(
-            std::io::ErrorKind::BrokenPipe,
-            "TCP handler broken",
-        ))
-    }
-}
-
-pub struct TcpStream {
-    inner: Arc<TcpStreamInner>,
-}
-
-impl Drop for TcpStream {
-    fn drop(&mut self) {
-        self.inner.close();
-    }
-}
-
-impl TcpStream {
-    pub fn local_addr(&self) -> SocketAddr {
-        SocketAddr::V4(self.inner.local_addr())
-    }
-
-    pub fn remote_addr(&self) -> SocketAddr {
-        SocketAddr::V4(self.inner.remote_addr())
-    }
-
-    pub fn split<'a>(&'a mut self) -> (ReadHalf<'a>, WriteHalf<'a>) {
-        (ReadHalf(&*self), WriteHalf(&*self))
-    }
-
-    fn poll_read(
-        &self,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        self.inner.poll_read(cx, buf)
-    }
-
-    fn poll_write(
-        &self,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<Result<usize, std::io::Error>> {
-        self.inner.poll_write(cx, buf)
-    }
-
-    fn poll_shutdown(
-        &self,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), std::io::Error>> {
-        self.inner.poll_shutdown(cx)
-    }
-}
-
-pub struct ReadHalf<'a>(&'a TcpStream);
-
-pub struct WriteHalf<'a>(&'a TcpStream);
-
-impl AsyncRead for ReadHalf<'_> {
-    fn poll_read(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        self.0.poll_read(cx, buf)
-    }
-}
-
-impl AsyncWrite for WriteHalf<'_> {
-    fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<Result<usize, std::io::Error>> {
-        self.0.poll_write(cx, buf)
-    }
-
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), std::io::Error>> {
-        std::task::Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), std::io::Error>> {
-        self.0.poll_shutdown(cx)
-    }
-}
-
-struct TcpStreamDriver {
-    packets: Receiver<Bytes>,
-    inner: Arc<TcpStreamInner>,
-}
-
-impl TcpStreamDriver {
-    fn start(self) {
-        tokio::spawn(async move {
-            self.await;
-        });
-    }
-}
-
-impl Future for TcpStreamDriver {
-    type Output = ();
-
-    fn poll(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        loop {
-            match self.packets.poll_recv(cx) {
-                std::task::Poll::Ready(Some(packet)) => {
-                    self.inner.handle_tcp_packet(packet);
-                }
-                std::task::Poll::Ready(None) => return std::task::Poll::Ready(()),
-                std::task::Poll::Pending => return self.inner.poll_state(cx),
-            }
-        }
-    }
-}
-
-struct TcpStreamInner {
-    core: Mutex<TcpStreamCore>,
-}
-
-impl TcpStreamInner {
-    fn local_addr(&self) -> SocketAddrV4 {
-        self.core.lock().unwrap().addr_pair.0
-    }
-
-    fn remote_addr(&self) -> SocketAddrV4 {
-        self.core.lock().unwrap().addr_pair.1
-    }
-
-    fn close(&self) {
-        self.core.lock().unwrap().close();
-    }
-
-    fn poll_read(
-        &self,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        self.core.lock().unwrap().poll_read(cx, buf)
-    }
-
-    fn poll_write(
-        &self,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<Result<usize, std::io::Error>> {
-        self.core.lock().unwrap().poll_write(cx, buf)
-    }
-
-    fn poll_shutdown(
-        &self,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), std::io::Error>> {
-        self.core.lock().unwrap().poll_shutdown(cx)
-    }
-
-    fn poll_state(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
-        self.core.lock().unwrap().poll_state(cx)
-    }
-
-    fn handle_tcp_packet(&self, packet: Bytes) -> Option<()> {
-        let request = TcpPacket::new(&packet)?;
-        self.core.lock().unwrap().handle_tcp_packet(&request);
-        Some(())
-    }
-}
-
-struct TcpStreamCore {
-    close_stream: UnboundedSender<AddrPair>,
+struct TcpStreamControlBlock {
     src_mac: MacAddr,
     addr_pair: AddrPair,
+    closer: StreamCloser,
     gw_sender: GatewaySender,
     timer: Pin<Box<Sleep>>,
     timers: TimerTable,
@@ -763,35 +284,36 @@ struct TcpStreamCore {
     state_data: StateData,
     recv_buffer: RecvBuffer,
     send_buffer: SendBuffer,
-    congestion: Box<dyn CController>,
+    congestion: Box<dyn Controller>,
     read_waker: Option<Waker>,
     write_waker: Option<Waker>,
     driver_waker: Option<Waker>,
 }
 
-impl TcpStreamCore {
+impl TcpStreamControlBlock {
     fn new(
-        close_stream: UnboundedSender<AddrPair>,
         src_mac: MacAddr,
         addr_pair: AddrPair,
+        closer: StreamCloser,
         gw_sender: GatewaySender,
     ) -> Self {
         let deadline = Instant::now();
         let congestion = FixBandwidth::new();
-        let srtt = DEFAULT_RTT;
+        let pacing = Pacer::new(DEFAULT_RTT, congestion.window(), GRANULARITY);
+        let rtt = RttEstimator::new(DEFAULT_RTT, DEFAULT_RTO, GRANULARITY);
 
         Self {
-            close_stream,
             src_mac,
             addr_pair,
+            closer,
             gw_sender,
             timer: Box::pin(sleep_until(deadline.into())),
             timers: TimerTable::default(),
             shutdown: false,
             state: State::Listen,
-            pacing: Pacer::new(srtt, congestion.window()),
+            pacing: pacing,
             time: StreamTime::new(),
-            rtt: RttEstimator::new(),
+            rtt: rtt,
             state_data: StateData::new(),
             recv_buffer: RecvBuffer::new(),
             send_buffer: SendBuffer::new(),
@@ -800,10 +322,6 @@ impl TcpStreamCore {
             write_waker: None,
             driver_waker: None,
         }
-    }
-
-    fn is_syn_packet(request: &TcpPacket) -> bool {
-        request.get_flags() & TcpFlags::SYN != 0
     }
 
     fn handle_tcp_packet(&mut self, request: &TcpPacket) {
@@ -834,7 +352,7 @@ impl TcpStreamCore {
 
     fn poll_state(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
         if self.is_closed() {
-            self.close_stream.send(self.addr_pair).ok();
+            self.closer.close(self.addr_pair);
             return std::task::Poll::Ready(());
         }
 
@@ -845,7 +363,7 @@ impl TcpStreamCore {
                 self.state
             );
             self.state = State::Closed;
-            self.close_stream.send(self.addr_pair).ok();
+            self.closer.close(self.addr_pair);
             return std::task::Poll::Ready(());
         }
 
@@ -1225,11 +743,12 @@ impl TcpStreamCore {
             }
 
             trace!(
-                "{}[{}]: resend data at seq: {}, len: {}, rto: {}",
+                "{}[{}]: resend data at seq: {}, len: {}, rto: {}({})ms",
                 self.addr_pair,
                 self.state,
                 sending_data.seq,
                 sending_data.data.len(),
+                sending_data.adjust_rto(self.rtt.rto()).as_millis(),
                 self.rtt.rto().as_millis()
             );
 
