@@ -3,68 +3,71 @@ use std::time::{Duration, Instant};
 pub(super) struct Pacer {
     granularity: Duration,
     granu_bytes: usize,
-    bytes: usize,
+    token_bytes: usize,
     window: usize,
     srtt: Duration,
-    prev: Instant,
+    last: Instant,
 }
 
 impl Pacer {
     pub(super) fn new(srtt: Duration, window: usize, granularity: Duration) -> Self {
-        let granu_bytes = Self::granularity_bytes(srtt, window, granularity);
-        Self {
+        let mut pacer = Self {
             granularity,
-            granu_bytes,
-            bytes: granu_bytes,
+            granu_bytes: 0,
+            token_bytes: 0,
             window,
             srtt,
-            prev: Instant::now(),
-        }
+            last: Instant::now(),
+        };
+        pacer.update_granularity(srtt, window);
+        pacer.token_bytes = pacer.granu_bytes;
+        pacer
     }
 
-    fn granularity_bytes(srtt: Duration, window: usize, granularity: Duration) -> usize {
-        let srtt = srtt.as_secs_f64();
-        let unit = granularity.as_secs_f64();
-        ((unit * window as f64) / srtt) as usize
+    pub(super) fn on_sent(&mut self, bytes: usize) {
+        self.token_bytes = self.token_bytes.saturating_sub(bytes);
     }
 
-    pub(super) fn consume(&mut self, bytes: usize) {
-        self.bytes = self.bytes.saturating_sub(bytes);
-    }
-
-    pub(super) fn delay(
+    pub(super) fn wait_until(
         &mut self,
         send_bytes: usize,
         now: Instant,
         srtt: Duration,
         window: usize,
     ) -> Option<Instant> {
-        if self.window != window {
-            self.granu_bytes = Self::granularity_bytes(srtt, window, self.granularity);
-            self.bytes = self.granu_bytes.min(self.bytes);
+        if self.window != window || self.srtt != srtt {
+            self.update_granularity(srtt, window);
             self.srtt = srtt;
             self.window = window;
+            self.token_bytes = self.granu_bytes.min(self.token_bytes);
         }
 
-        if self.bytes >= send_bytes {
+        if self.token_bytes >= send_bytes {
             return None;
         }
 
-        let inc_rtts = (now - self.prev).as_secs_f64() / self.srtt.as_secs_f64();
+        let inc_rtts = (now - self.last).as_secs_f64() / self.srtt.as_secs_f64();
         let inc_bytes = (inc_rtts * window as f64) as usize;
-        self.bytes = self
-            .bytes
+
+        self.token_bytes = self
+            .token_bytes
             .saturating_add(inc_bytes as usize)
             .min(self.granu_bytes);
-        self.prev = now;
+        self.last = now;
 
-        if self.bytes >= send_bytes {
+        if self.token_bytes >= send_bytes {
             return None;
         }
 
-        let diff = (send_bytes.max(self.granu_bytes) - self.bytes) as f64;
+        let diff = (send_bytes - self.token_bytes).max(self.granu_bytes) as f64;
         let duration = diff * self.srtt.as_secs_f64() / self.window as f64;
         let delay = Duration::from_secs_f64(duration);
         Some(now + delay)
+    }
+
+    fn update_granularity(&mut self, srtt: Duration, window: usize) {
+        let srtt = srtt.as_secs_f64();
+        let unit = self.granularity.as_secs_f64();
+        self.granu_bytes = ((unit * window as f64) / srtt) as usize;
     }
 }

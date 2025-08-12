@@ -8,7 +8,7 @@ use std::task::Waker;
 use std::time::{Duration, Instant};
 use std::usize;
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use log::{error, trace, warn};
 use pnet::packet::ethernet::{EtherTypes, MutableEthernetPacket};
 use pnet::packet::ip::IpNextHeaderProtocols;
@@ -28,9 +28,10 @@ const MSL_2: Duration = Duration::from_millis(30000);
 const DEFAULT_RTO: Duration = Duration::from_millis(50);
 const DEFAULT_RTT: Duration = Duration::from_millis(10);
 const GRANULARITY: Duration = Duration::from_millis(1);
-const MAX_TCP_HEADER_LEN: usize = 60;
 const LOCAL_WINDOW: u32 = 256 * 1024;
 const DEFAULT_MSS: usize = 1400;
+const MAX_TCP_HEADER_LEN: usize = 60;
+const MAX_SEND_BUFFER: usize = 128 * 1024;
 
 pub(super) fn is_syn_packet(request: &TcpPacket) -> bool {
     request.get_flags() & TcpFlags::SYN != 0
@@ -174,11 +175,11 @@ impl RecvBuffer {
 struct SendingData {
     sent: Instant,
     seq: u32,
-    data: Vec<u8>,
+    data: Bytes,
 }
 
 impl SendingData {
-    fn new(seq: u32, data: Vec<u8>) -> Self {
+    fn new(seq: u32, data: Bytes) -> Self {
         Self {
             sent: Instant::now(),
             seq,
@@ -196,23 +197,29 @@ impl SendingData {
 }
 
 enum PendingData {
-    Data(Vec<u8>),
+    Data(Bytes),
     Fin,
 }
 
 struct SendBuffer {
-    size: usize,
-    buffer: VecDeque<SendingData>,
+    inflight: usize,
+    pending_size: usize,
+    sending: VecDeque<SendingData>,
     pending: VecDeque<PendingData>,
 }
 
 impl SendBuffer {
     fn new() -> Self {
         Self {
-            size: 0,
-            buffer: VecDeque::new(),
+            inflight: 0,
+            pending_size: 0,
+            sending: VecDeque::new(),
             pending: VecDeque::new(),
         }
+    }
+
+    fn is_full(&self) -> bool {
+        self.inflight + self.pending_size >= MAX_SEND_BUFFER
     }
 }
 
@@ -432,7 +439,7 @@ impl TcpStreamControlBlock {
             )));
         }
 
-        if self.state == State::SynRcvd || !self.send_buffer.pending.is_empty() {
+        if self.state == State::SynRcvd || self.send_buffer.is_full() {
             self.write_waker = Some(cx.waker().clone());
             return std::task::Poll::Pending;
         }
@@ -440,7 +447,8 @@ impl TcpStreamControlBlock {
         let size = buf.len();
         self.send_buffer
             .pending
-            .push_back(PendingData::Data(buf.into()));
+            .push_back(PendingData::Data(Bytes::copy_from_slice(buf)));
+        self.send_buffer.pending_size += size;
         self.driver_waker.as_ref().map(|waker| waker.wake_by_ref());
         std::task::Poll::Ready(Ok(size))
     }
@@ -459,7 +467,7 @@ impl TcpStreamControlBlock {
             )));
         }
 
-        if self.send_buffer.buffer.is_empty() && self.send_buffer.pending.is_empty() {
+        if self.send_buffer.sending.is_empty() && self.send_buffer.pending.is_empty() {
             self.send_fin();
             std::task::Poll::Ready(Ok(()))
         } else {
@@ -501,18 +509,18 @@ impl TcpStreamControlBlock {
     }
 
     fn send_packets(&mut self) {
-        if let Some(delay) = self.resend_sending_data() {
-            self.timers.set(TimerType::Pacing, delay);
-        } else if let Some(delay) = self.send_pending_data() {
-            self.timers.set(TimerType::Pacing, delay);
+        if let Some(until_time) = self.resend_sending_data() {
+            self.timers.set(TimerType::Pacing, until_time);
+        } else if let Some(until_time) = self.send_pending_data() {
+            self.timers.set(TimerType::Pacing, until_time);
         } else {
             self.timers.stop(TimerType::Pacing);
         }
 
-        if self.send_buffer.buffer.is_empty() {
+        if self.send_buffer.sending.is_empty() {
             self.timers.stop(TimerType::Rto);
         } else {
-            let front = self.send_buffer.buffer.front().unwrap();
+            let front = self.send_buffer.sending.front().unwrap();
             self.timers
                 .set(TimerType::Rto, front.timeout(self.rtt.rto()));
         }
@@ -710,25 +718,25 @@ impl TcpStreamControlBlock {
         }
     }
 
-    fn send_data(&mut self, data: Vec<u8>) {
+    fn send_data(&mut self, data: Bytes) {
         let sending_data = SendingData::new(self.state_data.seq, data);
         let bytes = sending_data.data.len();
 
         self.state_data.seq += bytes as u32;
-        self.send_buffer.size += bytes;
-        self.pacing.consume(bytes);
+        self.send_buffer.inflight += bytes;
+        self.pacing.on_sent(bytes);
 
         self.send_tcp_data_packet(&sending_data);
-        self.send_buffer.buffer.push_back(sending_data);
+        self.send_buffer.sending.push_back(sending_data);
     }
 
     fn resend_sending_data(&mut self) -> Option<Instant> {
         let now = Instant::now();
-        let mut delay = None;
+        let mut until_time = None;
         let mut latest_loss_sent = None;
 
-        for index in 0..self.send_buffer.buffer.len() {
-            let sending_data = &self.send_buffer.buffer[index];
+        for index in 0..self.send_buffer.sending.len() {
+            let sending_data = &self.send_buffer.sending[index];
             if now < sending_data.timeout(self.rtt.rto()) {
                 break;
             }
@@ -736,9 +744,9 @@ impl TcpStreamControlBlock {
             let send_bytes = sending_data.data.len();
             if let Some(t) =
                 self.pacing
-                    .delay(send_bytes, now, self.rtt.get(), self.congestion.window())
+                    .wait_until(send_bytes, now, self.rtt.get(), self.congestion.window())
             {
-                delay = Some(t);
+                until_time = Some(t);
                 break;
             }
 
@@ -760,25 +768,25 @@ impl TcpStreamControlBlock {
                 latest_loss_sent = Some(sending_data.sent);
             }
 
-            self.pacing.consume(send_bytes);
+            self.pacing.on_sent(send_bytes);
             self.send_tcp_data_packet(sending_data);
-            self.send_buffer.buffer[index].sent = now;
+            self.send_buffer.sending[index].sent = now;
         }
 
         if let Some(sent) = latest_loss_sent {
             self.congestion.on_congestion(now, sent, false);
         }
 
-        delay
+        until_time
     }
 
     fn send_pending_data(&mut self) -> Option<Instant> {
         let now = Instant::now();
-        let mut delay = None;
+        let mut until_time = None;
         let mut window = self
             .congestion
             .window()
-            .saturating_sub(self.send_buffer.size);
+            .saturating_sub(self.send_buffer.inflight);
 
         trace!(
             "{}[{}]: remote wnd: {}, congestion wnd: {}, inflight: {}",
@@ -786,7 +794,7 @@ impl TcpStreamControlBlock {
             self.state,
             self.state_data.remote_window,
             self.congestion.window(),
-            self.send_buffer.size,
+            self.send_buffer.inflight,
         );
 
         while !self.send_buffer.pending.is_empty() && window > 0 {
@@ -795,11 +803,13 @@ impl TcpStreamControlBlock {
             match front {
                 PendingData::Data(mut data) => {
                     let send_bytes = data.len().min(window);
-                    if let Some(t) =
-                        self.pacing
-                            .delay(send_bytes, now, self.rtt.get(), self.congestion.window())
-                    {
-                        delay = Some(t);
+                    if let Some(t) = self.pacing.wait_until(
+                        send_bytes,
+                        now,
+                        self.rtt.get(),
+                        self.congestion.window(),
+                    ) {
+                        until_time = Some(t);
                         self.send_buffer.pending.push_front(PendingData::Data(data));
                         break;
                     }
@@ -809,17 +819,20 @@ impl TcpStreamControlBlock {
                         self.send_buffer.pending.push_front(PendingData::Data(tail));
                     }
 
+                    self.send_data(data);
+                    self.send_buffer.pending_size -= send_bytes;
+                    window -= send_bytes;
+
                     trace!(
-                        "{}[{}]: send pending data size: {}",
+                        "{}[{}]: send pending data: {}, inflight: {}",
                         self.addr_pair,
                         self.state,
-                        send_bytes
+                        send_bytes,
+                        self.send_buffer.inflight
                     );
-                    self.send_data(data);
-                    window -= send_bytes;
                 }
                 PendingData::Fin => {
-                    if self.send_buffer.buffer.is_empty() {
+                    if self.send_buffer.sending.is_empty() {
                         if let Some(waker) = self.write_waker.take() {
                             waker.wake();
                         }
@@ -832,14 +845,14 @@ impl TcpStreamControlBlock {
         }
 
         if self.state == State::Estab || self.state == State::CloseWait {
-            if self.send_buffer.pending.is_empty() {
+            if !self.send_buffer.is_full() {
                 if let Some(waker) = self.write_waker.take() {
                     waker.wake();
                 }
             }
         }
 
-        delay
+        until_time
     }
 
     fn send_fin(&mut self) {
@@ -1119,11 +1132,11 @@ impl TcpStreamControlBlock {
     fn process_acknowledgement(&mut self, request: &TcpPacket) {
         let now = Instant::now();
         let ack = request.get_acknowledgement();
-        let send_buffer_size = self.send_buffer.size;
+        let inflight = self.send_buffer.inflight;
         trace!("{}[{}]: process ack: {}", self.addr_pair, self.state, ack);
 
-        while !self.send_buffer.buffer.is_empty() {
-            let front = self.send_buffer.buffer.front_mut().unwrap();
+        while !self.send_buffer.sending.is_empty() {
+            let front = self.send_buffer.sending.front_mut().unwrap();
             let begin_seq = front.seq;
             let end_seq = begin_seq + front.data.len() as u32;
 
@@ -1134,18 +1147,18 @@ impl TcpStreamControlBlock {
             if ((end_seq - ack) as i32) <= 0 {
                 let bytes = front.data.len();
                 self.congestion.on_ack(now, front.sent, bytes, &self.rtt);
-                self.send_buffer.buffer.pop_front();
-                self.send_buffer.size -= bytes;
+                self.send_buffer.sending.pop_front();
+                self.send_buffer.inflight -= bytes;
             } else {
                 let bytes = (ack - begin_seq) as usize;
                 self.congestion.on_ack(now, front.sent, bytes, &self.rtt);
                 front.seq = ack;
-                front.data.drain(0..bytes);
-                self.send_buffer.size -= bytes;
+                front.data.advance(bytes);
+                self.send_buffer.inflight -= bytes;
             }
         }
 
-        if send_buffer_size != self.send_buffer.size {
+        if inflight != self.send_buffer.inflight {
             self.process_echo_timestamp(request);
         }
     }
