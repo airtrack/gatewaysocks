@@ -9,7 +9,6 @@ use gatewaysocks::gateway::new_gateway;
 use gatewaysocks::{gateway, socks5};
 use getopts::Options;
 use log::info;
-use simple_logger::SimpleLogger;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::runtime::Runtime;
@@ -179,12 +178,10 @@ fn main() {
         .opt_str("subnet-mask")
         .unwrap_or("255.255.255.0".to_string());
 
-    SimpleLogger::new()
-        .without_timestamps()
-        .with_level(log::LevelFilter::Info)
-        .env()
-        .init()
-        .unwrap();
+    env_logger::builder()
+        .filter_level(log::LevelFilter::Info)
+        .parse_default_env()
+        .init();
 
     let socks5 = socks5_addr.parse::<SocketAddr>().unwrap();
     let gateway = gateway_addr.parse::<Ipv4Addr>().unwrap();
