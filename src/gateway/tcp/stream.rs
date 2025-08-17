@@ -218,8 +218,28 @@ impl SendBuffer {
         }
     }
 
+    fn is_empty(&self) -> bool {
+        self.sending.is_empty() && self.pending.is_empty()
+    }
+
     fn is_full(&self) -> bool {
         self.inflight + self.pending_size >= MAX_SEND_BUFFER
+    }
+
+    fn push_pending(&mut self, mut data: Bytes, mss: usize) -> usize {
+        let total_size = data.len();
+        while data.len() > mss {
+            let segment = data.split_to(mss);
+            self.pending.push_back(PendingData::Data(segment));
+        }
+
+        self.pending.push_back(PendingData::Data(data));
+        self.pending_size += total_size;
+        total_size
+    }
+
+    fn push_pending_fin(&mut self) {
+        self.pending.push_back(PendingData::Fin);
     }
 }
 
@@ -444,11 +464,10 @@ impl TcpStreamControlBlock {
             return std::task::Poll::Pending;
         }
 
-        let size = buf.len();
-        self.send_buffer
-            .pending
-            .push_back(PendingData::Data(Bytes::copy_from_slice(buf)));
-        self.send_buffer.pending_size += size;
+        let size = self.send_buffer.push_pending(
+            Bytes::copy_from_slice(buf),
+            self.state_data.mss as usize - MAX_TCP_HEADER_LEN,
+        );
         self.driver_waker.as_ref().map(|waker| waker.wake_by_ref());
         std::task::Poll::Ready(Ok(size))
     }
@@ -467,13 +486,13 @@ impl TcpStreamControlBlock {
             )));
         }
 
-        if self.send_buffer.sending.is_empty() && self.send_buffer.pending.is_empty() {
+        if self.send_buffer.is_empty() {
             self.send_fin();
             std::task::Poll::Ready(Ok(()))
         } else {
             if !self.shutdown {
                 self.shutdown = true;
-                self.send_buffer.pending.push_back(PendingData::Fin);
+                self.send_buffer.push_pending_fin();
             }
             self.write_waker = Some(cx.waker().clone());
             std::task::Poll::Pending
@@ -832,12 +851,12 @@ impl TcpStreamControlBlock {
                     );
                 }
                 PendingData::Fin => {
-                    if self.send_buffer.sending.is_empty() {
+                    if self.send_buffer.is_empty() {
                         if let Some(waker) = self.write_waker.take() {
                             waker.wake();
                         }
                     } else {
-                        self.send_buffer.pending.push_front(PendingData::Fin);
+                        self.send_buffer.push_pending_fin();
                     }
                     break;
                 }
