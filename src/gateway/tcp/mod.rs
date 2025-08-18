@@ -20,6 +20,7 @@ use crate::gateway::GatewaySender;
 
 mod congestion;
 mod pacing;
+mod recv_buffer;
 mod rtt;
 mod stream;
 

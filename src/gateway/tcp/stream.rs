@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use std::usize;
 
 use bytes::{Buf, Bytes};
-use log::{error, trace, warn};
+use log::{error, trace};
 use pnet::packet::ethernet::{EtherTypes, MutableEthernetPacket};
 use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::packet::ipv4::{self, MutableIpv4Packet};
@@ -20,6 +20,7 @@ use tokio::time::{sleep_until, Sleep};
 
 use crate::gateway::tcp::congestion::{Controller, FixBandwidth};
 use crate::gateway::tcp::pacing::Pacer;
+use crate::gateway::tcp::recv_buffer::RecvBuffer;
 use crate::gateway::tcp::rtt::RttEstimator;
 use crate::gateway::tcp::{AddrPair, StreamCloser};
 use crate::gateway::GatewaySender;
@@ -148,27 +149,6 @@ impl StreamTime {
 
     fn update_alive(&mut self) {
         self.alive = Instant::now();
-    }
-}
-
-struct RecvBuffer {
-    recved: VecDeque<u8>,
-    buffer: VecDeque<u8>,
-    ranges: VecDeque<(u32, u32)>,
-}
-
-impl RecvBuffer {
-    fn new() -> Self {
-        let recved = VecDeque::new();
-        let mut buffer = VecDeque::new();
-        buffer.resize(LOCAL_WINDOW as usize, 0);
-        let ranges = VecDeque::new();
-
-        Self {
-            recved,
-            buffer,
-            ranges,
-        }
     }
 }
 
@@ -424,10 +404,9 @@ impl TcpStreamControlBlock {
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        if !self.recv_buffer.recved.is_empty() {
-            let size = buf.remaining().min(self.recv_buffer.recved.len());
-            let data = self.recv_buffer.recved.drain(..size).collect::<Vec<u8>>();
-            buf.put_slice(&data);
+        if self.recv_buffer.can_read() {
+            let size = self.recv_buffer.read(buf.initialize_unfilled());
+            buf.advance(size);
             return std::task::Poll::Ready(Ok(()));
         }
 
@@ -909,44 +888,6 @@ impl TcpStreamControlBlock {
         *opts_size += 12;
     }
 
-    fn add_tcp_option_sack(
-        &self,
-        opts: &mut Vec<TcpOption>,
-        opts_size: &mut usize,
-        seq_range: Option<(u32, u32)>,
-    ) {
-        if !self.state_data.sack {
-            return;
-        }
-
-        let mut blocks = 3;
-        let mut acks = Vec::new();
-
-        if let Some(seq_range) = seq_range {
-            if ((self.state_data.ack - seq_range.0) as i32) < 0 {
-                acks.push(seq_range.0);
-                acks.push(seq_range.1);
-                blocks -= 1;
-            }
-        }
-
-        for range in &self.recv_buffer.ranges {
-            if blocks == 0 {
-                break;
-            }
-            acks.push(range.0);
-            acks.push(range.1);
-            blocks -= 1;
-        }
-
-        if !acks.is_empty() {
-            opts.push(TcpOption::nop());
-            opts.push(TcpOption::nop());
-            opts.push(TcpOption::selective_ack(&acks));
-            *opts_size += 4 + 4 * acks.len();
-        }
-    }
-
     fn send_tcp_syn_ack_packet(&self) {
         let mut opts = Vec::new();
         let mut opts_size = 0;
@@ -982,7 +923,6 @@ impl TcpStreamControlBlock {
         let mut opts_size = 0;
 
         self.add_tcp_option_timestamp(&mut opts, &mut opts_size);
-        self.add_tcp_option_sack(&mut opts, &mut opts_size, None);
 
         let mut index = 0;
         let mut seq = data.seq;
@@ -1007,8 +947,8 @@ impl TcpStreamControlBlock {
         }
     }
 
-    fn send_tcp_acknowledge_packet(&self, seq_range: Option<(u32, u32)>) {
-        self.send_tcp_control_packet(TcpFlags::ACK, seq_range);
+    fn send_tcp_acknowledge_packet(&self) {
+        self.send_tcp_control_packet(TcpFlags::ACK);
         trace!(
             "{}[{}]: send acknowledge ack: {}",
             self.addr_pair,
@@ -1018,22 +958,21 @@ impl TcpStreamControlBlock {
     }
 
     fn send_tcp_fin_packet(&self) {
-        self.send_tcp_control_packet(TcpFlags::ACK | TcpFlags::FIN, None);
+        self.send_tcp_control_packet(TcpFlags::ACK | TcpFlags::FIN);
         trace!("{}[{}]: send FIN", self.addr_pair, self.state);
     }
 
     fn send_tcp_rst_packet(&self) {
-        self.send_tcp_control_packet(TcpFlags::ACK | TcpFlags::RST, None);
+        self.send_tcp_control_packet(TcpFlags::ACK | TcpFlags::RST);
         trace!("{}[{}]: send RST", self.addr_pair, self.state);
     }
 
-    fn send_tcp_control_packet(&self, flags: u8, seq_range: Option<(u32, u32)>) {
+    fn send_tcp_control_packet(&self, flags: u8) {
         let mut opts = Vec::new();
         let mut opts_size = 0;
         let payload = [0u8; 0];
 
         self.add_tcp_option_timestamp(&mut opts, &mut opts_size);
-        self.add_tcp_option_sack(&mut opts, &mut opts_size, seq_range);
         self.send_tcp_packet(self.state_data.seq, flags, &opts, opts_size, &payload);
     }
 
@@ -1191,7 +1130,7 @@ impl TcpStreamControlBlock {
                 request.payload().len()
             );
             if request.payload().len() <= 1 {
-                return self.send_tcp_acknowledge_packet(None);
+                return self.send_tcp_acknowledge_packet();
             }
         }
 
@@ -1201,58 +1140,27 @@ impl TcpStreamControlBlock {
         }
 
         let seq = request.get_sequence();
-        let range = (seq, seq + payload.len() as u32);
-        let window = (
-            self.state_data.ack,
-            self.state_data.ack + self.state_data.local_window,
-        );
+        self.recv_buffer.write(seq, Bytes::copy_from_slice(payload));
 
-        let range_left = ((range.0 - window.0) as i32, (range.1 - window.0) as i32);
-        let range_right = ((range.0 - window.1) as i32, (range.1 - window.1) as i32);
-        if range_left.1 <= 0 || range_right.0 >= 0 {
-            warn!(
-                "{}[{}]: payload [{}, {}) out of local window [{}, {})",
-                self.addr_pair, self.state, range.0, range.1, window.0, window.1
-            );
-            return self.send_tcp_acknowledge_packet(None);
+        let ack = self.state_data.ack;
+        self.state_data.ack = self.recv_buffer.advance_ack(ack);
+
+        if ack != self.state_data.ack {
+            self.process_remote_timestamp(request);
         }
 
-        let mut data_index = 0usize;
-        let mut data_len = payload.len();
-        if range_left.0 < 0 {
-            data_index = range_left.0.abs() as usize;
-            data_len -= data_index;
+        if self.recv_buffer.can_read() {
+            if let Some(waker) = self.read_waker.take() {
+                waker.wake();
+            }
         }
 
-        if range_right.1 > 0 {
-            data_len -= range_right.1 as usize;
-        }
-
-        let buffer_index = if range_left.0 > 0 {
-            warn!(
-                "{}[{}]: local window hole [{}, {})",
-                self.addr_pair, self.state, window.0, range.0
-            );
-            range_left.0 as usize
-        } else {
-            0usize
-        };
-
-        self.copy_to_recv_buffer(buffer_index, &payload[data_index..data_index + data_len]);
-
-        let seq_range = (
-            seq + data_index as u32,
-            seq + data_index as u32 + data_len as u32,
-        );
-
-        self.update_recv_ranges(seq_range);
-        self.handle_recv_buffer(request);
-        self.send_tcp_acknowledge_packet(Some(seq_range));
+        self.send_tcp_acknowledge_packet();
     }
 
     fn process_fin(&mut self, request: &TcpPacket) {
         self.state_data.ack = request.get_sequence() + 1;
-        self.send_tcp_acknowledge_packet(None);
+        self.send_tcp_acknowledge_packet();
 
         match self.state {
             State::Estab | State::CloseWait => self.state = State::CloseWait,
@@ -1268,79 +1176,6 @@ impl TcpStreamControlBlock {
 
         if let Some(waker) = self.read_waker.take() {
             waker.wake();
-        }
-    }
-
-    fn copy_to_recv_buffer(&mut self, mut index: usize, buffer: &[u8]) {
-        let slices = self.recv_buffer.buffer.as_mut_slices();
-
-        let mut consumed = 0usize;
-        let mut remain = buffer.len();
-        if index < slices.0.len() {
-            let len = std::cmp::min(slices.0.len() - index, remain);
-            slices.0[index..index + len].copy_from_slice(&buffer[0..len]);
-
-            index += len;
-            remain -= len;
-            consumed = len;
-        }
-
-        if remain == 0 {
-            return;
-        }
-
-        index -= slices.0.len();
-        let len = std::cmp::min(slices.1.len() - index, remain);
-        slices.1[index..index + len].copy_from_slice(&buffer[consumed..consumed + len]);
-    }
-
-    fn update_recv_ranges(&mut self, seq_range: (u32, u32)) {
-        for index in 0..self.recv_buffer.ranges.len() {
-            let diff = (seq_range.0 - self.recv_buffer.ranges[index].0) as i32;
-            if diff < 0 {
-                return self.recv_buffer.ranges.insert(index, seq_range);
-            }
-        }
-
-        self.recv_buffer.ranges.push_back(seq_range);
-    }
-
-    fn handle_recv_buffer(&mut self, request: &TcpPacket) {
-        let mut range = self.recv_buffer.ranges.front().unwrap().clone();
-        if self.state_data.ack != range.0 {
-            return;
-        }
-
-        loop {
-            self.recv_buffer.ranges.pop_front();
-            if self.recv_buffer.ranges.is_empty() {
-                break;
-            }
-
-            let front = self.recv_buffer.ranges.front().unwrap().clone();
-            if ((front.0 - range.1) as i32) > 0 {
-                break;
-            }
-
-            if ((front.1 - range.1) as i32) > 0 {
-                range.1 = front.1;
-            }
-        }
-
-        self.state_data.ack = range.1;
-        self.process_remote_timestamp(request);
-
-        let len = (range.1 - range.0) as usize;
-        let mut data: VecDeque<u8> = self.recv_buffer.buffer.drain(0..len).collect();
-        self.recv_buffer.recved.append(&mut data);
-        self.recv_buffer
-            .buffer
-            .resize(self.state_data.local_window as usize, 0);
-
-        if !self.recv_buffer.recved.is_empty() {
-            if let Some(waker) = self.read_waker.take() {
-                waker.wake();
-            }
         }
     }
 }
