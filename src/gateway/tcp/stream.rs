@@ -100,7 +100,7 @@ impl TcpStreamInner {
 
     pub(super) fn handle_tcp_packet(&self, packet: Bytes) -> Option<()> {
         let request = TcpPacket::new(&packet)?;
-        self.cb.lock().unwrap().handle_tcp_packet(&request);
+        self.cb.lock().unwrap().handle_tcp_packet(&request, &packet);
         Some(())
     }
 }
@@ -331,7 +331,7 @@ impl TcpStreamControlBlock {
         }
     }
 
-    fn handle_tcp_packet(&mut self, request: &TcpPacket) {
+    fn handle_tcp_packet(&mut self, request: &TcpPacket, packet: &Bytes) {
         if request.get_flags() & TcpFlags::RST != 0 {
             trace!(
                 "{}[{}]: recv RST, change state to Closed",
@@ -345,10 +345,10 @@ impl TcpStreamControlBlock {
 
         match self.state {
             State::Listen => self.state_listen(request),
-            State::SynRcvd => self.state_syn_rcvd(request),
-            State::Estab => self.state_estab(request),
-            State::FinWait1 => self.state_fin_wait1(request),
-            State::FinWait2 => self.state_fin_wait2(request),
+            State::SynRcvd => self.state_syn_rcvd(request, packet),
+            State::Estab => self.state_estab(request, packet),
+            State::FinWait1 => self.state_fin_wait1(request, packet),
+            State::FinWait2 => self.state_fin_wait2(request, packet),
             State::Closing => self.state_closing(request),
             State::TimeWait => self.state_time_wait(request),
             State::CloseWait => self.state_close_wait(request),
@@ -404,7 +404,7 @@ impl TcpStreamControlBlock {
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        if self.recv_buffer.can_read() {
+        if self.recv_buffer.readable() {
             let size = self.recv_buffer.read(buf.initialize_unfilled());
             buf.advance(size);
             return std::task::Poll::Ready(Ok(()));
@@ -533,6 +533,7 @@ impl TcpStreamControlBlock {
                 request.get_sequence()
             );
             self.state_data.ack = request.get_sequence() + 1;
+            self.recv_buffer.initialize_ack(self.state_data.ack);
             self.update_remote_window(request);
 
             for opt in request.get_options_iter() {
@@ -578,7 +579,7 @@ impl TcpStreamControlBlock {
         }
     }
 
-    fn state_syn_rcvd(&mut self, request: &TcpPacket) {
+    fn state_syn_rcvd(&mut self, request: &TcpPacket, packet: &Bytes) {
         if request.get_flags() & TcpFlags::SYN != 0 {
             self.send_tcp_syn_ack_packet();
         }
@@ -594,12 +595,12 @@ impl TcpStreamControlBlock {
                 self.state_data.seq += 1;
                 self.state = State::Estab;
 
-                self.process_payload(request);
+                self.process_payload(request, packet);
             }
         }
     }
 
-    fn state_estab(&mut self, request: &TcpPacket) {
+    fn state_estab(&mut self, request: &TcpPacket, packet: &Bytes) {
         trace!(
             "{}[{}]: recv packet flags: {:b}, seq: {}, payload size: {}",
             self.addr_pair,
@@ -623,10 +624,10 @@ impl TcpStreamControlBlock {
             }
         }
 
-        self.process_payload(request);
+        self.process_payload(request, packet);
     }
 
-    fn state_fin_wait1(&mut self, request: &TcpPacket) {
+    fn state_fin_wait1(&mut self, request: &TcpPacket, packet: &Bytes) {
         if request.get_flags() & TcpFlags::FIN != 0 {
             if request.get_sequence() == self.state_data.ack {
                 trace!(
@@ -644,10 +645,10 @@ impl TcpStreamControlBlock {
             }
         }
 
-        self.process_payload(request);
+        self.process_payload(request, packet);
     }
 
-    fn state_fin_wait2(&mut self, request: &TcpPacket) {
+    fn state_fin_wait2(&mut self, request: &TcpPacket, packet: &Bytes) {
         if request.get_flags() & TcpFlags::FIN != 0 {
             if request.get_sequence() == self.state_data.ack {
                 trace!(
@@ -659,7 +660,7 @@ impl TcpStreamControlBlock {
             }
         }
 
-        self.process_payload(request);
+        self.process_payload(request, packet);
     }
 
     fn state_closing(&mut self, request: &TcpPacket) {
@@ -1121,7 +1122,7 @@ impl TcpStreamControlBlock {
         }
     }
 
-    fn process_payload(&mut self, request: &TcpPacket) {
+    fn process_payload(&mut self, request: &TcpPacket, packet: &Bytes) {
         if request.get_sequence() == (self.state_data.ack - 1) {
             trace!(
                 "{}[{}]: keep-alive request, payload size: {}",
@@ -1139,17 +1140,16 @@ impl TcpStreamControlBlock {
             return;
         }
 
-        let seq = request.get_sequence();
-        self.recv_buffer.write(seq, Bytes::copy_from_slice(payload));
-
         let ack = self.state_data.ack;
-        self.state_data.ack = self.recv_buffer.advance_ack(ack);
+        let seq = request.get_sequence();
+        let data = packet.slice_ref(payload);
+        self.state_data.ack = self.recv_buffer.write(seq, data).unwrap();
 
         if ack != self.state_data.ack {
             self.process_remote_timestamp(request);
         }
 
-        if self.recv_buffer.can_read() {
+        if self.recv_buffer.readable() {
             if let Some(waker) = self.read_waker.take() {
                 waker.wake();
             }

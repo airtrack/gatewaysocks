@@ -35,36 +35,33 @@ impl RecvBuffer {
         Self::default()
     }
 
-    pub(super) fn write(&mut self, mut seq: u32, mut data: Bytes) {
-        if let Some(ack) = self.ack {
-            if Seq(seq) < Seq(ack) {
-                let len = ack.wrapping_sub(seq).min(data.len() as u32);
-                data.advance(len as usize);
-                seq = seq.wrapping_add(len);
-            }
-        }
-
-        while !data.is_empty() {
-            self.insert_slice(&mut seq, &mut data);
-        }
-    }
-
-    pub(super) fn advance_ack(&mut self, mut ack: u32) -> u32 {
-        let mut iter = self.recvd.range(Seq(ack)..);
-
-        while let Some((k, v)) = iter.next() {
-            if k.0 == ack {
-                ack = ack.wrapping_add(v.len() as u32);
-            } else {
-                break;
-            }
-        }
-
+    pub(super) fn initialize_ack(&mut self, ack: u32) {
         self.ack = Some(ack);
-        ack
     }
 
-    pub(super) fn can_read(&self) -> bool {
+    pub(super) fn write(&mut self, mut seq: u32, mut data: Bytes) -> std::io::Result<u32> {
+        let ack = self.ack.ok_or(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "ack is not initialized",
+        ))?;
+
+        if Seq(seq) < Seq(ack) {
+            let len = ack.wrapping_sub(seq).min(data.len() as u32);
+            data.advance(len as usize);
+            seq = seq.wrapping_add(len);
+        }
+
+        let mut start = ack;
+        while !data.is_empty() {
+            (start, seq) = self.insert_slice(start, seq, &mut data);
+        }
+
+        let ack = self.advance_ack(ack);
+        self.ack = Some(ack);
+        Ok(ack)
+    }
+
+    pub(super) fn readable(&self) -> bool {
         if self.ack.is_none() || self.recvd.is_empty() {
             return false;
         }
@@ -104,22 +101,54 @@ impl RecvBuffer {
         size
     }
 
-    fn insert_slice(&mut self, seq: &mut u32, data: &mut Bytes) {
-        let mut iter = self.recvd.range(Seq(*seq)..);
+    fn insert_slice(&mut self, mut start: u32, mut seq: u32, data: &mut Bytes) -> (u32, u32) {
+        let mut iter = self.recvd.range(Seq(start)..);
 
-        if let Some((k, v)) = iter.next() {
-            if k.0 == *seq {
-                let size = v.len().min(data.len());
-                data.advance(size);
-                *seq = seq.wrapping_add(size as u32);
+        if let Some((&k, v)) = iter.next() {
+            if k < Seq(seq) {
+                let k_end = Seq(k.0.wrapping_add(v.len() as u32));
+
+                if Seq(seq) < k_end {
+                    let size = (k_end.0.wrapping_sub(seq) as usize).min(data.len());
+
+                    data.advance(size);
+                    seq = seq.wrapping_add(size as u32);
+                    start = seq;
+                } else {
+                    start = k_end.0;
+                }
+            } else if k > Seq(seq) {
+                let size = (k.0.wrapping_sub(seq) as usize).min(data.len());
+
+                self.recvd.insert(Seq(seq), data.split_to(size));
+                seq = seq.wrapping_add(size as u32);
+                start = seq;
             } else {
-                let size = (k.0.wrapping_sub(*seq) as usize).min(data.len());
-                self.recvd.insert(Seq(*seq), data.split_to(size));
-                *seq = seq.wrapping_add(size as u32);
+                let size = v.len().min(data.len());
+
+                data.advance(size);
+                seq = seq.wrapping_add(size as u32);
+                start = seq;
             }
         } else {
-            self.recvd.insert(Seq(*seq), data.split_to(data.len()));
+            self.recvd.insert(Seq(seq), data.split_to(data.len()));
         }
+
+        (start, seq)
+    }
+
+    fn advance_ack(&mut self, mut ack: u32) -> u32 {
+        let mut iter = self.recvd.range(Seq(ack)..);
+
+        while let Some((k, v)) = iter.next() {
+            if k.0 == ack {
+                ack = ack.wrapping_add(v.len() as u32);
+            } else {
+                break;
+            }
+        }
+
+        ack
     }
 }
 
@@ -137,63 +166,116 @@ mod tests {
     }
 
     #[test]
-    fn test_recv_buffer() {
+    fn test_recv_buffer_normal() {
         let mut buffer = RecvBuffer::new();
-        buffer.write(1, Bytes::copy_from_slice(b"1"));
-        buffer.write(3, Bytes::copy_from_slice(b"34"));
-        buffer.write(6, Bytes::copy_from_slice(b"678"));
-        buffer.write(0, Bytes::copy_from_slice(b"0123456789"));
-        buffer.write(20, Bytes::copy_from_slice(b"20"));
+        let mut ack = u32::MAX;
+        buffer.initialize_ack(ack);
 
-        let mut ack = buffer.advance_ack(u32::MAX);
-        assert!(ack == u32::MAX);
+        buffer.write(1, Bytes::copy_from_slice(b"1")).unwrap();
+        buffer.write(3, Bytes::copy_from_slice(b"34")).unwrap();
+        buffer.write(6, Bytes::copy_from_slice(b"678")).unwrap();
+        buffer
+            .write(0, Bytes::copy_from_slice(b"0123456789"))
+            .unwrap();
+        ack = buffer.write(20, Bytes::copy_from_slice(b"20")).unwrap();
+
+        assert_eq!(ack, u32::MAX);
 
         let mut buf = [0u8; 5];
-        assert!(!buffer.can_read());
-        assert!(buffer.read(&mut buf) == 0);
+        assert!(!buffer.readable());
+        assert_eq!(buffer.read(&mut buf), 0);
 
-        buffer.write(u32::MAX, Bytes::copy_from_slice(b"u32::MAX"));
-        ack = buffer.advance_ack(ack);
-        assert!(ack == 10);
+        ack = buffer
+            .write(u32::MAX, Bytes::copy_from_slice(b"u32::MAX"))
+            .unwrap();
+        assert_eq!(ack, 10);
 
         let mut iter = buffer.recvd.iter();
-        assert!(iter.next() == Some((&Seq(u32::MAX), &Bytes::copy_from_slice(b"u"))));
-        assert!(iter.next() == Some((&Seq(0), &Bytes::copy_from_slice(b"0"))));
-        assert!(iter.next() == Some((&Seq(1), &Bytes::copy_from_slice(b"1"))));
-        assert!(iter.next() == Some((&Seq(2), &Bytes::copy_from_slice(b"2"))));
-        assert!(iter.next() == Some((&Seq(3), &Bytes::copy_from_slice(b"34"))));
-        assert!(iter.next() == Some((&Seq(5), &Bytes::copy_from_slice(b"5"))));
-        assert!(iter.next() == Some((&Seq(6), &Bytes::copy_from_slice(b"678"))));
-        assert!(iter.next() == Some((&Seq(9), &Bytes::copy_from_slice(b"9"))));
-        assert!(iter.next() == Some((&Seq(20), &Bytes::copy_from_slice(b"20"))));
-        assert!(iter.next() == None);
+        assert_eq!(
+            iter.next(),
+            Some((&Seq(u32::MAX), &Bytes::copy_from_slice(b"u")))
+        );
+        assert_eq!(iter.next(), Some((&Seq(0), &Bytes::copy_from_slice(b"0"))));
+        assert_eq!(iter.next(), Some((&Seq(1), &Bytes::copy_from_slice(b"1"))));
+        assert_eq!(iter.next(), Some((&Seq(2), &Bytes::copy_from_slice(b"2"))));
+        assert_eq!(iter.next(), Some((&Seq(3), &Bytes::copy_from_slice(b"34"))));
+        assert_eq!(iter.next(), Some((&Seq(5), &Bytes::copy_from_slice(b"5"))));
+        assert_eq!(
+            iter.next(),
+            Some((&Seq(6), &Bytes::copy_from_slice(b"678")))
+        );
+        assert_eq!(iter.next(), Some((&Seq(9), &Bytes::copy_from_slice(b"9"))));
+        assert_eq!(
+            iter.next(),
+            Some((&Seq(20), &Bytes::copy_from_slice(b"20")))
+        );
+        assert_eq!(iter.next(), None);
 
-        assert!(buffer.can_read());
-        assert!(buffer.read(&mut buf) == 5);
-        assert!(&buf[..5] == b"u0123");
+        assert!(buffer.readable());
+        assert_eq!(buffer.read(&mut buf), 5);
+        assert_eq!(&buf[..5], b"u0123");
 
-        assert!(buffer.can_read());
-        assert!(buffer.read(&mut buf) == 5);
-        assert!(&buf[..5] == b"45678");
+        assert!(buffer.readable());
+        assert_eq!(buffer.read(&mut buf), 5);
+        assert_eq!(&buf[..5], b"45678");
 
-        assert!(buffer.can_read());
-        assert!(buffer.read(&mut buf) == 1);
-        assert!(&buf[..1] == b"9");
+        assert!(buffer.readable());
+        assert_eq!(buffer.read(&mut buf), 1);
+        assert_eq!(&buf[..1], b"9");
 
-        assert!(!buffer.can_read());
-        assert!(buffer.read(&mut buf) == 0);
+        assert!(!buffer.readable());
+        assert_eq!(buffer.read(&mut buf), 0);
 
-        assert!(!buffer.can_read());
-        assert!(buffer.read(&mut buf) == 0);
+        assert!(!buffer.readable());
+        assert_eq!(buffer.read(&mut buf), 0);
 
-        buffer.write(6, Bytes::copy_from_slice(b"6789abcdef"));
-        ack = buffer.advance_ack(ack);
-        assert!(ack == 16);
+        ack = buffer
+            .write(6, Bytes::copy_from_slice(b"6789abcdef"))
+            .unwrap();
+        assert_eq!(ack, 16);
 
         iter = buffer.recvd.iter();
-        assert!(buffer.can_read());
-        assert!(iter.next() == Some((&Seq(10), &Bytes::copy_from_slice(b"abcdef"))));
-        assert!(iter.next() == Some((&Seq(20), &Bytes::copy_from_slice(b"20"))));
-        assert!(iter.next() == None);
+        assert!(buffer.readable());
+        assert_eq!(
+            iter.next(),
+            Some((&Seq(10), &Bytes::copy_from_slice(b"abcdef")))
+        );
+        assert_eq!(
+            iter.next(),
+            Some((&Seq(20), &Bytes::copy_from_slice(b"20")))
+        );
+        assert_eq!(iter.next(), None);
+    }
+
+    #[test]
+    fn test_recv_buffer_overlap() {
+        let mut buffer = RecvBuffer::new();
+        let mut ack = 0;
+        buffer.initialize_ack(ack);
+
+        ack = buffer.write(1, Bytes::copy_from_slice(b"123456")).unwrap();
+        assert_eq!(ack, 0);
+
+        ack = buffer.write(3, Bytes::copy_from_slice(b"3456789")).unwrap();
+        assert_eq!(ack, 0);
+
+        ack = buffer.write(0, Bytes::copy_from_slice(b"0")).unwrap();
+        assert_eq!(ack, 10);
+
+        let mut iter = buffer.recvd.iter();
+        assert_eq!(iter.next(), Some((&Seq(0), &Bytes::copy_from_slice(b"0"))));
+        assert_eq!(
+            iter.next(),
+            Some((&Seq(1), &Bytes::copy_from_slice(b"123456")))
+        );
+        assert_eq!(
+            iter.next(),
+            Some((&Seq(7), &Bytes::copy_from_slice(b"789")))
+        );
+        assert_eq!(iter.next(), None);
+
+        let mut buf = [0u8; 10];
+        assert_eq!(buffer.read(&mut buf), 10);
+        assert_eq!(&buf[..], b"0123456789");
     }
 }
