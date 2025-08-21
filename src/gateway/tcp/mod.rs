@@ -22,6 +22,7 @@ mod congestion;
 mod pacing;
 mod recv_buffer;
 mod rtt;
+mod send_buffer;
 mod stream;
 
 #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
