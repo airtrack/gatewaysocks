@@ -6,17 +6,17 @@ use std::sync::Arc;
 use std::usize;
 
 use bytes::Bytes;
+use pnet::packet::Packet;
 use pnet::packet::ethernet::EthernetPacket;
 use pnet::packet::ipv4::Ipv4Packet;
 use pnet::packet::tcp::TcpPacket;
-use pnet::packet::Packet;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{
-    channel, unbounded_channel, Receiver, Sender, UnboundedReceiver, UnboundedSender,
+    Receiver, Sender, UnboundedReceiver, UnboundedSender, channel, unbounded_channel,
 };
 
-use crate::gateway::tcp::stream::{is_syn_packet, TcpStreamInner};
 use crate::gateway::GatewaySender;
+use crate::gateway::tcp::stream::{TcpStreamInner, is_syn_packet};
 
 mod congestion;
 mod pacing;

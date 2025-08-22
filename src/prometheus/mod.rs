@@ -1,9 +1,9 @@
 use axum::{
+    Router,
     body::Body,
-    http::{header::CONTENT_TYPE, StatusCode},
+    http::{StatusCode, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
     routing::get,
-    Router,
 };
 use metrics::METRICS_COUNTER;
 use prometheus::{Encoder, TextEncoder};

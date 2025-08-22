@@ -9,11 +9,11 @@ use pnet::packet::ipv4::{self, Ipv4Packet, MutableIpv4Packet};
 use pnet::packet::udp::{self, MutableUdpPacket, UdpPacket};
 use pnet::packet::{MutablePacket, Packet};
 use pnet::util::MacAddr;
+use tokio::sync::Mutex;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{
-    channel, unbounded_channel, Receiver, Sender, UnboundedReceiver, UnboundedSender,
+    Receiver, Sender, UnboundedReceiver, UnboundedSender, channel, unbounded_channel,
 };
-use tokio::sync::Mutex;
 
 use crate::gateway::GatewaySender;
 

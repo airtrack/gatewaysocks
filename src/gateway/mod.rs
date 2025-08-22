@@ -3,13 +3,13 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use pnet::datalink::{self, DataLinkReceiver};
+use pnet::packet::Packet;
 use pnet::packet::ethernet::{EtherTypes, EthernetPacket};
 use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::packet::ipv4::Ipv4Packet;
-use pnet::packet::Packet;
 use pnet::util::MacAddr;
-use tokio::sync::mpsc::unbounded_channel;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::unbounded_channel;
 
 pub use tcp::TcpListener;
 pub use tcp::TcpStream;

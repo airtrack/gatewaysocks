@@ -1,7 +1,7 @@
 use lazy_static::lazy_static;
 use prometheus::{
-    register_int_counter, register_int_counter_vec, register_int_gauge, IntCounter, IntCounterVec,
-    IntGauge,
+    IntCounter, IntCounterVec, IntGauge, register_int_counter, register_int_counter_vec,
+    register_int_gauge,
 };
 
 lazy_static! {

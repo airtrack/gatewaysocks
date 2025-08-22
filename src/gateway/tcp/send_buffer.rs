@@ -1,6 +1,6 @@
 use std::{
     cell::Cell,
-    collections::{vec_deque::Iter, VecDeque},
+    collections::{VecDeque, vec_deque::Iter},
     time::{Duration, Instant},
 };
 

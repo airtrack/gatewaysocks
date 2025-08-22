@@ -15,15 +15,15 @@ use pnet::packet::ipv4::{self, MutableIpv4Packet};
 use pnet::packet::tcp::{self, MutableTcpPacket, TcpFlags, TcpOption, TcpOptionNumbers, TcpPacket};
 use pnet::packet::{MutablePacket, Packet};
 use pnet::util::MacAddr;
-use tokio::time::{sleep_until, Sleep};
+use tokio::time::{Sleep, sleep_until};
 
+use crate::gateway::GatewaySender;
 use crate::gateway::tcp::congestion::{Controller, FixBandwidth};
 use crate::gateway::tcp::pacing::Pacer;
 use crate::gateway::tcp::recv_buffer::RecvBuffer;
 use crate::gateway::tcp::rtt::RttEstimator;
 use crate::gateway::tcp::send_buffer::SendBuffer;
 use crate::gateway::tcp::{AddrPair, StreamCloser};
-use crate::gateway::GatewaySender;
 
 const MSL_2: Duration = Duration::from_millis(30000);
 const DEFAULT_RTO: Duration = Duration::from_millis(50);
@@ -264,8 +264,7 @@ impl TcpStreamControlBlock {
         if request.get_flags() & TcpFlags::RST != 0 {
             trace!(
                 "{}[{}]: recv RST, change state to Closed",
-                self.addr_pair,
-                self.state
+                self.addr_pair, self.state
             );
             self.state = State::Closed;
         }
@@ -295,8 +294,7 @@ impl TcpStreamControlBlock {
         if self.is_timewait_timeout() {
             trace!(
                 "{}[{}]: TimeWait timeout, change state to Closed",
-                self.addr_pair,
-                self.state
+                self.addr_pair, self.state
             );
             self.state = State::Closed;
             self.closer.close(self.addr_pair);
@@ -510,8 +508,7 @@ impl TcpStreamControlBlock {
             self.state = State::SynRcvd;
             trace!(
                 "{}[{}]: change state to SynRcvd",
-                self.addr_pair,
-                self.state
+                self.addr_pair, self.state
             );
         }
     }
@@ -554,8 +551,7 @@ impl TcpStreamControlBlock {
             if request.get_sequence() == self.state_data.ack {
                 trace!(
                     "{}[{}]: recv FIN, change state to CloseWait",
-                    self.addr_pair,
-                    self.state
+                    self.addr_pair, self.state
                 );
                 return self.process_fin(request);
             }
@@ -569,8 +565,7 @@ impl TcpStreamControlBlock {
             if request.get_sequence() == self.state_data.ack {
                 trace!(
                     "{}[{}]: recv FIN, change state to Closing",
-                    self.addr_pair,
-                    self.state
+                    self.addr_pair, self.state
                 );
                 return self.process_fin(request);
             }
@@ -590,8 +585,7 @@ impl TcpStreamControlBlock {
             if request.get_sequence() == self.state_data.ack {
                 trace!(
                     "{}[{}]: recv FIN, change state to TimeWait",
-                    self.addr_pair,
-                    self.state
+                    self.addr_pair, self.state
                 );
                 return self.process_fin(request);
             }
@@ -609,8 +603,7 @@ impl TcpStreamControlBlock {
             if request.get_acknowledgement() == self.state_data.seq + 1 {
                 trace!(
                     "{}[{}]: recv FIN ack, change state to TimeWait",
-                    self.addr_pair,
-                    self.state
+                    self.addr_pair, self.state
                 );
                 self.state = State::TimeWait;
             }
@@ -638,8 +631,7 @@ impl TcpStreamControlBlock {
                 self.state = State::Closed;
                 trace!(
                     "{}[{}]: recv last ACK, change state to Closed",
-                    self.addr_pair,
-                    self.state
+                    self.addr_pair, self.state
                 );
             }
         }
@@ -756,9 +748,7 @@ impl TcpStreamControlBlock {
         self.state_data.remote_window <<= self.state_data.wscale;
         trace!(
             "{}[{}]: update remote window size: {}",
-            self.addr_pair,
-            self.state,
-            self.state_data.remote_window
+            self.addr_pair, self.state, self.state_data.remote_window
         );
     }
 
@@ -838,9 +828,7 @@ impl TcpStreamControlBlock {
         self.send_tcp_control_packet(TcpFlags::ACK);
         trace!(
             "{}[{}]: send acknowledge ack: {}",
-            self.addr_pair,
-            self.state,
-            self.state_data.ack
+            self.addr_pair, self.state, self.state_data.ack
         );
     }
 
@@ -942,9 +930,7 @@ impl TcpStreamControlBlock {
                     self.state_data.remote_ts = new_ts;
                     trace!(
                         "{}[{}]: update remote timestamp: {}",
-                        self.addr_pair,
-                        self.state,
-                        self.state_data.remote_ts
+                        self.addr_pair, self.state, self.state_data.remote_ts
                     );
                 }
             }
