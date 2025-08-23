@@ -17,8 +17,8 @@ pub use udp::UdpBinder;
 pub use udp::UdpSocket;
 
 mod arp;
-mod tcp;
-mod udp;
+pub mod tcp;
+pub mod udp;
 
 pub fn new_gateway(
     addr: Ipv4Addr,

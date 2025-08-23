@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::fmt::Display;
 use std::future::Future;
 use std::net::{SocketAddr, SocketAddrV4};
 use std::sync::Arc;
@@ -23,16 +22,14 @@ mod pacing;
 mod recv_buffer;
 mod rtt;
 mod send_buffer;
+mod stats;
 mod stream;
+mod types;
 
-#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
-struct AddrPair(SocketAddrV4, SocketAddrV4);
-
-impl Display for AddrPair {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!("({}, {})", self.0, self.1))
-    }
-}
+pub use stats::StatsMap;
+pub use stats::StreamStats;
+pub use types::AddrPair;
+pub use types::State;
 
 struct StreamStarter(UnboundedSender<TcpStream>);
 
@@ -94,9 +91,13 @@ pub(super) fn new_tcp(
         stream_starter,
         stream_closer,
         closed_stream,
+        stats: StatsMap::new(),
         streams: HashMap::new(),
     };
-    let listener = TcpListener { stream_receiver };
+    let listener = TcpListener {
+        stats: handler.stats.clone(),
+        stream_receiver,
+    };
     (handler, listener)
 }
 
@@ -106,6 +107,7 @@ pub struct TcpHandler {
     stream_starter: StreamStarter,
     stream_closer: StreamCloser,
     closed_stream: ClosedStream,
+    stats: StatsMap,
     streams: HashMap<AddrPair, Sender<Bytes>>,
 }
 
@@ -131,6 +133,7 @@ impl TcpHandler {
 
     fn remove_stream(&mut self, addr_pair: AddrPair) {
         self.streams.remove(&addr_pair);
+        self.stats.map.remove(&addr_pair);
     }
 
     fn handle_packet(&mut self, packet: Bytes) -> Option<()> {
@@ -150,7 +153,14 @@ impl TcpHandler {
                     let (packets_tx, packets_rx) = channel(32);
                     let stream_closer = self.stream_closer.clone();
                     let gw_sender = self.gw_sender.clone();
-                    let inner = Arc::new(TcpStreamInner::new(mac, pair, stream_closer, gw_sender));
+                    let stats = StreamStats::new();
+                    let inner = Arc::new(TcpStreamInner::new(
+                        mac,
+                        pair,
+                        stream_closer,
+                        gw_sender,
+                        stats.clone(),
+                    ));
                     let driver = TcpStreamDriver {
                         packets: packets_rx,
                         inner: inner.clone(),
@@ -159,6 +169,7 @@ impl TcpHandler {
 
                     packets_tx.try_send(data).ok()?;
                     self.streams.insert(pair, packets_tx);
+                    self.stats.map.insert(pair, stats);
                     self.stream_starter.start(stream).ok()?;
                     driver.start();
                 }
@@ -170,12 +181,17 @@ impl TcpHandler {
 }
 
 pub struct TcpListener {
+    stats: StatsMap,
     stream_receiver: StreamReceiver,
 }
 
 impl TcpListener {
     pub async fn accept(&mut self) -> std::io::Result<TcpStream> {
         self.stream_receiver.recv().await
+    }
+
+    pub fn get_stats(&self) -> StatsMap {
+        self.stats.clone()
     }
 }
 

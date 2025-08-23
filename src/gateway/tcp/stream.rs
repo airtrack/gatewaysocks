@@ -1,4 +1,3 @@
-use std::fmt::Display;
 use std::future::Future;
 use std::net::SocketAddrV4;
 use std::pin::Pin;
@@ -18,12 +17,14 @@ use pnet::util::MacAddr;
 use tokio::time::{Sleep, sleep_until};
 
 use crate::gateway::GatewaySender;
+use crate::gateway::tcp::StreamCloser;
 use crate::gateway::tcp::congestion::{Controller, FixBandwidth};
 use crate::gateway::tcp::pacing::Pacer;
 use crate::gateway::tcp::recv_buffer::RecvBuffer;
 use crate::gateway::tcp::rtt::RttEstimator;
 use crate::gateway::tcp::send_buffer::SendBuffer;
-use crate::gateway::tcp::{AddrPair, StreamCloser};
+use crate::gateway::tcp::stats::StreamStats;
+use crate::gateway::tcp::types::{AddrPair, State};
 
 const MSL_2: Duration = Duration::from_millis(30000);
 const DEFAULT_RTO: Duration = Duration::from_millis(50);
@@ -48,6 +49,7 @@ impl TcpStreamInner {
         pair: AddrPair,
         stream_closer: StreamCloser,
         gw_sender: GatewaySender,
+        stats: StreamStats,
     ) -> Self {
         TcpStreamInner {
             cb: Mutex::new(TcpStreamControlBlock::new(
@@ -55,6 +57,7 @@ impl TcpStreamInner {
                 pair,
                 stream_closer,
                 gw_sender,
+                stats,
             )),
         }
     }
@@ -102,26 +105,6 @@ impl TcpStreamInner {
         let request = TcpPacket::new(&packet)?;
         self.cb.lock().unwrap().handle_tcp_packet(&request, &packet);
         Some(())
-    }
-}
-
-#[derive(PartialEq, Debug)]
-enum State {
-    Listen,
-    SynRcvd,
-    Estab,
-    FinWait1,
-    FinWait2,
-    Closing,
-    TimeWait,
-    CloseWait,
-    LastAck,
-    Closed,
-}
-
-impl Display for State {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Debug::fmt(self, f)
     }
 }
 
@@ -206,6 +189,7 @@ impl TimerTable {
 }
 
 struct TcpStreamControlBlock {
+    stats: StreamStats,
     src_mac: MacAddr,
     addr_pair: AddrPair,
     closer: StreamCloser,
@@ -232,6 +216,7 @@ impl TcpStreamControlBlock {
         addr_pair: AddrPair,
         closer: StreamCloser,
         gw_sender: GatewaySender,
+        stats: StreamStats,
     ) -> Self {
         let deadline = Instant::now();
         let congestion = FixBandwidth::new();
@@ -239,6 +224,7 @@ impl TcpStreamControlBlock {
         let rtt = RttEstimator::new(DEFAULT_RTT, DEFAULT_RTO, GRANULARITY);
 
         Self {
+            stats,
             src_mac,
             addr_pair,
             closer,
@@ -266,7 +252,7 @@ impl TcpStreamControlBlock {
                 "{}[{}]: recv RST, change state to Closed",
                 self.addr_pair, self.state
             );
-            self.state = State::Closed;
+            self.set_state(State::Closed);
         }
 
         self.time.update_alive();
@@ -296,7 +282,7 @@ impl TcpStreamControlBlock {
                 "{}[{}]: TimeWait timeout, change state to Closed",
                 self.addr_pair, self.state
             );
-            self.state = State::Closed;
+            self.set_state(State::Closed);
             self.closer.close(self.addr_pair);
             return std::task::Poll::Ready(());
         }
@@ -334,6 +320,7 @@ impl TcpStreamControlBlock {
         if self.recv_buffer.readable() {
             let size = self.recv_buffer.read(buf.initialize_unfilled());
             buf.advance(size);
+            self.stats.set_recv_queue(self.recv_buffer.readable_size());
             return std::task::Poll::Ready(Ok(()));
         }
 
@@ -374,7 +361,10 @@ impl TcpStreamControlBlock {
             Bytes::copy_from_slice(buf),
             self.state_data.mss as usize - MAX_TCP_HEADER_LEN,
         );
+
         self.driver_waker.as_ref().map(|waker| waker.wake_by_ref());
+        self.stats.set_send_queue(self.send_buffer.len());
+
         std::task::Poll::Ready(Ok(size))
     }
 
@@ -412,7 +402,7 @@ impl TcpStreamControlBlock {
             && self.state != State::Closing
         {
             self.send_tcp_rst_packet();
-            self.state = State::Closed;
+            self.set_state(State::Closed);
             self.state_closed();
             self.driver_waker.as_ref().map(|waker| waker.wake_by_ref());
         }
@@ -457,6 +447,11 @@ impl TcpStreamControlBlock {
                 }
             }
         }
+    }
+
+    fn set_state(&mut self, state: State) {
+        self.state = state;
+        self.stats.set_state(state);
     }
 
     fn state_listen(&mut self, request: &TcpPacket) {
@@ -505,7 +500,7 @@ impl TcpStreamControlBlock {
             }
 
             self.send_tcp_syn_ack_packet();
-            self.state = State::SynRcvd;
+            self.set_state(State::SynRcvd);
             trace!(
                 "{}[{}]: change state to SynRcvd",
                 self.addr_pair, self.state
@@ -527,7 +522,7 @@ impl TcpStreamControlBlock {
                     request.payload().len()
                 );
                 self.state_data.seq += 1;
-                self.state = State::Estab;
+                self.set_state(State::Estab);
 
                 self.process_payload(request, packet);
             }
@@ -573,7 +568,7 @@ impl TcpStreamControlBlock {
 
         if request.get_flags() & TcpFlags::ACK != 0 {
             if request.get_acknowledgement() == self.state_data.seq + 1 {
-                self.state = State::FinWait2;
+                self.set_state(State::FinWait2);
             }
         }
 
@@ -605,7 +600,7 @@ impl TcpStreamControlBlock {
                     "{}[{}]: recv FIN ack, change state to TimeWait",
                     self.addr_pair, self.state
                 );
-                self.state = State::TimeWait;
+                self.set_state(State::TimeWait);
             }
         }
     }
@@ -628,7 +623,7 @@ impl TcpStreamControlBlock {
     fn state_last_ack(&mut self, request: &TcpPacket) {
         if request.get_flags() & TcpFlags::ACK != 0 {
             if request.get_acknowledgement() == self.state_data.seq + 1 {
-                self.state = State::Closed;
+                self.set_state(State::Closed);
                 trace!(
                     "{}[{}]: recv last ACK, change state to Closed",
                     self.addr_pair, self.state
@@ -737,8 +732,8 @@ impl TcpStreamControlBlock {
         self.send_tcp_fin_packet();
 
         match self.state {
-            State::SynRcvd | State::Estab => self.state = State::FinWait1,
-            State::CloseWait => self.state = State::LastAck,
+            State::SynRcvd | State::Estab => self.set_state(State::FinWait1),
+            State::CloseWait => self.set_state(State::LastAck),
             _ => self.close(),
         }
     }
@@ -979,6 +974,8 @@ impl TcpStreamControlBlock {
                 waker.wake();
             }
         }
+
+        self.stats.set_send_queue(self.send_buffer.len());
     }
 
     fn process_payload(&mut self, request: &TcpPacket, packet: &Bytes) {
@@ -1015,6 +1012,7 @@ impl TcpStreamControlBlock {
         }
 
         self.send_tcp_acknowledge_packet();
+        self.stats.set_recv_queue(self.recv_buffer.readable_size());
     }
 
     fn process_fin(&mut self, request: &TcpPacket) {
@@ -1022,9 +1020,9 @@ impl TcpStreamControlBlock {
         self.send_tcp_acknowledge_packet();
 
         match self.state {
-            State::Estab | State::CloseWait => self.state = State::CloseWait,
-            State::FinWait1 | State::Closing => self.state = State::Closing,
-            State::FinWait2 | State::TimeWait => self.state = State::TimeWait,
+            State::Estab | State::CloseWait => self.set_state(State::CloseWait),
+            State::FinWait1 | State::Closing => self.set_state(State::Closing),
+            State::FinWait2 | State::TimeWait => self.set_state(State::TimeWait),
             _ => {
                 error!(
                     "{}[{}]: process fin on error state",

@@ -62,13 +62,21 @@ impl RecvBuffer {
     }
 
     pub(super) fn readable(&self) -> bool {
+        self.readable_size() > 0
+    }
+
+    pub(super) fn readable_size(&self) -> usize {
         if self.ack.is_none() || self.recvd.is_empty() {
-            return false;
+            return 0;
         }
 
         let ack = Seq(self.ack.unwrap());
         let (&k, _) = self.recvd.first_key_value().unwrap();
-        k < ack
+        if k < ack {
+            ack.0.wrapping_sub(k.0) as usize
+        } else {
+            0
+        }
     }
 
     pub(super) fn read(&mut self, buf: &mut [u8]) -> usize {

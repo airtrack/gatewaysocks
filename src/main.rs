@@ -5,12 +5,16 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use atomic_time::AtomicInstant;
-use gatewaysocks::gateway::new_gateway;
+use axum::response::IntoResponse;
+use axum::{Router, routing};
+use gatewaysocks::gateway::{new_gateway, tcp};
 use gatewaysocks::{gateway, socks5};
 use getopts::Options;
 use log::info;
+use tabled::settings::Style;
+use tabled::{Table, Tabled};
 use tokio::io::AsyncReadExt;
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::runtime::Runtime;
 use tokio::time::sleep_until;
 
@@ -116,10 +120,63 @@ async fn gateway_tcp_stream(stream: gateway::TcpStream, socks5: SocketAddr) -> s
     Ok(())
 }
 
-fn gateway_async_main(
+async fn gateway_stats(listen: &str, tcp_stats: tcp::StatsMap) {
+    #[derive(Tabled)]
+    struct SocketEntry {
+        #[tabled(rename = "Proto")]
+        proto: &'static str,
+        #[tabled(rename = "Recv-Q")]
+        recv_queue: usize,
+        #[tabled(rename = "Send-Q")]
+        send_queue: usize,
+        #[tabled(rename = "Local Address")]
+        local_address: SocketAddrV4,
+        #[tabled(rename = "Remote Address")]
+        remote_address: SocketAddrV4,
+        #[tabled(rename = "State")]
+        state: tcp::State,
+    }
+
+    struct StatsState {
+        tcp: tcp::StatsMap,
+    }
+
+    async fn netstat(
+        axum::extract::State(stats): axum::extract::State<Arc<StatsState>>,
+    ) -> impl IntoResponse {
+        let mut entries = Vec::new();
+
+        stats.tcp.for_each(|k, v| {
+            let entry = SocketEntry {
+                proto: "tcp4",
+                recv_queue: v.get_recv_queue(),
+                send_queue: v.get_send_queue(),
+                local_address: k.0,
+                remote_address: k.1,
+                state: v.get_state(),
+            };
+            entries.push(entry);
+        });
+
+        let mut table = Table::new(entries);
+        table.with(Style::empty());
+        table.to_string()
+    }
+
+    let stats_state = Arc::new(StatsState { tcp: tcp_stats });
+    let app = Router::new()
+        .route("/netstat", routing::get(netstat))
+        .with_state(stats_state);
+
+    let listener = TcpListener::bind(listen).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}
+
+async fn gateway_serve(
+    stats: &str,
+    iface_name: &str,
     gateway: Ipv4Addr,
     subnet_mask: Ipv4Addr,
-    iface_name: &str,
     socks5: SocketAddr,
 ) {
     info!(
@@ -127,31 +184,30 @@ fn gateway_async_main(
         iface_name, gateway, subnet_mask, socks5
     );
 
-    let rt = Runtime::new().unwrap();
-    rt.block_on(async move {
-        let (mut udp_binder, mut tcp_listener) =
-            new_gateway(gateway, subnet_mask, iface_name).unwrap();
-        let fut_udp = async {
-            loop {
-                let socket = udp_binder.accept().await.unwrap();
-                info!("UDP socket going out: {}", socket.local_addr());
-                tokio::spawn(gateway_udp_socket(socket, socks5));
-            }
-        };
-        let fut_tcp = async {
-            loop {
-                let stream = tcp_listener.accept().await.unwrap();
-                info!(
-                    "TCP stream going out: {} -> {}",
-                    stream.local_addr(),
-                    stream.remote_addr()
-                );
-                tokio::spawn(gateway_tcp_stream(stream, socks5));
-            }
-        };
+    let (mut udp, mut tcp) = new_gateway(gateway, subnet_mask, iface_name).unwrap();
+    let tcp_stats = tcp.get_stats();
 
-        futures::join!(fut_udp, fut_tcp);
-    });
+    let fut_udp = async {
+        loop {
+            let socket = udp.accept().await.unwrap();
+            info!("UDP socket going out: {}", socket.local_addr());
+            tokio::spawn(gateway_udp_socket(socket, socks5));
+        }
+    };
+    let fut_tcp = async {
+        loop {
+            let stream = tcp.accept().await.unwrap();
+            info!(
+                "TCP stream going out: {} -> {}",
+                stream.local_addr(),
+                stream.remote_addr()
+            );
+            tokio::spawn(gateway_tcp_stream(stream, socks5));
+        }
+    };
+    let fut_stats = gateway_stats(stats, tcp_stats);
+
+    futures::join!(fut_udp, fut_tcp, fut_stats);
 }
 
 fn main() {
@@ -162,7 +218,7 @@ fn main() {
     opts.optopt("s", "socks5", "socks5 address", "socks5");
     opts.optopt("", "gateway-ip", "gateway ip", "gateway");
     opts.optopt("", "subnet-mask", "subnet mask", "subnet");
-    opts.optopt("", "prometheus", "prometheus exporter", "prometheus");
+    opts.optopt("", "stats", "query statistics", "ip:port");
 
     let matches = match opts.parse(&args[1..]) {
         Ok(m) => m,
@@ -177,6 +233,9 @@ fn main() {
     let subnet_addr = matches
         .opt_str("subnet-mask")
         .unwrap_or("255.255.255.0".to_string());
+    let stats = matches
+        .opt_str("stats")
+        .unwrap_or("127.0.0.1:3080".to_string());
 
     env_logger::builder()
         .filter_level(log::LevelFilter::Info)
@@ -187,5 +246,8 @@ fn main() {
     let gateway = gateway_addr.parse::<Ipv4Addr>().unwrap();
     let subnet_mask = subnet_addr.parse::<Ipv4Addr>().unwrap();
 
-    gateway_async_main(gateway, subnet_mask, &iface_name, socks5);
+    let rt = Runtime::new().unwrap();
+    rt.block_on(async move {
+        gateway_serve(&stats, &iface_name, gateway, subnet_mask, socks5).await;
+    });
 }

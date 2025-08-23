@@ -86,6 +86,10 @@ impl SendBuffer {
         self.in_flight_bytes
     }
 
+    pub(super) fn len(&self) -> usize {
+        self.in_flight_bytes + self.pending_bytes
+    }
+
     pub(super) fn set_fin(&mut self) {
         self.fin = true;
     }
