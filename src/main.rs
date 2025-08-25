@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use atomic_time::AtomicInstant;
 use axum::response::IntoResponse;
 use axum::{Router, routing};
-use gatewaysocks::gateway::{new_gateway, tcp};
+use gatewaysocks::gateway::{new_gateway, tcp, udp};
 use gatewaysocks::{gateway, socks5};
 use getopts::Options;
 use log::info;
@@ -120,7 +120,7 @@ async fn gateway_tcp_stream(stream: gateway::TcpStream, socks5: SocketAddr) -> s
     Ok(())
 }
 
-async fn gateway_stats(listen: &str, tcp_stats: tcp::StatsMap) {
+async fn gateway_stats(listen: &str, tcp_stats: tcp::StatsMap, udp_stats: udp::StatsSet) {
     #[derive(Tabled)]
     struct SocketEntry {
         #[tabled(rename = "Proto")]
@@ -134,11 +134,12 @@ async fn gateway_stats(listen: &str, tcp_stats: tcp::StatsMap) {
         #[tabled(rename = "Remote Address")]
         remote_address: SocketAddrV4,
         #[tabled(rename = "State")]
-        state: tcp::State,
+        state: String,
     }
 
     struct StatsState {
         tcp: tcp::StatsMap,
+        udp: udp::StatsSet,
     }
 
     async fn netstat(
@@ -153,7 +154,19 @@ async fn gateway_stats(listen: &str, tcp_stats: tcp::StatsMap) {
                 send_queue: v.get_send_queue(),
                 local_address: k.0,
                 remote_address: k.1,
-                state: v.get_state(),
+                state: v.get_state().to_string(),
+            };
+            entries.push(entry);
+        });
+
+        stats.udp.for_each(|k| {
+            let entry = SocketEntry {
+                proto: "udp4",
+                recv_queue: 0,
+                send_queue: 0,
+                local_address: *k,
+                remote_address: SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
+                state: "".to_string(),
             };
             entries.push(entry);
         });
@@ -163,7 +176,11 @@ async fn gateway_stats(listen: &str, tcp_stats: tcp::StatsMap) {
         table.to_string()
     }
 
-    let stats_state = Arc::new(StatsState { tcp: tcp_stats });
+    let stats_state = Arc::new(StatsState {
+        tcp: tcp_stats,
+        udp: udp_stats,
+    });
+
     let app = Router::new()
         .route("/netstat", routing::get(netstat))
         .with_state(stats_state);
@@ -185,6 +202,7 @@ async fn gateway_serve(
     );
 
     let (mut udp, mut tcp) = new_gateway(gateway, subnet_mask, iface_name).unwrap();
+    let udp_stats = udp.get_stats();
     let tcp_stats = tcp.get_stats();
 
     let fut_udp = async {
@@ -205,7 +223,7 @@ async fn gateway_serve(
             tokio::spawn(gateway_tcp_stream(stream, socks5));
         }
     };
-    let fut_stats = gateway_stats(stats, tcp_stats);
+    let fut_stats = gateway_stats(stats, tcp_stats, udp_stats);
 
     futures::join!(fut_udp, fut_tcp, fut_stats);
 }

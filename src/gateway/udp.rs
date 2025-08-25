@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::net::SocketAddrV4;
+use std::sync::Arc;
 
 use bytes::Bytes;
+use dashmap::DashSet;
 use log::trace;
 use pnet::packet::ethernet::{EtherTypes, EthernetPacket, MutableEthernetPacket};
 use pnet::packet::ip::IpNextHeaderProtocols;
@@ -22,16 +24,20 @@ pub(super) fn new_udp(
     gw_sender: GatewaySender,
 ) -> (UdpHandler, UdpBinder) {
     let (new_socket, sockets) = unbounded_channel();
-    let (close_socket, close_sockets) = unbounded_channel();
+    let (socket_closer, closed_socket) = unbounded_channel();
     let handler = UdpHandler {
         channel,
         gw_sender,
         new_socket,
-        close_socket,
-        close_sockets,
+        socket_closer,
+        closed_socket,
         sockets: HashMap::new(),
+        stats: StatsSet::new(),
     };
-    let binder = UdpBinder { sockets };
+    let binder = UdpBinder {
+        stats: handler.stats.clone(),
+        sockets,
+    };
     (handler, binder)
 }
 
@@ -39,9 +45,10 @@ pub struct UdpHandler {
     channel: UnboundedReceiver<Bytes>,
     gw_sender: GatewaySender,
     new_socket: UnboundedSender<UdpSocket>,
-    close_socket: UnboundedSender<SocketAddrV4>,
-    close_sockets: UnboundedReceiver<SocketAddrV4>,
+    socket_closer: UnboundedSender<SocketAddrV4>,
+    closed_socket: UnboundedReceiver<SocketAddrV4>,
     sockets: HashMap<SocketAddrV4, UdpSocketInner>,
+    stats: StatsSet,
 }
 
 impl UdpHandler {
@@ -54,7 +61,7 @@ impl UdpHandler {
     async fn handle_loop(&mut self) {
         loop {
             tokio::select! {
-                Some(addr) = self.close_sockets.recv() => {
+                Some(addr) = self.closed_socket.recv() => {
                     self.remove_socket(addr);
                 }
                 Some(packet) = self.channel.recv() => {
@@ -66,6 +73,7 @@ impl UdpHandler {
 
     fn remove_socket(&mut self, addr: SocketAddrV4) {
         self.sockets.remove(&addr);
+        self.stats.set.remove(&addr);
     }
 
     fn handle_packet(&mut self, packet: Bytes) -> Option<()> {
@@ -86,7 +94,7 @@ impl UdpHandler {
                     bind_addr: src,
                     gw_sender: self.gw_sender.clone(),
                     packets: Mutex::new(packets_rx),
-                    close_socket: self.close_socket.clone(),
+                    socket_closer: self.socket_closer.clone(),
                 };
                 let inner = UdpSocketInner {
                     packets: packets_tx,
@@ -94,6 +102,7 @@ impl UdpHandler {
 
                 inner.try_input_packet(data, dst).ok()?;
                 self.sockets.insert(src, inner);
+                self.stats.set.insert(src);
                 self.new_socket.send(socket).ok()?;
             }
         }
@@ -102,7 +111,28 @@ impl UdpHandler {
     }
 }
 
+#[derive(Clone, Default)]
+pub struct StatsSet {
+    set: Arc<DashSet<SocketAddrV4>>,
+}
+
+impl StatsSet {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn for_each<F>(&self, mut f: F)
+    where
+        F: FnMut(&SocketAddrV4),
+    {
+        for item in self.set.iter() {
+            f(item.key());
+        }
+    }
+}
+
 pub struct UdpBinder {
+    stats: StatsSet,
     sockets: UnboundedReceiver<UdpSocket>,
 }
 
@@ -113,6 +143,10 @@ impl UdpBinder {
             "UDP handler broken",
         ))
     }
+
+    pub fn get_stats(&self) -> StatsSet {
+        self.stats.clone()
+    }
 }
 
 pub struct UdpSocket {
@@ -120,12 +154,12 @@ pub struct UdpSocket {
     bind_addr: SocketAddrV4,
     gw_sender: GatewaySender,
     packets: Mutex<Receiver<(Bytes, SocketAddrV4)>>,
-    close_socket: UnboundedSender<SocketAddrV4>,
+    socket_closer: UnboundedSender<SocketAddrV4>,
 }
 
 impl Drop for UdpSocket {
     fn drop(&mut self) {
-        self.close_socket.send(self.bind_addr).ok();
+        self.socket_closer.send(self.bind_addr).ok();
     }
 }
 
