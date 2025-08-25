@@ -287,7 +287,9 @@ impl TcpStreamControlBlock {
             return std::task::Poll::Ready(());
         }
 
-        if self.driver_waker.is_none() {
+        if let Some(ref mut waker) = self.driver_waker {
+            waker.clone_from(cx.waker());
+        } else {
             self.driver_waker = Some(cx.waker().clone());
         }
 
