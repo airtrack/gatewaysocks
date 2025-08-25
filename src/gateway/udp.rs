@@ -19,12 +19,13 @@ use tokio::sync::mpsc::{
 
 use crate::gateway::GatewaySender;
 
-pub(super) fn new_udp(
+pub(super) fn new(
     channel: UnboundedReceiver<Bytes>,
     gw_sender: GatewaySender,
 ) -> (UdpHandler, UdpBinder) {
     let (new_socket, sockets) = unbounded_channel();
     let (socket_closer, closed_socket) = unbounded_channel();
+
     let handler = UdpHandler {
         channel,
         gw_sender,
@@ -34,14 +35,16 @@ pub(super) fn new_udp(
         sockets: HashMap::new(),
         stats: StatsSet::new(),
     };
+
     let binder = UdpBinder {
         stats: handler.stats.clone(),
         sockets,
     };
+
     (handler, binder)
 }
 
-pub struct UdpHandler {
+pub(super) struct UdpHandler {
     channel: UnboundedReceiver<Bytes>,
     gw_sender: GatewaySender,
     new_socket: UnboundedSender<UdpSocket>,
@@ -52,7 +55,7 @@ pub struct UdpHandler {
 }
 
 impl UdpHandler {
-    pub fn start(mut self) {
+    pub(super) fn start(mut self) {
         tokio::spawn(async move {
             self.handle_loop().await;
         });
@@ -80,22 +83,26 @@ impl UdpHandler {
         let ethernet_packet = EthernetPacket::new(&packet)?;
         let ipv4_packet = Ipv4Packet::new(ethernet_packet.payload())?;
         let udp_packet = UdpPacket::new(ipv4_packet.payload())?;
+
         let mac = ethernet_packet.get_source();
         let src = SocketAddrV4::new(ipv4_packet.get_source(), udp_packet.get_source());
         let dst = SocketAddrV4::new(ipv4_packet.get_destination(), udp_packet.get_destination());
+
         let data = packet.slice_ref(udp_packet.payload());
 
         match self.sockets.get(&src) {
             Some(inner) => inner.try_input_packet(data, dst).ok()?,
             None => {
                 let (packets_tx, packets_rx) = channel(32);
+
                 let socket = UdpSocket {
-                    bind_mac: mac,
-                    bind_addr: src,
+                    source_mac: mac,
+                    source_addr: src,
                     gw_sender: self.gw_sender.clone(),
                     packets: Mutex::new(packets_rx),
                     socket_closer: self.socket_closer.clone(),
                 };
+
                 let inner = UdpSocketInner {
                     packets: packets_tx,
                 };
@@ -150,8 +157,8 @@ impl UdpBinder {
 }
 
 pub struct UdpSocket {
-    bind_mac: MacAddr,
-    bind_addr: SocketAddrV4,
+    source_mac: MacAddr,
+    source_addr: SocketAddrV4,
     gw_sender: GatewaySender,
     packets: Mutex<Receiver<(Bytes, SocketAddrV4)>>,
     socket_closer: UnboundedSender<SocketAddrV4>,
@@ -159,7 +166,7 @@ pub struct UdpSocket {
 
 impl Drop for UdpSocket {
     fn drop(&mut self) {
-        self.socket_closer.send(self.bind_addr).ok();
+        self.socket_closer.send(self.source_addr).ok();
     }
 }
 
@@ -171,7 +178,7 @@ impl UdpSocket {
             "socket has been closed",
         ))?;
 
-        trace!("{} send data({}) to {}", self.bind_addr, data.len(), dst);
+        trace!("{} send data({}) to {}", self.source_addr, data.len(), dst);
 
         let size = data.len().min(buf.len());
         buf[..size].copy_from_slice(&data[..size]);
@@ -179,7 +186,12 @@ impl UdpSocket {
     }
 
     pub fn try_send(&self, buf: &[u8], from: SocketAddrV4) -> std::io::Result<()> {
-        trace!("{} recv data({}) from {}", self.bind_addr, buf.len(), from);
+        trace!(
+            "{} recv data({}) from {}",
+            self.source_addr,
+            buf.len(),
+            from
+        );
 
         let udp_packet_len = 8 + buf.len();
         let ipv4_packet_len = 20 + udp_packet_len;
@@ -188,7 +200,7 @@ impl UdpSocket {
         self.gw_sender
             .build_and_send(1, ethernet_packet_len, &mut |buffer| {
                 let mut ethernet_packet = MutableEthernetPacket::new(buffer).unwrap();
-                ethernet_packet.set_destination(self.bind_mac);
+                ethernet_packet.set_destination(self.source_mac);
                 ethernet_packet.set_source(self.gw_sender.info.mac);
                 ethernet_packet.set_ethertype(EtherTypes::Ipv4);
 
@@ -206,18 +218,18 @@ impl UdpSocket {
                 ipv4_packet.set_next_level_protocol(IpNextHeaderProtocols::Udp);
                 ipv4_packet.set_checksum(0);
                 ipv4_packet.set_source(*from.ip());
-                ipv4_packet.set_destination(*self.bind_addr.ip());
+                ipv4_packet.set_destination(*self.source_addr.ip());
 
                 let mut udp_packet = MutableUdpPacket::new(ipv4_packet.payload_mut()).unwrap();
                 udp_packet.set_source(from.port());
-                udp_packet.set_destination(self.bind_addr.port());
+                udp_packet.set_destination(self.source_addr.port());
                 udp_packet.set_length(udp_packet_len as u16);
                 udp_packet.set_checksum(0);
                 udp_packet.set_payload(buf);
                 udp_packet.set_checksum(udp::ipv4_checksum(
                     &udp_packet.to_immutable(),
                     from.ip(),
-                    self.bind_addr.ip(),
+                    self.source_addr.ip(),
                 ));
 
                 ipv4_packet.set_checksum(ipv4::checksum(&ipv4_packet.to_immutable()));
@@ -226,8 +238,8 @@ impl UdpSocket {
         Ok(())
     }
 
-    pub fn local_addr(&self) -> SocketAddrV4 {
-        self.bind_addr
+    pub fn source_addr(&self) -> SocketAddrV4 {
+        self.source_addr
     }
 }
 

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use atomic_time::AtomicInstant;
 use axum::response::IntoResponse;
 use axum::{Router, routing};
-use gatewaysocks::gateway::{new_gateway, tcp, udp};
+use gatewaysocks::gateway::{tcp, udp};
 use gatewaysocks::{gateway, socks5};
 use getopts::Options;
 use log::info;
@@ -104,7 +104,7 @@ async fn gateway_udp_socket(socket: gateway::UdpSocket, socks5: SocketAddr) -> s
 
 async fn gateway_tcp_stream(stream: gateway::TcpStream, socks5: SocketAddr) -> std::io::Result<()> {
     let mut handshaker = socks5::Handshaker::new(socks5).await?;
-    handshaker.connect(stream.remote_addr()).await?;
+    handshaker.connect(stream.destination_addr()).await?;
 
     let mut stream = stream;
     let (mut reader, mut writer) = stream.split();
@@ -129,12 +129,12 @@ async fn gateway_stats(listen: &str, tcp_stats: tcp::StatsMap, udp_stats: udp::S
         recv_queue: usize,
         #[tabled(rename = "Send-Q")]
         send_queue: usize,
-        #[tabled(rename = "Local Address")]
-        local_address: SocketAddrV4,
-        #[tabled(rename = "Remote Address")]
-        remote_address: SocketAddrV4,
+        #[tabled(rename = "Source Address")]
+        source: SocketAddrV4,
+        #[tabled(rename = "Destination Address")]
+        destination: SocketAddrV4,
         #[tabled(rename = "State")]
-        state: String,
+        state: &'static str,
     }
 
     struct StatsState {
@@ -152,9 +152,9 @@ async fn gateway_stats(listen: &str, tcp_stats: tcp::StatsMap, udp_stats: udp::S
                 proto: "tcp4",
                 recv_queue: v.get_recv_queue(),
                 send_queue: v.get_send_queue(),
-                local_address: k.0,
-                remote_address: k.1,
-                state: v.get_state().to_string(),
+                source: k.source,
+                destination: k.destination,
+                state: v.get_state().to_str(),
             };
             entries.push(entry);
         });
@@ -164,9 +164,9 @@ async fn gateway_stats(listen: &str, tcp_stats: tcp::StatsMap, udp_stats: udp::S
                 proto: "udp4",
                 recv_queue: 0,
                 send_queue: 0,
-                local_address: *k,
-                remote_address: SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
-                state: "".to_string(),
+                source: *k,
+                destination: SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
+                state: "",
             };
             entries.push(entry);
         });
@@ -201,14 +201,14 @@ async fn gateway_serve(
         iface_name, gateway, subnet_mask, socks5
     );
 
-    let (mut udp, mut tcp) = new_gateway(gateway, subnet_mask, iface_name).unwrap();
+    let (mut udp, mut tcp) = gateway::new(gateway, subnet_mask, iface_name).unwrap();
     let udp_stats = udp.get_stats();
     let tcp_stats = tcp.get_stats();
 
     let fut_udp = async {
         loop {
             let socket = udp.accept().await.unwrap();
-            info!("UDP socket going out: {}", socket.local_addr());
+            info!("UDP socket going out: {}", socket.source_addr());
             tokio::spawn(gateway_udp_socket(socket, socks5));
         }
     };
@@ -217,8 +217,8 @@ async fn gateway_serve(
             let stream = tcp.accept().await.unwrap();
             info!(
                 "TCP stream going out: {} -> {}",
-                stream.local_addr(),
-                stream.remote_addr()
+                stream.source_addr(),
+                stream.destination_addr()
             );
             tokio::spawn(gateway_tcp_stream(stream, socks5));
         }

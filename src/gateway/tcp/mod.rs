@@ -31,6 +31,31 @@ pub use stats::StreamStats;
 pub use types::AddrPair;
 pub use types::State;
 
+pub(super) fn new(
+    channel: UnboundedReceiver<Bytes>,
+    gw_sender: GatewaySender,
+) -> (TcpHandler, TcpListener) {
+    let (stream_starter, stream_receiver) = stream_starter();
+    let (stream_closer, closed_stream) = stream_closer();
+
+    let handler = TcpHandler {
+        channel,
+        gw_sender,
+        stream_starter,
+        stream_closer,
+        closed_stream,
+        stats: StatsMap::new(),
+        streams: HashMap::new(),
+    };
+
+    let listener = TcpListener {
+        stats: handler.stats.clone(),
+        stream_receiver,
+    };
+
+    (handler, listener)
+}
+
 struct StreamStarter(UnboundedSender<TcpStream>);
 
 impl StreamStarter {
@@ -79,29 +104,7 @@ fn stream_closer() -> (StreamCloser, ClosedStream) {
     (StreamCloser(send), ClosedStream(recv))
 }
 
-pub(super) fn new_tcp(
-    channel: UnboundedReceiver<Bytes>,
-    gw_sender: GatewaySender,
-) -> (TcpHandler, TcpListener) {
-    let (stream_starter, stream_receiver) = stream_starter();
-    let (stream_closer, closed_stream) = stream_closer();
-    let handler = TcpHandler {
-        channel,
-        gw_sender,
-        stream_starter,
-        stream_closer,
-        closed_stream,
-        stats: StatsMap::new(),
-        streams: HashMap::new(),
-    };
-    let listener = TcpListener {
-        stats: handler.stats.clone(),
-        stream_receiver,
-    };
-    (handler, listener)
-}
-
-pub struct TcpHandler {
+pub(super) struct TcpHandler {
     channel: UnboundedReceiver<Bytes>,
     gw_sender: GatewaySender,
     stream_starter: StreamStarter,
@@ -112,7 +115,7 @@ pub struct TcpHandler {
 }
 
 impl TcpHandler {
-    pub fn start(mut self) {
+    pub(super) fn start(mut self) {
         tokio::spawn(async move {
             self.handle_loop().await;
         });
@@ -140,10 +143,15 @@ impl TcpHandler {
         let ethernet_packet = EthernetPacket::new(&packet)?;
         let ipv4_packet = Ipv4Packet::new(ethernet_packet.payload())?;
         let tcp_request = TcpPacket::new(ipv4_packet.payload())?;
+
         let mac = ethernet_packet.get_source();
         let src = SocketAddrV4::new(ipv4_packet.get_source(), tcp_request.get_source());
         let dst = SocketAddrV4::new(ipv4_packet.get_destination(), tcp_request.get_destination());
-        let pair = AddrPair(src, dst);
+
+        let pair = AddrPair {
+            source: src,
+            destination: dst,
+        };
         let data = packet.slice_ref(ipv4_packet.payload());
 
         match self.streams.get(&pair) {
@@ -154,6 +162,7 @@ impl TcpHandler {
                     let stream_closer = self.stream_closer.clone();
                     let gw_sender = self.gw_sender.clone();
                     let stats = StreamStats::new();
+
                     let inner = Arc::new(TcpStreamInner::new(
                         mac,
                         pair,
@@ -161,10 +170,12 @@ impl TcpHandler {
                         gw_sender,
                         stats.clone(),
                     ));
+
                     let driver = TcpStreamDriver {
                         packets: packets_rx,
                         inner: inner.clone(),
                     };
+
                     let stream = TcpStream { inner };
 
                     packets_tx.try_send(data).ok()?;
@@ -206,12 +217,12 @@ impl Drop for TcpStream {
 }
 
 impl TcpStream {
-    pub fn local_addr(&self) -> SocketAddr {
-        SocketAddr::V4(self.inner.local_addr())
+    pub fn source_addr(&self) -> SocketAddr {
+        SocketAddr::V4(self.inner.source_addr())
     }
 
-    pub fn remote_addr(&self) -> SocketAddr {
-        SocketAddr::V4(self.inner.remote_addr())
+    pub fn destination_addr(&self) -> SocketAddr {
+        SocketAddr::V4(self.inner.destination_addr())
     }
 
     pub fn split<'a>(&'a mut self) -> (ReadHalf<'a>, WriteHalf<'a>) {

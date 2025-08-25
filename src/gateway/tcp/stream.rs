@@ -62,12 +62,12 @@ impl TcpStreamInner {
         }
     }
 
-    pub(super) fn local_addr(&self) -> SocketAddrV4 {
-        self.cb.lock().unwrap().addr_pair.0
+    pub(super) fn source_addr(&self) -> SocketAddrV4 {
+        self.cb.lock().unwrap().addr_pair.source
     }
 
-    pub(super) fn remote_addr(&self) -> SocketAddrV4 {
-        self.cb.lock().unwrap().addr_pair.1
+    pub(super) fn destination_addr(&self) -> SocketAddrV4 {
+        self.cb.lock().unwrap().addr_pair.destination
     }
 
     pub(super) fn close(&self) {
@@ -889,12 +889,12 @@ impl TcpStreamControlBlock {
                 ipv4_packet.set_ttl(64);
                 ipv4_packet.set_next_level_protocol(IpNextHeaderProtocols::Tcp);
                 ipv4_packet.set_checksum(0);
-                ipv4_packet.set_source(*self.addr_pair.1.ip());
-                ipv4_packet.set_destination(*self.addr_pair.0.ip());
+                ipv4_packet.set_source(*self.addr_pair.destination.ip());
+                ipv4_packet.set_destination(*self.addr_pair.source.ip());
 
                 let mut tcp_packet = MutableTcpPacket::new(ipv4_packet.payload_mut()).unwrap();
-                tcp_packet.set_source(self.addr_pair.1.port());
-                tcp_packet.set_destination(self.addr_pair.0.port());
+                tcp_packet.set_source(self.addr_pair.destination.port());
+                tcp_packet.set_destination(self.addr_pair.source.port());
                 tcp_packet.set_sequence(seq);
                 tcp_packet.set_acknowledgement(self.state_data.ack);
                 tcp_packet.set_data_offset(((20 + opts_size) / 4) as u8);
@@ -908,8 +908,8 @@ impl TcpStreamControlBlock {
                 tcp_packet.set_payload(payload);
                 tcp_packet.set_checksum(tcp::ipv4_checksum(
                     &tcp_packet.to_immutable(),
-                    self.addr_pair.1.ip(),
-                    self.addr_pair.0.ip(),
+                    self.addr_pair.destination.ip(),
+                    self.addr_pair.source.ip(),
                 ));
 
                 ipv4_packet.set_checksum(ipv4::checksum(&ipv4_packet.to_immutable()));

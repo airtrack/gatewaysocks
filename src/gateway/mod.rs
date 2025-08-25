@@ -20,7 +20,7 @@ mod arp;
 pub mod tcp;
 pub mod udp;
 
-pub fn new_gateway(
+pub fn new(
     addr: Ipv4Addr,
     mask: Ipv4Addr,
     iface_name: &str,
@@ -76,8 +76,8 @@ pub fn new_gateway(
     };
 
     let arp_handler = arp::new_arp(arp_rx, gw_sender.clone());
-    let (udp_handler, udp_binder) = udp::new_udp(udp_rx, gw_sender.clone());
-    let (tcp_handler, tcp_listener) = tcp::new_tcp(tcp_rx, gw_sender);
+    let (udp_handler, udp_binder) = udp::new(udp_rx, gw_sender.clone());
+    let (tcp_handler, tcp_listener) = tcp::new(tcp_rx, gw_sender);
 
     gw_receiver.start();
     arp_handler.start();
