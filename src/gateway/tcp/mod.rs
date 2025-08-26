@@ -224,56 +224,25 @@ impl TcpStream {
     pub fn destination_addr(&self) -> SocketAddr {
         SocketAddr::V4(self.inner.destination_addr())
     }
+}
 
-    pub fn split<'a>(&'a mut self) -> (ReadHalf<'a>, WriteHalf<'a>) {
-        (ReadHalf(&*self), WriteHalf(&*self))
-    }
-
+impl AsyncRead for TcpStream {
     fn poll_read(
-        &self,
+        self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         self.inner.poll_read(cx, buf)
     }
+}
 
+impl AsyncWrite for TcpStream {
     fn poll_write(
-        &self,
+        self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<Result<usize, std::io::Error>> {
         self.inner.poll_write(cx, buf)
-    }
-
-    fn poll_shutdown(
-        &self,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), std::io::Error>> {
-        self.inner.poll_shutdown(cx)
-    }
-}
-
-pub struct ReadHalf<'a>(&'a TcpStream);
-
-pub struct WriteHalf<'a>(&'a TcpStream);
-
-impl AsyncRead for ReadHalf<'_> {
-    fn poll_read(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        self.0.poll_read(cx, buf)
-    }
-}
-
-impl AsyncWrite for WriteHalf<'_> {
-    fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<Result<usize, std::io::Error>> {
-        self.0.poll_write(cx, buf)
     }
 
     fn poll_flush(
@@ -287,7 +256,7 @@ impl AsyncWrite for WriteHalf<'_> {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), std::io::Error>> {
-        self.0.poll_shutdown(cx)
+        self.inner.poll_shutdown(cx)
     }
 }
 

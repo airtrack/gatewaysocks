@@ -107,16 +107,9 @@ async fn gateway_tcp_stream(stream: gateway::TcpStream, socks5: SocketAddr) -> s
     handshaker.connect(stream.destination_addr()).await?;
 
     let mut stream = stream;
-    let (mut reader, mut writer) = stream.split();
-
     let mut ostream = handshaker.into_tcp_stream();
-    let (mut oreader, mut owriter) = ostream.split();
 
-    let _ = futures::join!(
-        tokio::io::copy(&mut reader, &mut owriter),
-        tokio::io::copy(&mut oreader, &mut writer),
-    );
-
+    tokio::io::copy_bidirectional(&mut stream, &mut ostream).await?;
     Ok(())
 }
 
