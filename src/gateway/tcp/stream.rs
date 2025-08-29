@@ -4,7 +4,6 @@ use std::pin::Pin;
 use std::sync::Mutex;
 use std::task::Waker;
 use std::time::{Duration, Instant};
-use std::usize;
 
 use bytes::Bytes;
 use log::{error, trace};
@@ -31,7 +30,7 @@ const DEFAULT_RTO: Duration = Duration::from_millis(50);
 const DEFAULT_RTT: Duration = Duration::from_millis(10);
 const GRANULARITY: Duration = Duration::from_millis(1);
 const LOCAL_WINDOW: u32 = 256 * 1024;
-const DEFAULT_MSS: usize = 1400;
+const DEFAULT_MSS: usize = 1500;
 const MAX_TCP_HEADER_LEN: usize = 60;
 const MAX_SEND_BUFFER: usize = 128 * 1024;
 
@@ -220,7 +219,7 @@ impl TcpStreamControlBlock {
     ) -> Self {
         let deadline = Instant::now();
         let congestion = FixBandwidth::new();
-        let pacing = Pacer::new(DEFAULT_RTT, congestion.window(), GRANULARITY);
+        let pacing = Pacer::new(DEFAULT_RTT, congestion.window(), GRANULARITY, DEFAULT_MSS);
         let rtt = RttEstimator::new(DEFAULT_RTT, DEFAULT_RTO, GRANULARITY);
 
         Self {

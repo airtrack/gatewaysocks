@@ -5,17 +5,19 @@ pub(super) struct Pacer {
     granu_bytes: usize,
     token_bytes: usize,
     window: usize,
+    mss: usize,
     srtt: Duration,
     last: Instant,
 }
 
 impl Pacer {
-    pub(super) fn new(srtt: Duration, window: usize, granularity: Duration) -> Self {
+    pub(super) fn new(srtt: Duration, window: usize, granularity: Duration, mss: usize) -> Self {
         let mut pacer = Self {
             granularity,
             granu_bytes: 0,
             token_bytes: 0,
             window,
+            mss,
             srtt,
             last: Instant::now(),
         };
@@ -68,6 +70,7 @@ impl Pacer {
     fn update_granularity(&mut self, srtt: Duration, window: usize) {
         let srtt = srtt.as_secs_f64();
         let unit = self.granularity.as_secs_f64();
-        self.granu_bytes = ((unit * window as f64) / srtt) as usize;
+        let bytes = ((unit * window as f64) / srtt) as usize;
+        self.granu_bytes = bytes.max(self.mss);
     }
 }
