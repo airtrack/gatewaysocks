@@ -14,7 +14,7 @@ pub(super) struct InFlight {
 }
 
 impl InFlight {
-    pub(super) fn new(seq: u32, data: Bytes, now: Instant) -> Self {
+    fn new(seq: u32, data: Bytes, now: Instant) -> Self {
         Self {
             seq,
             data,
@@ -49,13 +49,43 @@ impl InFlight {
     }
 }
 
+pub(super) struct InFlightFin {
+    retry: Cell<u32>,
+    sent: Cell<Instant>,
+}
+
+impl InFlightFin {
+    fn new(now: Instant) -> Self {
+        Self {
+            retry: Cell::new(0),
+            sent: Cell::new(now),
+        }
+    }
+
+    pub(super) fn timeout(&self, rto: Duration) -> Instant {
+        self.sent.get() + rto * 2u32.pow(self.retry.get())
+    }
+
+    pub(super) fn num_of_retries(&self) -> u32 {
+        self.retry.get()
+    }
+
+    pub(super) fn retried_at(&self, t: Instant) {
+        self.sent.set(t);
+        self.retry.set(self.retry.get() + 1);
+    }
+}
+
 pub(super) struct SendBuffer {
     capacity: usize,
     in_flight_bytes: usize,
     pending_bytes: usize,
+
     in_flight: VecDeque<InFlight>,
     pending: VecDeque<Bytes>,
-    fin: bool,
+
+    in_flight_fin: Option<InFlightFin>,
+    pending_fin: bool,
 }
 
 impl SendBuffer {
@@ -66,7 +96,8 @@ impl SendBuffer {
             pending_bytes: 0,
             in_flight: VecDeque::new(),
             pending: VecDeque::new(),
-            fin: false,
+            in_flight_fin: None,
+            pending_fin: false,
         }
     }
 
@@ -78,8 +109,8 @@ impl SendBuffer {
         self.in_flight_bytes + self.pending_bytes >= self.capacity
     }
 
-    pub(super) fn is_fin(&self) -> bool {
-        self.fin
+    pub(super) fn has_pending_fin(&self) -> bool {
+        self.pending_fin
     }
 
     pub(super) fn in_flight(&self) -> usize {
@@ -90,8 +121,16 @@ impl SendBuffer {
         self.in_flight_bytes + self.pending_bytes
     }
 
-    pub(super) fn set_fin(&mut self) {
-        self.fin = true;
+    pub(super) fn sent_fin(&mut self, now: Instant) {
+        self.in_flight_fin = Some(InFlightFin::new(now));
+    }
+
+    pub(super) fn in_flight_fin(&self) -> Option<&InFlightFin> {
+        self.in_flight_fin.as_ref()
+    }
+
+    pub(super) fn pending_fin(&mut self) {
+        self.pending_fin = true;
     }
 
     pub(super) fn push_pending(&mut self, mut data: Bytes, mss: usize) -> usize {
