@@ -272,30 +272,21 @@ impl TcpStreamControlBlock {
     }
 
     fn poll_state(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
-        match self.state {
-            State::Estab | State::CloseWait => {
-                self.send_packets();
-            }
-            State::FinWait1 | State::Closing | State::LastAck => {
-                if self.resend_fin().is_err() {
-                    self.closer.close(self.addr_pair);
-                    return std::task::Poll::Ready(());
-                }
-            }
+        let close = match self.state {
+            State::Estab | State::CloseWait => self.send_packets().is_err(),
+            State::FinWait1 | State::Closing | State::LastAck => self.resend_fin().is_err(),
             State::FinWait2 => {
                 self.timers.stop(TimerType::Rto);
+                false
             }
-            State::TimeWait => {
-                if self.wait_timewait_timeout() {
-                    self.closer.close(self.addr_pair);
-                    return std::task::Poll::Ready(());
-                }
-            }
-            State::Closed => {
-                self.closer.close(self.addr_pair);
-                return std::task::Poll::Ready(());
-            }
-            _ => {}
+            State::TimeWait => self.wait_timewait_timeout(),
+            State::Closed => true,
+            _ => false,
+        };
+
+        if close {
+            self.closer.close(self.addr_pair);
+            return std::task::Poll::Ready(());
         }
 
         if let Some(ref mut waker) = self.driver_waker {
@@ -304,18 +295,14 @@ impl TcpStreamControlBlock {
             self.driver_waker = Some(cx.waker().clone());
         }
 
-        let deadline = self.timers.next_deadline();
-        if deadline.is_none() {
-            return std::task::Poll::Pending;
-        }
+        if let Some(deadline) = self.timers.next_deadline() {
+            if self.timer.deadline().into_std() != deadline {
+                Sleep::reset(self.timer.as_mut(), deadline.into());
+            }
 
-        let deadline = deadline.unwrap();
-        if self.timer.deadline().into_std() != deadline {
-            Sleep::reset(self.timer.as_mut(), deadline.into());
-        }
-
-        if Future::poll(self.timer.as_mut(), cx).is_ready() {
-            cx.waker().wake_by_ref();
+            if Future::poll(self.timer.as_mut(), cx).is_ready() {
+                cx.waker().wake_by_ref();
+            }
         }
 
         std::task::Poll::Pending
@@ -417,9 +404,11 @@ impl TcpStreamControlBlock {
         }
     }
 
-    fn send_packets(&mut self) {
+    fn send_packets(&mut self) -> std::io::Result<()> {
         let now = Instant::now();
         let rto = self.rtt.rto().max(DEFAULT_RTO);
+
+        self.stream_conn_ok(now, rto)?;
 
         if let Some(until_time) = self.resend_in_flight(now, rto) {
             self.timers.set(TimerType::Pacing, until_time);
@@ -441,6 +430,8 @@ impl TcpStreamControlBlock {
                 }
             }
         }
+
+        Ok(())
     }
 
     fn resend_fin(&mut self) -> std::io::Result<()> {
@@ -679,6 +670,30 @@ impl TcpStreamControlBlock {
         if let Some(waker) = self.write_waker.take() {
             waker.wake();
         }
+    }
+
+    fn stream_conn_ok(&self, now: Instant, rto: Duration) -> std::io::Result<()> {
+        if let Some(in_flight) = self.send_buffer.resend_iter(now, rto).next() {
+            if in_flight.num_of_retries() >= MAX_RETRY_TIMES
+                && self.time.alive_time() + MSL_2 <= now
+            {
+                warn!(
+                    "{}[{}]: data {}:{} has been resent more than {} times",
+                    self.addr_pair,
+                    self.state,
+                    in_flight.seq(),
+                    in_flight.seq().wrapping_add(in_flight.len() as u32),
+                    MAX_RETRY_TIMES
+                );
+
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "data sending timeout",
+                ));
+            }
+        }
+
+        Ok(())
     }
 
     fn resend_in_flight(&mut self, now: Instant, rto: Duration) -> Option<Instant> {

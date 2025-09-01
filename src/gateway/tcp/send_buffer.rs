@@ -23,6 +23,10 @@ impl InFlight {
         }
     }
 
+    fn timeout(&self, rto: Duration) -> Instant {
+        self.sent.get() + rto * 2u32.pow(self.retry.get())
+    }
+
     pub(super) fn seq(&self) -> u32 {
         self.seq
     }
@@ -39,13 +43,13 @@ impl InFlight {
         self.sent.get()
     }
 
+    pub(super) fn num_of_retries(&self) -> u32 {
+        self.retry.get()
+    }
+
     pub(super) fn retried_at(&self, t: Instant) {
         self.sent.set(t);
         self.retry.set(self.retry.get() + 1);
-    }
-
-    fn timeout(&self, rto: Duration) -> Instant {
-        self.sent.get() + rto
     }
 }
 
