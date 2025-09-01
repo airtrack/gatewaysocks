@@ -6,7 +6,7 @@ use std::task::Waker;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use log::{error, trace};
+use log::{error, trace, warn};
 use pnet::packet::ethernet::{EtherTypes, MutableEthernetPacket};
 use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::packet::ipv4::{self, MutableIpv4Packet};
@@ -29,6 +29,7 @@ const MSL_2: Duration = Duration::from_millis(30000);
 const DEFAULT_RTO: Duration = Duration::from_millis(50);
 const DEFAULT_RTT: Duration = Duration::from_millis(10);
 const GRANULARITY: Duration = Duration::from_millis(1);
+const MAX_RETRY_TIMES: u32 = 5;
 const LOCAL_WINDOW: u32 = 256 * 1024;
 const DEFAULT_MSS: usize = 1500;
 const MAX_TCP_HEADER_LEN: usize = 60;
@@ -271,29 +272,36 @@ impl TcpStreamControlBlock {
     }
 
     fn poll_state(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
-        if self.is_closed() {
-            self.closer.close(self.addr_pair);
-            return std::task::Poll::Ready(());
-        }
-
-        if self.is_timewait_timeout() {
-            trace!(
-                "{}[{}]: TimeWait timeout, change state to Closed",
-                self.addr_pair, self.state
-            );
-            self.set_state(State::Closed);
-            self.closer.close(self.addr_pair);
-            return std::task::Poll::Ready(());
+        match self.state {
+            State::Estab | State::CloseWait => {
+                self.send_packets();
+            }
+            State::FinWait1 | State::Closing | State::LastAck => {
+                if self.resend_fin().is_err() {
+                    self.closer.close(self.addr_pair);
+                    return std::task::Poll::Ready(());
+                }
+            }
+            State::FinWait2 => {
+                self.timers.stop(TimerType::Rto);
+            }
+            State::TimeWait => {
+                if self.wait_timewait_timeout() {
+                    self.closer.close(self.addr_pair);
+                    return std::task::Poll::Ready(());
+                }
+            }
+            State::Closed => {
+                self.closer.close(self.addr_pair);
+                return std::task::Poll::Ready(());
+            }
+            _ => {}
         }
 
         if let Some(ref mut waker) = self.driver_waker {
             waker.clone_from(cx.waker());
         } else {
             self.driver_waker = Some(cx.waker().clone());
-        }
-
-        if self.state == State::Estab || self.state == State::CloseWait {
-            self.send_packets();
         }
 
         let deadline = self.timers.next_deadline();
@@ -385,12 +393,12 @@ impl TcpStreamControlBlock {
 
         if self.send_buffer.is_empty() {
             self.send_fin();
+            self.send_buffer.sent_fin(Instant::now());
+            self.driver_waker.as_ref().map(|waker| waker.wake_by_ref());
             std::task::Poll::Ready(Ok(()))
         } else {
-            if !self.shutdown {
-                self.shutdown = true;
-                self.send_buffer.set_fin();
-            }
+            self.shutdown = true;
+            self.send_buffer.pending_fin();
             self.write_waker = Some(cx.waker().clone());
             std::task::Poll::Pending
         }
@@ -407,21 +415,6 @@ impl TcpStreamControlBlock {
             self.state_closed();
             self.driver_waker.as_ref().map(|waker| waker.wake_by_ref());
         }
-    }
-
-    fn is_closed(&self) -> bool {
-        self.state == State::Closed
-    }
-
-    fn is_timewait_timeout(&mut self) -> bool {
-        if self.state != State::TimeWait {
-            return false;
-        }
-
-        let deadline = self.time.alive_time() + MSL_2;
-        self.timers.set(TimerType::TimeWait, deadline);
-
-        Instant::now() >= deadline
     }
 
     fn send_packets(&mut self) {
@@ -442,12 +435,58 @@ impl TcpStreamControlBlock {
         }
 
         if self.send_buffer.is_empty() {
-            if self.send_buffer.is_fin() {
+            if self.send_buffer.has_pending_fin() {
                 if let Some(waker) = self.write_waker.take() {
                     waker.wake();
                 }
             }
         }
+    }
+
+    fn resend_fin(&mut self) -> std::io::Result<()> {
+        let now = Instant::now();
+        let rto = self.rtt.rto().max(DEFAULT_RTO);
+        let fin = self.send_buffer.in_flight_fin().expect("FIN not sent");
+        let mut deadline = fin.timeout(rto);
+
+        if deadline <= now {
+            if fin.num_of_retries() >= MAX_RETRY_TIMES {
+                warn!(
+                    "{}[{}]: FIN has been resent more than {} times",
+                    self.addr_pair, self.state, MAX_RETRY_TIMES
+                );
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "FIN sending timeout",
+                ));
+            }
+
+            self.send_tcp_fin_packet();
+
+            fin.retried_at(now);
+            deadline = fin.timeout(rto);
+        }
+
+        self.timers.set(TimerType::Rto, deadline);
+        Ok(())
+    }
+
+    fn wait_timewait_timeout(&mut self) -> bool {
+        let deadline = self.time.alive_time() + MSL_2;
+        let timeout = Instant::now() >= deadline;
+
+        if timeout {
+            trace!(
+                "{}[{}]: TimeWait timeout, change state to Closed",
+                self.addr_pair, self.state
+            );
+            self.set_state(State::Closed);
+        } else {
+            self.timers.stop(TimerType::Rto);
+            self.timers.set(TimerType::TimeWait, deadline);
+        }
+
+        timeout
     }
 
     fn set_state(&mut self, state: State) {
