@@ -25,7 +25,8 @@ use crate::gateway::tcp::send_buffer::SendBuffer;
 use crate::gateway::tcp::stats::StreamStats;
 use crate::gateway::tcp::types::{AddrPair, State};
 
-const MSL_2: Duration = Duration::from_millis(30000);
+const MSL_2: Duration = Duration::from_secs(60);
+const FIN_TIMEOUT: Duration = Duration::from_secs(600);
 const DEFAULT_RTO: Duration = Duration::from_millis(50);
 const DEFAULT_RTT: Duration = Duration::from_millis(10);
 const GRANULARITY: Duration = Duration::from_millis(1);
@@ -165,7 +166,6 @@ impl StateData {
 enum TimerType {
     Rto = 0,
     Pacing = 1,
-    TimeWait = 2,
     Count,
 }
 
@@ -273,18 +273,18 @@ impl TcpStreamControlBlock {
 
     fn poll_state(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
         let close = match self.state {
+            State::Listen => unreachable!("cannot poll state while in State::Listen"),
+            State::SynRcvd => self.resend_syn_ack().is_err(),
             State::Estab | State::CloseWait => self.send_packets().is_err(),
             State::FinWait1 | State::Closing | State::LastAck => self.resend_fin().is_err(),
-            State::FinWait2 => {
-                self.timers.stop(TimerType::Rto);
-                false
-            }
+            State::FinWait2 => self.wait_finwait2_timeout(),
             State::TimeWait => self.wait_timewait_timeout(),
             State::Closed => true,
-            _ => false,
         };
 
         if close {
+            self.set_state(State::Closed);
+            self.state_closed();
             self.closer.close(self.addr_pair);
             return std::task::Poll::Ready(());
         }
@@ -404,6 +404,38 @@ impl TcpStreamControlBlock {
         }
     }
 
+    fn resend_syn_ack(&mut self) -> std::io::Result<()> {
+        let now = Instant::now();
+        let rto = self.rtt.rto().max(DEFAULT_RTO);
+        let syn_ack = self
+            .send_buffer
+            .in_flight_syn_ack()
+            .expect("SYN-ACK not sent");
+        let mut deadline = syn_ack.timeout(rto);
+
+        if deadline <= now {
+            if syn_ack.num_of_retries() >= MAX_RETRY_TIMES {
+                warn!(
+                    "{}[{}]: SYN-ACK has been resent more than {} times",
+                    self.addr_pair, self.state, MAX_RETRY_TIMES
+                );
+
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "SYN-ACK sending timeout",
+                ));
+            }
+
+            self.send_tcp_syn_ack_packet();
+
+            syn_ack.retried_at(now);
+            deadline = syn_ack.timeout(rto);
+        }
+
+        self.timers.set(TimerType::Rto, deadline);
+        Ok(())
+    }
+
     fn send_packets(&mut self) -> std::io::Result<()> {
         let now = Instant::now();
         let rto = self.rtt.rto().max(DEFAULT_RTO);
@@ -446,6 +478,7 @@ impl TcpStreamControlBlock {
                     "{}[{}]: FIN has been resent more than {} times",
                     self.addr_pair, self.state, MAX_RETRY_TIMES
                 );
+
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     "FIN sending timeout",
@@ -462,19 +495,30 @@ impl TcpStreamControlBlock {
         Ok(())
     }
 
+    fn wait_finwait2_timeout(&mut self) -> bool {
+        let deadline = self.time.alive_time() + FIN_TIMEOUT;
+        let timeout = Instant::now() >= deadline;
+
+        if timeout {
+            warn!(
+                "{}[{}]: timeout for receiving the peer FIN",
+                self.addr_pair, self.state
+            );
+        } else {
+            self.timers.set(TimerType::Rto, deadline);
+        }
+
+        timeout
+    }
+
     fn wait_timewait_timeout(&mut self) -> bool {
         let deadline = self.time.alive_time() + MSL_2;
         let timeout = Instant::now() >= deadline;
 
         if timeout {
-            trace!(
-                "{}[{}]: TimeWait timeout, change state to Closed",
-                self.addr_pair, self.state
-            );
-            self.set_state(State::Closed);
+            trace!("{}[{}]: TimeWait timeout", self.addr_pair, self.state);
         } else {
-            self.timers.stop(TimerType::Rto);
-            self.timers.set(TimerType::TimeWait, deadline);
+            self.timers.set(TimerType::Rto, deadline);
         }
 
         timeout
@@ -532,6 +576,7 @@ impl TcpStreamControlBlock {
 
             self.send_tcp_syn_ack_packet();
             self.set_state(State::SynRcvd);
+            self.send_buffer.sent_syn_ack(Instant::now());
             trace!(
                 "{}[{}]: change state to SynRcvd",
                 self.addr_pair, self.state

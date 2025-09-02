@@ -53,12 +53,12 @@ impl InFlight {
     }
 }
 
-pub(super) struct InFlightFin {
+pub(super) struct InFlightCtl {
     retry: Cell<u32>,
     sent: Cell<Instant>,
 }
 
-impl InFlightFin {
+impl InFlightCtl {
     fn new(now: Instant) -> Self {
         Self {
             retry: Cell::new(0),
@@ -88,7 +88,8 @@ pub(super) struct SendBuffer {
     in_flight: VecDeque<InFlight>,
     pending: VecDeque<Bytes>,
 
-    in_flight_fin: Option<InFlightFin>,
+    in_flight_syn_ack: Option<InFlightCtl>,
+    in_flight_fin: Option<InFlightCtl>,
     pending_fin: bool,
 }
 
@@ -100,6 +101,7 @@ impl SendBuffer {
             pending_bytes: 0,
             in_flight: VecDeque::new(),
             pending: VecDeque::new(),
+            in_flight_syn_ack: None,
             in_flight_fin: None,
             pending_fin: false,
         }
@@ -125,11 +127,19 @@ impl SendBuffer {
         self.in_flight_bytes + self.pending_bytes
     }
 
-    pub(super) fn sent_fin(&mut self, now: Instant) {
-        self.in_flight_fin = Some(InFlightFin::new(now));
+    pub(super) fn sent_syn_ack(&mut self, now: Instant) {
+        self.in_flight_syn_ack = Some(InFlightCtl::new(now));
     }
 
-    pub(super) fn in_flight_fin(&self) -> Option<&InFlightFin> {
+    pub(super) fn in_flight_syn_ack(&self) -> Option<&InFlightCtl> {
+        self.in_flight_syn_ack.as_ref()
+    }
+
+    pub(super) fn sent_fin(&mut self, now: Instant) {
+        self.in_flight_fin = Some(InFlightCtl::new(now));
+    }
+
+    pub(super) fn in_flight_fin(&self) -> Option<&InFlightCtl> {
         self.in_flight_fin.as_ref()
     }
 
