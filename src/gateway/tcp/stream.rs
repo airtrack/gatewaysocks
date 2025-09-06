@@ -23,6 +23,7 @@ use crate::gateway::tcp::recv_buffer::RecvBuffer;
 use crate::gateway::tcp::rtt::RttEstimator;
 use crate::gateway::tcp::send_buffer::SendBuffer;
 use crate::gateway::tcp::stats::StreamStats;
+use crate::gateway::tcp::time::StreamTime;
 use crate::gateway::tcp::types::{AddrPair, State};
 
 const MSL_2: Duration = Duration::from_secs(60);
@@ -109,33 +110,6 @@ impl TcpStreamInner {
     }
 }
 
-struct StreamTime {
-    init: Instant,
-    alive: Instant,
-}
-
-impl StreamTime {
-    fn new() -> Self {
-        let now = Instant::now();
-        Self {
-            init: now,
-            alive: now,
-        }
-    }
-
-    fn timestamp_millis(&self) -> u32 {
-        (Instant::now() - self.init).as_millis() as u32
-    }
-
-    fn alive_time(&self) -> Instant {
-        self.alive
-    }
-
-    fn update_alive(&mut self) {
-        self.alive = Instant::now();
-    }
-}
-
 struct StateData {
     seq: u32,
     ack: u32,
@@ -218,7 +192,7 @@ impl TcpStreamControlBlock {
         gw_sender: GatewaySender,
         stats: StreamStats,
     ) -> Self {
-        let deadline = Instant::now();
+        let now = Instant::now();
         let congestion = FixBandwidth::new();
         let pacing = Pacer::new(DEFAULT_RTT, congestion.window(), GRANULARITY, DEFAULT_MSS);
         let rtt = RttEstimator::new(DEFAULT_RTT, DEFAULT_RTO, GRANULARITY);
@@ -229,12 +203,12 @@ impl TcpStreamControlBlock {
             addr_pair,
             closer,
             gw_sender,
-            timer: Box::pin(sleep_until(deadline.into())),
+            timer: Box::pin(sleep_until(now.into())),
             timers: TimerTable::default(),
             shutdown: false,
             state: State::Listen,
             pacing: pacing,
-            time: StreamTime::new(),
+            time: StreamTime::new(now),
             rtt: rtt,
             state_data: StateData::new(),
             recv_buffer: RecvBuffer::new(),
@@ -255,7 +229,7 @@ impl TcpStreamControlBlock {
             self.set_state(State::Closed);
         }
 
-        self.time.update_alive();
+        self.time.update_alive(Instant::now());
 
         match self.state {
             State::Listen => self.state_listen(request),
@@ -848,7 +822,7 @@ impl TcpStreamControlBlock {
     }
 
     fn timestamp(&self) -> u32 {
-        self.time.timestamp_millis()
+        self.time.elapsed_millis(Instant::now())
     }
 
     fn add_tcp_option_timestamp(&self, opts: &mut Vec<TcpOption>, opts_size: &mut usize) {

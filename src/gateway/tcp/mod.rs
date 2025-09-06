@@ -24,6 +24,7 @@ mod rtt;
 mod send_buffer;
 mod stats;
 mod stream;
+mod time;
 mod types;
 
 pub use stats::StatsMap;
