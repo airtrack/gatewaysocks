@@ -151,7 +151,7 @@ struct StateData {
 impl StateData {
     fn new() -> Self {
         Self {
-            seq: 0,
+            seq: rand::random(),
             ack: 0,
             local_window: LOCAL_WINDOW,
             remote_window: 0,
