@@ -1,5 +1,11 @@
 use std::{fmt::Display, net::SocketAddrV4};
 
+/// TCP connection state according to the TCP state machine.
+///
+/// Represents all possible states in the TCP connection lifecycle,
+/// from initial listening through established data transfer to
+/// various connection teardown phases. Each state has specific
+/// behavior for handling incoming packets and state transitions.
 #[derive(PartialEq, Eq, Copy, Clone)]
 pub enum State {
     Listen = 0,
@@ -21,6 +27,9 @@ impl Display for State {
 }
 
 impl State {
+    /// Converts an integer value back to a TCP state.
+    ///
+    /// Returns None for invalid values.
     pub(super) fn from_integer(value: usize) -> Option<Self> {
         match value {
             0 => Some(State::Listen),
@@ -37,6 +46,7 @@ impl State {
         }
     }
 
+    /// Returns the string representation of the TCP state.
     pub fn to_str(&self) -> &'static str {
         match self {
             State::Listen => "Listen",
@@ -53,9 +63,19 @@ impl State {
     }
 }
 
+/// Address pair identifying a unique TCP connection.
+///
+/// Combines source and destination socket addresses to create a unique
+/// identifier for TCP connections. Used as a key in connection maps
+/// and for routing packets to the correct stream.
+///
+/// The ordering implementation allows for consistent sorting and
+/// efficient storage in ordered collections.
 #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct AddrPair {
+    /// Source (local) IP address and port
     pub source: SocketAddrV4,
+    /// Destination (remote) IP address and port
     pub destination: SocketAddrV4,
 }
 

@@ -37,10 +37,15 @@ const DEFAULT_MSS: usize = 1500;
 const MAX_TCP_HEADER_LEN: usize = 60;
 const MAX_SEND_BUFFER: usize = 128 * 1024;
 
+/// Checks if a TCP packet has the SYN flag set.
 pub(super) fn is_syn_packet(request: &TcpPacket) -> bool {
     request.get_flags() & TcpFlags::SYN != 0
 }
 
+/// Thread-safe wrapper around the TCP stream control block.
+///
+/// Provides a mutex-protected interface to the TCP connection state
+/// and operations, allowing safe concurrent access from multiple tasks.
 pub(super) struct TcpStreamInner {
     cb: Mutex<TcpStreamControlBlock>,
 }
@@ -110,15 +115,24 @@ impl TcpStreamInner {
     }
 }
 
+/// TCP connection state data including sequence numbers and negotiated options.
 struct StateData {
+    /// Our sequence number (next byte to send)
     seq: u32,
+    /// Acknowledgment number (next byte we expect to receive)
     ack: u32,
+    /// Our advertised receive window size
     local_window: u32,
+    /// Remote peer's advertised window size
     remote_window: u32,
 
+    /// Remote timestamp value for timestamp option
     remote_ts: u32,
+    /// Maximum Segment Size negotiated with peer
     mss: u16,
+    /// Window scale factor negotiated with peer
     wscale: u8,
+    /// Whether Selective Acknowledgment (SACK) is enabled
     sack: bool,
 }
 
@@ -137,12 +151,17 @@ impl StateData {
     }
 }
 
+/// Types of timers used in TCP connection management.
 enum TimerType {
+    /// Retransmission timeout timer
     Rto = 0,
+    /// Pacing timer for congestion control
     Pacing = 1,
+    /// Total count of timer types (used for array sizing)
     Count,
 }
 
+/// Table for managing multiple TCP timers efficiently.
 #[derive(Default)]
 struct TimerTable {
     table: [Option<Instant>; TimerType::Count as usize],
@@ -162,6 +181,10 @@ impl TimerTable {
     }
 }
 
+/// Core TCP stream control block containing all connection state and logic.
+///
+/// This structure manages the complete TCP connection including state machine,
+/// buffers, timers, congestion control, and async task coordination.
 struct TcpStreamControlBlock {
     stats: StreamStats,
     src_mac: MacAddr,
@@ -220,6 +243,10 @@ impl TcpStreamControlBlock {
         }
     }
 
+    /// Processes an incoming TCP packet and updates connection state.
+    ///
+    /// Handles RST packets immediately and then dispatches to appropriate
+    /// state handler based on current TCP state machine state.
     fn handle_tcp_packet(&mut self, request: &TcpPacket, packet: &Bytes) {
         if request.get_flags() & TcpFlags::RST != 0 {
             trace!(
@@ -245,6 +272,11 @@ impl TcpStreamControlBlock {
         }
     }
 
+    /// Drives the TCP connection state machine and handles periodic tasks.
+    ///
+    /// This is the main driver function that handles retransmissions, timeouts,
+    /// and state transitions. Returns std::task::Poll::Ready(()) when the
+    /// connection should be closed.
     fn poll_state(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
         let close = match self.state {
             State::Listen => unreachable!("cannot poll state while in State::Listen"),
@@ -282,6 +314,10 @@ impl TcpStreamControlBlock {
         std::task::Poll::Pending
     }
 
+    /// Attempts to read data from the receive buffer into the provided buffer.
+    ///
+    /// Returns immediately if data is available, otherwise registers a waker
+    /// for notification when data becomes available.
     fn poll_read(
         &mut self,
         cx: &mut std::task::Context<'_>,
@@ -306,6 +342,10 @@ impl TcpStreamControlBlock {
         return std::task::Poll::Ready(Ok(()));
     }
 
+    /// Attempts to write data to the send buffer.
+    ///
+    /// Returns immediately if buffer space is available, otherwise registers
+    /// a waker. Data is segmented according to MSS and queued for transmission.
     fn poll_write(
         &mut self,
         cx: &mut std::task::Context<'_>,
@@ -338,6 +378,10 @@ impl TcpStreamControlBlock {
         std::task::Poll::Ready(Ok(size))
     }
 
+    /// Initiates graceful connection shutdown by sending FIN.
+    ///
+    /// Marks the connection for shutdown and queues a FIN packet to be sent
+    /// after any pending data. Returns Ready when shutdown is complete.
     fn poll_shutdown(
         &mut self,
         cx: &mut std::task::Context<'_>,
@@ -365,6 +409,8 @@ impl TcpStreamControlBlock {
         }
     }
 
+    /// Closes the connection, sending RST if the state is incorrect and
+    /// transitioning to Closed state.
     fn close(&mut self) {
         if self.state != State::Closed
             && self.state != State::TimeWait
@@ -378,6 +424,10 @@ impl TcpStreamControlBlock {
         }
     }
 
+    /// Handles SYN-ACK retransmission in SYN_RCVD state.
+    ///
+    /// Retransmits SYN-ACK packet if timeout has occurred, implements
+    /// exponential backoff, and gives up after maximum retries.
     fn resend_syn_ack(&mut self) -> std::io::Result<()> {
         let now = Instant::now();
         let rto = self.rtt.rto().max(DEFAULT_RTO);
@@ -410,6 +460,10 @@ impl TcpStreamControlBlock {
         Ok(())
     }
 
+    /// Sends pending data packets when conditions allow.
+    ///
+    /// Handles retransmissions of timed-out segments and transmission of
+    /// new pending data, subject to congestion control and flow control.
     fn send_packets(&mut self) -> std::io::Result<()> {
         let now = Instant::now();
         let rto = self.rtt.rto().max(DEFAULT_RTO);
@@ -440,6 +494,10 @@ impl TcpStreamControlBlock {
         Ok(())
     }
 
+    /// Handles FIN packet retransmission during connection teardown.
+    ///
+    /// Retransmits FIN packet if timeout has occurred and gives up
+    /// after maximum retries, transitioning to appropriate state.
     fn resend_fin(&mut self) -> std::io::Result<()> {
         let now = Instant::now();
         let rto = self.rtt.rto().max(DEFAULT_RTO);
@@ -469,6 +527,9 @@ impl TcpStreamControlBlock {
         Ok(())
     }
 
+    /// Waits for timeout in FIN_WAIT2 state to prevent indefinite waiting.
+    ///
+    /// Returns true if timeout has elapsed and connection should be closed.
     fn wait_finwait2_timeout(&mut self) -> bool {
         let deadline = self.time.alive_time() + FIN_TIMEOUT;
         let timeout = Instant::now() >= deadline;
@@ -485,6 +546,9 @@ impl TcpStreamControlBlock {
         timeout
     }
 
+    /// Waits for 2*MSL timeout in TIME_WAIT state before final closure.
+    ///
+    /// Returns true when the TIME_WAIT period has elapsed.
     fn wait_timewait_timeout(&mut self) -> bool {
         let deadline = self.time.alive_time() + MSL_2;
         let timeout = Instant::now() >= deadline;
@@ -503,6 +567,10 @@ impl TcpStreamControlBlock {
         self.stats.set_state(state);
     }
 
+    /// Handles incoming packets in LISTEN state - processes SYN packets to begin connection.
+    ///
+    /// Parses TCP options (MSS, SACK, window scale, timestamps) and sends SYN/ACK response.
+    /// Transitions to SYN_RCVD state when SYN is received.
     fn state_listen(&mut self, request: &TcpPacket) {
         if request.get_flags() & TcpFlags::SYN != 0 {
             trace!(
@@ -558,6 +626,10 @@ impl TcpStreamControlBlock {
         }
     }
 
+    /// Handles packets in SYN_RCVD state - completes three-way handshake.
+    ///
+    /// Retransmits SYN-ACK if another SYN is received. Transitions to ESTABLISHED
+    /// when valid ACK is received, then processes any payload data.
     fn state_syn_rcvd(&mut self, request: &TcpPacket, packet: &Bytes) {
         if request.get_flags() & TcpFlags::SYN != 0 {
             self.send_tcp_syn_ack_packet();
@@ -579,6 +651,10 @@ impl TcpStreamControlBlock {
         }
     }
 
+    /// Handles packets in ESTABLISHED state - normal data transfer operations.
+    ///
+    /// Processes acknowledgments, updates flow control windows, handles data payload,
+    /// and transitions to CLOSE_WAIT if FIN is received.
     fn state_estab(&mut self, request: &TcpPacket, packet: &Bytes) {
         trace!(
             "{}[{}]: recv packet flags: {:b}, seq: {}, payload size: {}",
@@ -605,6 +681,10 @@ impl TcpStreamControlBlock {
         self.process_payload(request, packet);
     }
 
+    /// Handles packets in FIN_WAIT1 state - waiting for FIN acknowledgment.
+    ///
+    /// Processes ACKs and transitions to FIN_WAIT2 when FIN is acknowledged.
+    /// Transitions to CLOSING if FIN is received.
     fn state_fin_wait1(&mut self, request: &TcpPacket, packet: &Bytes) {
         if request.get_flags() & TcpFlags::FIN != 0 {
             if request.get_sequence() == self.state_data.ack {
@@ -625,6 +705,9 @@ impl TcpStreamControlBlock {
         self.process_payload(request, packet);
     }
 
+    /// Handles packets in FIN_WAIT2 state - waiting for remote FIN.
+    ///
+    /// Processes final data segments and transitions to TIME_WAIT when FIN is received.
     fn state_fin_wait2(&mut self, request: &TcpPacket, packet: &Bytes) {
         if request.get_flags() & TcpFlags::FIN != 0 {
             if request.get_sequence() == self.state_data.ack {
@@ -639,6 +722,9 @@ impl TcpStreamControlBlock {
         self.process_payload(request, packet);
     }
 
+    /// Handles packets in CLOSING state - simultaneous close scenario.
+    ///
+    /// Waits for ACK of our FIN and transitions to TIME_WAIT when received.
     fn state_closing(&mut self, request: &TcpPacket) {
         if request.get_flags() & TcpFlags::FIN != 0 {
             return self.process_fin(request);
@@ -655,12 +741,18 @@ impl TcpStreamControlBlock {
         }
     }
 
+    /// Handles packets in TIME_WAIT state - final cleanup phase.
+    ///
+    /// Responds to any retransmitted FINs with ACK to handle network delays.
     fn state_time_wait(&mut self, request: &TcpPacket) {
         if request.get_flags() & TcpFlags::FIN != 0 {
             self.process_fin(request);
         }
     }
 
+    /// Handles packets in CLOSE_WAIT state - remote has closed, local can still send.
+    ///
+    /// Processes acknowledgments for any remaining data being sent.
     fn state_close_wait(&mut self, request: &TcpPacket) {
         self.update_remote_window(request);
         self.process_acknowledgement(request);
@@ -670,6 +762,9 @@ impl TcpStreamControlBlock {
         }
     }
 
+    /// Handles packets in LAST_ACK state - waiting for final ACK after sending FIN.
+    ///
+    /// Transitions to CLOSED when ACK for our FIN is received.
     fn state_last_ack(&mut self, request: &TcpPacket) {
         if request.get_flags() & TcpFlags::ACK != 0 {
             if request.get_acknowledgement() == self.state_data.seq + 1 {
@@ -682,6 +777,9 @@ impl TcpStreamControlBlock {
         }
     }
 
+    /// Handles CLOSED state - connection is terminated.
+    ///
+    /// Cleans up resources and notifies any waiting tasks that connection is closed.
     fn state_closed(&mut self) {
         if let Some(waker) = self.read_waker.take() {
             waker.wake();
@@ -691,6 +789,10 @@ impl TcpStreamControlBlock {
         }
     }
 
+    /// Checks if the connection is healthy and hasn't exceeded retry limits.
+    ///
+    /// Returns error if segments have been retransmitted too many times,
+    /// indicating the connection should be terminated.
     fn stream_conn_ok(&self, now: Instant, rto: Duration) -> std::io::Result<()> {
         if let Some(in_flight) = self.send_buffer.resend_iter(now, rto).next() {
             if in_flight.num_of_retries() >= MAX_RETRY_TIMES
@@ -715,6 +817,9 @@ impl TcpStreamControlBlock {
         Ok(())
     }
 
+    /// Retransmits segments that have timed out based on RTO.
+    ///
+    /// Returns the next time when more data can be sent due to pacing.
     fn resend_in_flight(&mut self, now: Instant, rto: Duration) -> Option<Instant> {
         let mut until_time = None;
         let mut latest_loss_sent = None;
@@ -760,6 +865,10 @@ impl TcpStreamControlBlock {
         until_time
     }
 
+    /// Sends pending data packets up to congestion and flow control limits.
+    ///
+    /// Respects congestion window and pacing constraints.
+    /// Returns the next time when more data can be sent due to pacing.
     fn send_pending(&mut self, now: Instant) -> Option<Instant> {
         let srtt = self.rtt.get();
         let cwnd = self.congestion.window();
@@ -802,6 +911,7 @@ impl TcpStreamControlBlock {
         until_time
     }
 
+    /// Sends a FIN packet to initiate connection close.
     fn send_fin(&mut self) {
         self.send_tcp_fin_packet();
 
@@ -812,6 +922,7 @@ impl TcpStreamControlBlock {
         }
     }
 
+    /// Updates remote window size from received packet, applying window scaling if negotiated.
     fn update_remote_window(&mut self, request: &TcpPacket) {
         self.state_data.remote_window = request.get_window() as u32;
         self.state_data.remote_window <<= self.state_data.wscale;
@@ -821,10 +932,12 @@ impl TcpStreamControlBlock {
         );
     }
 
+    /// Gets current timestamp in milliseconds for TCP timestamp option.
     fn timestamp(&self) -> u32 {
         self.time.elapsed_millis(Instant::now())
     }
 
+    /// Adds TCP timestamp option with proper padding to options list.
     fn add_tcp_option_timestamp(&self, opts: &mut Vec<TcpOption>, opts_size: &mut usize) {
         opts.push(TcpOption::nop());
         opts.push(TcpOption::nop());
@@ -835,6 +948,7 @@ impl TcpStreamControlBlock {
         *opts_size += 12;
     }
 
+    /// Sends SYN-ACK packet with negotiated options during connection establishment.
     fn send_tcp_syn_ack_packet(&self) {
         let mut opts = Vec::new();
         let mut opts_size = 0;
@@ -865,6 +979,7 @@ impl TcpStreamControlBlock {
         );
     }
 
+    /// Sends data packet, segmenting if necessary to fit within MSS limits.
     fn send_tcp_data_packet(&self, mut seq: u32, data: &[u8]) {
         let mut opts = Vec::new();
         let mut opts_size = 0;
@@ -893,6 +1008,7 @@ impl TcpStreamControlBlock {
         }
     }
 
+    /// Sends standalone ACK packet to acknowledge received data.
     fn send_tcp_acknowledge_packet(&self) {
         self.send_tcp_control_packet(TcpFlags::ACK);
         trace!(
@@ -901,16 +1017,19 @@ impl TcpStreamControlBlock {
         );
     }
 
+    /// Sends FIN+ACK packet to initiate connection close.
     fn send_tcp_fin_packet(&self) {
         self.send_tcp_control_packet(TcpFlags::ACK | TcpFlags::FIN);
         trace!("{}[{}]: send FIN", self.addr_pair, self.state);
     }
 
+    /// Sends RST+ACK packet to forcibly reset the connection.
     fn send_tcp_rst_packet(&self) {
         self.send_tcp_control_packet(TcpFlags::ACK | TcpFlags::RST);
         trace!("{}[{}]: send RST", self.addr_pair, self.state);
     }
 
+    /// Sends control packet (ACK, FIN, RST) with timestamp option.
     fn send_tcp_control_packet(&self, flags: u8) {
         let mut opts = Vec::new();
         let mut opts_size = 0;
@@ -920,6 +1039,7 @@ impl TcpStreamControlBlock {
         self.send_tcp_packet(self.state_data.seq, flags, &opts, opts_size, &payload);
     }
 
+    /// Builds and sends a complete TCP packet with Ethernet and IPv4 headers.
     fn send_tcp_packet(
         &self,
         seq: u32,
@@ -988,6 +1108,9 @@ impl TcpStreamControlBlock {
             });
     }
 
+    /// Processes and updates remote timestamp from TCP timestamp option.
+    ///
+    /// Only updates if the new timestamp is newer (handles wraparound).
     fn process_remote_timestamp(&mut self, request: &TcpPacket) {
         for opt in request.get_options_iter() {
             if opt.get_number() == TcpOptionNumbers::TIMESTAMPS {
@@ -1006,6 +1129,9 @@ impl TcpStreamControlBlock {
         }
     }
 
+    /// Processes echoed timestamp for RTT measurement.
+    ///
+    /// Updates RTT estimator when our timestamp is echoed back by the peer.
     fn process_echo_timestamp(&mut self, request: &TcpPacket) {
         for opt in request.get_options_iter() {
             if opt.get_number() == TcpOptionNumbers::TIMESTAMPS {
@@ -1029,6 +1155,9 @@ impl TcpStreamControlBlock {
         }
     }
 
+    /// Processes incoming ACK to advance send window and update congestion control.
+    ///
+    /// Acknowledges sent data, updates RTT estimates, and notifies congestion control.
     fn process_acknowledgement(&mut self, request: &TcpPacket) {
         let now = Instant::now();
         let ack = request.get_acknowledgement();
@@ -1052,6 +1181,9 @@ impl TcpStreamControlBlock {
         self.stats.set_send_queue(self.send_buffer.len());
     }
 
+    /// Processes incoming data payload and updates receive buffer.
+    ///
+    /// Handles out-of-order data, sends ACKs, and wakes read tasks when data is available.
     fn process_payload(&mut self, request: &TcpPacket, packet: &Bytes) {
         if request.get_sequence() == (self.state_data.ack - 1) {
             trace!(
@@ -1089,6 +1221,9 @@ impl TcpStreamControlBlock {
         self.stats.set_recv_queue(self.recv_buffer.readable_size());
     }
 
+    /// Processes incoming FIN packet and transitions connection state.
+    ///
+    /// Updates receive buffer, sends ACK, and transitions to appropriate close state.
     fn process_fin(&mut self, request: &TcpPacket) {
         self.state_data.ack = request.get_sequence() + 1;
         self.send_tcp_acknowledge_packet();

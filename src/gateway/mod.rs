@@ -1,3 +1,17 @@
+//! Network gateway module for intercepting and processing network packets.
+//!
+//! This module implements a network gateway that captures packets at the data link layer,
+//! processes them based on protocol type (ARP, UDP, TCP), and provides application-level
+//! interfaces for network communication. It acts as a bridge between raw network packets
+//! and high-level async I/O abstractions.
+//!
+//! # Architecture
+//!
+//! - `GatewayReceiver`: Captures raw packets and routes them to protocol handlers
+//! - `GatewaySender`: Sends packets back to the network interface
+//! - Protocol handlers: ARP, UDP, and TCP processing modules
+//! - Application interfaces: `UdpBinder`, `TcpListener` for async I/O
+
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 
@@ -20,17 +34,41 @@ mod arp;
 pub mod tcp;
 pub mod udp;
 
+/// Creates a new network gateway on the specified interface.
+///
+/// This function sets up a complete network stack including packet capture,
+/// protocol processing, and application-level interfaces for UDP and TCP.
+///
+/// # Arguments
+///
+/// * `addr` - Gateway IPv4 address
+/// * `mask` - Subnet mask for determining local network
+/// * `iface_name` - Network interface name (empty string for auto-detection)
+///
+/// # Returns
+///
+/// A tuple containing (UdpBinder, TcpListener) for application use
+///
+/// # Errors
+///
+/// Returns error if:
+/// - Network interface not found or unavailable
+/// - MAC address not available
+/// - Interface is not Ethernet-compatible
 pub fn new(
     addr: Ipv4Addr,
     mask: Ipv4Addr,
     iface_name: &str,
 ) -> std::io::Result<(UdpBinder, TcpListener)> {
+    // Find suitable network interface by name or auto-detect
     let interface = datalink::interfaces()
         .into_iter()
         .filter(|iface| {
             if !iface_name.is_empty() {
+                // Use specific interface if name provided
                 iface_name == iface.name
             } else {
+                // Auto-detect: non-loopback, has MAC, has IPv4
                 !iface.is_loopback()
                     && iface.mac.is_some()
                     && !iface.mac.as_ref().unwrap().is_zero()
@@ -87,26 +125,42 @@ pub fn new(
     Ok((udp_binder, tcp_listener))
 }
 
+/// Gateway configuration information shared across components.
 #[derive(Clone, Copy)]
 struct GatewayInfo {
+    /// MAC address of the gateway interface
     mac: MacAddr,
+    /// IPv4 address of the gateway
     addr: Ipv4Addr,
+    /// Subnet mask for determining local network scope
     mask: Ipv4Addr,
 }
 
 impl GatewayInfo {
+    /// Checks if the source address is within the gateway's subnet.
+    ///
+    /// Used to filter packets that should be processed by this gateway.
     fn in_subnet(&self, source: Ipv4Addr) -> bool {
         is_to_gateway(self.addr, self.mask, source)
     }
 }
 
+/// Thread-safe packet sender for transmitting packets to the network interface.
 #[derive(Clone)]
 struct GatewaySender {
     info: GatewayInfo,
+    /// Data link layer transmitter (thread-safe)
     datalink_tx: Arc<Mutex<Box<dyn datalink::DataLinkSender>>>,
 }
 
 impl GatewaySender {
+    /// Builds and sends packets using the provided construction function.
+    ///
+    /// # Arguments
+    ///
+    /// * `num_packets` - Number of packets to send
+    /// * `packet_size` - Size of each packet in bytes
+    /// * `func` - Function to construct packet data
     fn build_and_send(
         &self,
         num_packets: usize,
@@ -121,21 +175,31 @@ impl GatewaySender {
     }
 }
 
+/// Packet receiver that captures and routes network packets to protocol handlers.
 struct GatewayReceiver {
     info: GatewayInfo,
+    /// Data link layer receiver for capturing packets
     datalink_rx: Box<dyn DataLinkReceiver>,
+    /// Channel for sending ARP packets to ARP handler
     arp_channel: UnboundedSender<Bytes>,
+    /// Channel for sending UDP packets to UDP handler
     udp_channel: UnboundedSender<Bytes>,
+    /// Channel for sending TCP packets to TCP handler
     tcp_channel: UnboundedSender<Bytes>,
 }
 
 impl GatewayReceiver {
+    /// Starts the packet receiver in a background thread.
     fn start(mut self) {
         std::thread::spawn(move || {
             self.recv();
         });
     }
 
+    /// Main packet reception loop that processes incoming packets.
+    ///
+    /// Continuously captures packets, parses them, and routes them to
+    /// appropriate protocol handlers based on packet type.
     fn recv(&mut self) {
         loop {
             match self.datalink_rx.next() {
@@ -148,10 +212,12 @@ impl GatewayReceiver {
                                 if let Some(ipv4_packet) =
                                     Ipv4Packet::new(ethernet_packet.payload())
                                 {
+                                    // Only process packets from our subnet
                                     if !self.info.in_subnet(ipv4_packet.get_source()) {
                                         continue;
                                     }
 
+                                    // Route based on IP protocol
                                     match ipv4_packet.get_next_level_protocol() {
                                         IpNextHeaderProtocols::Udp => self.handle_udp(data),
                                         IpNextHeaderProtocols::Tcp => self.handle_tcp(data),
@@ -169,27 +235,39 @@ impl GatewayReceiver {
         }
     }
 
+    /// Routes ARP packets to the ARP handler.
     fn handle_arp(&self, data: Bytes) {
         self.arp_channel.send(data).unwrap();
     }
 
+    /// Routes UDP packets to the UDP handler.
     fn handle_udp(&self, data: Bytes) {
         self.udp_channel.send(data).unwrap();
     }
 
+    /// Routes TCP packets to the TCP handler.
     fn handle_tcp(&self, data: Bytes) {
         self.tcp_channel.send(data).unwrap();
     }
 }
 
+/// Determines if a packet from the source should be processed by the gateway.
+///
+/// Returns true if the source is in the same subnet as the gateway but is not
+/// the gateway itself (to avoid processing our own packets).
 fn is_to_gateway(gateway: Ipv4Addr, subnet_mask: Ipv4Addr, source: Ipv4Addr) -> bool {
     source != gateway && is_same_subnet(source, gateway, subnet_mask)
 }
 
+/// Checks if two IPv4 addresses are in the same subnet.
+///
+/// Applies the subnet mask to both addresses and compares the results.
+/// Returns true if both addresses have the same network portion.
 fn is_same_subnet(addr1: Ipv4Addr, addr2: Ipv4Addr, subnet_mask: Ipv4Addr) -> bool {
     let mask = subnet_mask.octets();
     let a1 = addr1.octets();
     let a2 = addr2.octets();
+    // Compare each octet after applying the mask
     (a1[0] & mask[0] == a2[0] & mask[0])
         && (a1[1] & mask[1] == a2[1] & mask[1])
         && (a1[2] & mask[2] == a2[2] & mask[2])

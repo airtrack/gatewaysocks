@@ -6,6 +6,7 @@ use std::{
 
 use bytes::{Buf, Bytes};
 
+/// Represents a data segment that has been sent but not yet acknowledged.
 pub(super) struct InFlight {
     seq: u32,
     data: Bytes,
@@ -23,6 +24,10 @@ impl InFlight {
         }
     }
 
+    /// Calculates when this segment will timeout using exponential backoff.
+    ///
+    /// Formula: sent_time + (rto * 2^retry_count)
+    /// This implements the standard TCP exponential backoff algorithm.
     fn timeout(&self, rto: Duration) -> Instant {
         self.sent.get() + rto * 2u32.pow(self.retry.get())
     }
@@ -47,12 +52,14 @@ impl InFlight {
         self.retry.get()
     }
 
+    /// Marks this segment as retried at the given time and increments retry count.
     pub(super) fn retried_at(&self, t: Instant) {
         self.sent.set(t);
         self.retry.set(self.retry.get() + 1);
     }
 }
 
+/// Control structure for tracking SYN-ACK and FIN segments.
 pub(super) struct InFlightCtl {
     retry: Cell<u32>,
     sent: Cell<Instant>,
@@ -80,6 +87,13 @@ impl InFlightCtl {
     }
 }
 
+/// TCP send buffer that manages pending and in-flight data segments.
+///
+/// Handles data segmentation, retransmission tracking, and flow control.
+/// The buffer has a fixed capacity and maintains separate tracking for:
+/// - Pending data: waiting to be sent when window space is available
+/// - In-flight data: sent but not yet acknowledged
+/// - Control segments: SYN-ACK and FIN packets with separate retry logic
 pub(super) struct SendBuffer {
     capacity: usize,
     in_flight_bytes: usize,
@@ -147,6 +161,8 @@ impl SendBuffer {
         self.pending_fin = true;
     }
 
+    /// Adds data to the pending queue, segmenting it according to MSS.
+    /// Returns the total number of bytes added.
     pub(super) fn push_pending(&mut self, mut data: Bytes, mss: usize) -> usize {
         let bytes = data.len();
         while data.len() > mss {
@@ -179,6 +195,8 @@ impl SendBuffer {
         }
     }
 
+    /// Moves pending data to in-flight status up to the specified size.
+    /// Used when the send window opens up and data can be transmitted.
     pub(super) fn slide_in_flight(&mut self, mut seq: u32, mut size: usize, now: Instant) {
         while size > 0 && !self.pending.is_empty() {
             let mut data = self.pending.pop_front().unwrap();
@@ -198,6 +216,9 @@ impl SendBuffer {
         }
     }
 
+    /// Acknowledges in-flight data up to the given ACK number.
+    /// Calls `on_ack` for each acknowledged segment with send time and byte count.
+    /// Handles partial acknowledgments by splitting segments.
     pub(super) fn ack_in_flight<F>(&mut self, ack: u32, mut on_ack: F)
     where
         F: FnMut(Instant, usize),
@@ -229,6 +250,7 @@ impl SendBuffer {
     }
 }
 
+/// Iterator over in-flight segments that have timed out and need retransmission.
 pub(super) struct ResendIterator<'a> {
     index: usize,
     now: Instant,
@@ -253,6 +275,7 @@ impl<'a> Iterator for ResendIterator<'a> {
     }
 }
 
+/// Iterator over pending data segments waiting to be sent.
 pub(super) struct PendingIterator<'a> {
     iter: Iter<'a, Bytes>,
 }

@@ -1,3 +1,17 @@
+//! TCP gateway module providing full TCP connection handling.
+//!
+//! This module implements a complete TCP stack for the gateway, handling
+//! connection establishment, data transfer, and connection teardown.
+//! It provides async-compatible TCP streams that integrate with Tokio's
+//! async I/O ecosystem.
+//!
+//! # Architecture
+//!
+//! - `TcpHandler`: Processes incoming TCP packets and manages stream lifecycle
+//! - `TcpListener`: Accepts new TCP connections for applications
+//! - `TcpStream`: Async TCP stream implementing AsyncRead/AsyncWrite traits
+//! - `TcpStreamDriver`: Background task driving individual TCP connections
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::{SocketAddr, SocketAddrV4};
@@ -32,6 +46,19 @@ pub use stats::StreamStats;
 pub use types::AddrPair;
 pub use types::State;
 
+/// Creates a new TCP handler and listener pair.
+///
+/// The handler processes incoming TCP packets and manages connection lifecycle,
+/// while the listener provides an interface for accepting new connections.
+///
+/// # Arguments
+///
+/// * `channel` - Receiver for incoming TCP packets from the gateway
+/// * `gw_sender` - Gateway sender for outgoing packets
+///
+/// # Returns
+///
+/// A tuple containing (TcpHandler, TcpListener)
 pub(super) fn new(
     channel: UnboundedReceiver<Bytes>,
     gw_sender: GatewaySender,
@@ -57,9 +84,11 @@ pub(super) fn new(
     (handler, listener)
 }
 
+/// Internal channel for notifying the listener of new TCP connections.
 struct StreamStarter(UnboundedSender<TcpStream>);
 
 impl StreamStarter {
+    /// Notifies the listener of a new TCP connection.
     fn start(&self, stream: TcpStream) -> std::io::Result<()> {
         self.0.send(stream).map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stream receiver dropped")
@@ -67,9 +96,11 @@ impl StreamStarter {
     }
 }
 
+/// Internal channel for receiving new TCP connections.
 struct StreamReceiver(UnboundedReceiver<TcpStream>);
 
 impl StreamReceiver {
+    /// Receives the next new TCP connection.
     async fn recv(&mut self) -> std::io::Result<TcpStream> {
         self.0.recv().await.ok_or(std::io::Error::new(
             std::io::ErrorKind::BrokenPipe,
@@ -78,33 +109,44 @@ impl StreamReceiver {
     }
 }
 
+/// Creates a channel pair for stream startup notifications.
 fn stream_starter() -> (StreamStarter, StreamReceiver) {
     let (starter, receiver) = unbounded_channel();
     (StreamStarter(starter), StreamReceiver(receiver))
 }
 
+/// Channel for notifying when TCP streams are closed.
 #[derive(Clone)]
 struct StreamCloser(UnboundedSender<AddrPair>);
 
 impl StreamCloser {
+    /// Notifies that a TCP stream with the given address pair has closed.
     fn close(&self, addr_pair: AddrPair) {
         self.0.send(addr_pair).ok();
     }
 }
 
+/// Channel for receiving notifications of closed TCP streams.
 struct ClosedStream(UnboundedReceiver<AddrPair>);
 
 impl ClosedStream {
+    /// Receives the next closed stream notification.
     async fn recv(&mut self) -> Option<AddrPair> {
         self.0.recv().await
     }
 }
 
+/// Creates a channel pair for stream closure notifications.
 fn stream_closer() -> (StreamCloser, ClosedStream) {
     let (send, recv) = unbounded_channel();
     (StreamCloser(send), ClosedStream(recv))
 }
 
+/// Main TCP packet handler that processes incoming packets and manages streams.
+///
+/// The handler maintains a map of active TCP streams and routes packets to
+/// the appropriate stream. It also handles connection establishment by
+/// creating new streams when SYN packets arrive.
 pub(super) struct TcpHandler {
     channel: UnboundedReceiver<Bytes>,
     gw_sender: GatewaySender,
@@ -116,12 +158,14 @@ pub(super) struct TcpHandler {
 }
 
 impl TcpHandler {
+    /// Starts the TCP handler in a background task.
     pub(super) fn start(mut self) {
         tokio::spawn(async move {
             self.handle_loop().await;
         });
     }
 
+    /// Main event loop that processes packets and stream events.
     async fn handle_loop(&mut self) -> Option<()> {
         loop {
             tokio::select! {
@@ -135,11 +179,15 @@ impl TcpHandler {
         }
     }
 
+    /// Removes a closed stream from the active streams map.
     fn remove_stream(&mut self, addr_pair: AddrPair) {
         self.streams.remove(&addr_pair);
         self.stats.map.remove(&addr_pair);
     }
 
+    /// Processes an incoming TCP packet.
+    ///
+    /// Routes the packet to existing streams or creates new streams for SYN packets.
     fn handle_packet(&mut self, packet: Bytes) -> Option<()> {
         let ethernet_packet = EthernetPacket::new(&packet)?;
         let ipv4_packet = Ipv4Packet::new(ethernet_packet.payload())?;
@@ -192,21 +240,34 @@ impl TcpHandler {
     }
 }
 
+/// TCP listener for accepting incoming TCP connections.
+///
+/// Provides an async interface for applications to accept new TCP streams
+/// and access connection statistics.
 pub struct TcpListener {
     stats: StatsMap,
     stream_receiver: StreamReceiver,
 }
 
 impl TcpListener {
+    /// Accepts the next incoming TCP connection.
+    ///
+    /// This method waits for a new TCP connection to be established
+    /// and returns the corresponding TcpStream.
     pub async fn accept(&mut self) -> std::io::Result<TcpStream> {
         self.stream_receiver.recv().await
     }
 
+    /// Returns a clone of the current connection statistics map.
     pub fn get_stats(&self) -> StatsMap {
         self.stats.clone()
     }
 }
 
+/// An async TCP stream that implements AsyncRead and AsyncWrite.
+///
+/// This stream represents a single TCP connection and provides
+/// async I/O operations compatible with Tokio's async ecosystem.
 pub struct TcpStream {
     inner: Arc<TcpStreamInner>,
 }
@@ -218,10 +279,12 @@ impl Drop for TcpStream {
 }
 
 impl TcpStream {
+    /// Returns the source (local) address of this TCP connection.
     pub fn source_addr(&self) -> SocketAddr {
         SocketAddr::V4(self.inner.source_addr())
     }
 
+    /// Returns the destination (remote) address of this TCP connection.
     pub fn destination_addr(&self) -> SocketAddr {
         SocketAddr::V4(self.inner.destination_addr())
     }
@@ -261,12 +324,17 @@ impl AsyncWrite for TcpStream {
     }
 }
 
+/// Background driver task for individual TCP streams.
+///
+/// Handles packet processing and state management for a single TCP connection.
+/// Runs as a separate task to avoid blocking the main TCP handler.
 struct TcpStreamDriver {
     packets: Receiver<Bytes>,
     inner: Arc<TcpStreamInner>,
 }
 
 impl TcpStreamDriver {
+    /// Starts the stream driver in a background task.
     fn start(self) {
         tokio::spawn(async move {
             self.await;
