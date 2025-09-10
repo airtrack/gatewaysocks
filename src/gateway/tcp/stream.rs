@@ -17,7 +17,7 @@ use tokio::time::{Sleep, sleep_until};
 
 use crate::gateway::GatewaySender;
 use crate::gateway::tcp::StreamCloser;
-use crate::gateway::tcp::congestion::{Controller, FixBandwidth};
+use crate::gateway::tcp::congestion::{Controller, Cubic};
 use crate::gateway::tcp::pacing::Pacer;
 use crate::gateway::tcp::recv_buffer::RecvBuffer;
 use crate::gateway::tcp::rtt::RttEstimator;
@@ -31,10 +31,15 @@ const FIN_TIMEOUT: Duration = Duration::from_secs(600);
 const DEFAULT_RTO: Duration = Duration::from_millis(50);
 const DEFAULT_RTT: Duration = Duration::from_millis(10);
 const GRANULARITY: Duration = Duration::from_millis(1);
+
 const MAX_RETRY_TIMES: u32 = 5;
 const LOCAL_WINDOW: u32 = 256 * 1024;
-const DEFAULT_MSS: usize = 1500;
+const DEFAULT_MTU: usize = 1500;
+const DEFAULT_MSS: usize = DEFAULT_MTU - MIN_TCP_HEADER_LEN - IP_HEADER_LEN;
+const IP_HEADER_LEN: usize = 20;
+const MIN_TCP_HEADER_LEN: usize = 20;
 const MAX_TCP_HEADER_LEN: usize = 60;
+const MAX_TCP_OPTION_HEADER_LEN: usize = MAX_TCP_HEADER_LEN - MIN_TCP_HEADER_LEN;
 const MAX_SEND_BUFFER: usize = 128 * 1024;
 
 /// Checks if a TCP packet has the SYN flag set.
@@ -216,7 +221,7 @@ impl TcpStreamControlBlock {
         stats: StreamStats,
     ) -> Self {
         let now = Instant::now();
-        let congestion = FixBandwidth::new();
+        let congestion = Cubic::new(DEFAULT_MSS, stats.clone());
         let pacing = Pacer::new(DEFAULT_RTT, congestion.window(), GRANULARITY, DEFAULT_MSS);
         let rtt = RttEstimator::new(DEFAULT_RTT, DEFAULT_RTO, GRANULARITY);
 
@@ -369,7 +374,7 @@ impl TcpStreamControlBlock {
 
         let size = self.send_buffer.push_pending(
             Bytes::copy_from_slice(buf),
-            self.state_data.mss as usize - MAX_TCP_HEADER_LEN,
+            self.state_data.mss as usize - MAX_TCP_OPTION_HEADER_LEN,
         );
 
         self.driver_waker.as_ref().map(|waker| waker.wake_by_ref());
@@ -588,7 +593,8 @@ impl TcpStreamControlBlock {
                     TcpOptionNumbers::MSS => {
                         let mut payload = [0u8; 2];
                         payload.copy_from_slice(&opt.payload()[0..2]);
-                        self.state_data.mss = u16::from_be_bytes(payload);
+                        let mss = u16::from_be_bytes(payload);
+                        self.state_data.mss = self.state_data.mss.min(mss);
                         trace!("tcp mss: {}", self.state_data.mss);
                     }
                     TcpOptionNumbers::SACK_PERMITTED => {
@@ -822,7 +828,6 @@ impl TcpStreamControlBlock {
     /// Returns the next time when more data can be sent due to pacing.
     fn resend_in_flight(&mut self, now: Instant, rto: Duration) -> Option<Instant> {
         let mut until_time = None;
-        let mut latest_loss_sent = None;
 
         for in_flight in self.send_buffer.resend_iter(now, rto) {
             let bytes = in_flight.len();
@@ -845,21 +850,10 @@ impl TcpStreamControlBlock {
                 self.rtt.rto().as_millis()
             );
 
-            if let Some(sent) = latest_loss_sent {
-                if in_flight.sent_time() > sent {
-                    latest_loss_sent = Some(in_flight.sent_time());
-                }
-            } else {
-                latest_loss_sent = Some(in_flight.sent_time());
-            }
-
+            self.congestion.on_congestion(now, in_flight.sent_time());
             self.send_tcp_data_packet(in_flight.seq(), in_flight.as_ref());
             self.pacing.on_sent(bytes);
             in_flight.retried_at(now);
-        }
-
-        if let Some(sent) = latest_loss_sent {
-            self.congestion.on_congestion(now, sent, false);
         }
 
         until_time
@@ -890,6 +884,7 @@ impl TcpStreamControlBlock {
             }
 
             self.send_tcp_data_packet(self.state_data.seq, &data[..bytes]);
+            self.congestion.on_sent(now, bytes);
             self.pacing.on_sent(bytes);
             self.state_data.seq += bytes as u32;
 
@@ -988,7 +983,7 @@ impl TcpStreamControlBlock {
 
         let mut index = 0;
         let mut len = data.len();
-        let max_payload_len = self.state_data.mss as usize - MAX_TCP_HEADER_LEN;
+        let max_payload_len = self.state_data.mss as usize - MAX_TCP_OPTION_HEADER_LEN;
 
         while len > 0 {
             let payload_len = std::cmp::min(len, max_payload_len);
@@ -1057,8 +1052,8 @@ impl TcpStreamControlBlock {
             payload.len()
         );
 
-        let tcp_packet_len = 20 + opts_size + payload.len();
-        let ipv4_packet_len = 20 + tcp_packet_len;
+        let tcp_packet_len = MIN_TCP_HEADER_LEN + opts_size + payload.len();
+        let ipv4_packet_len = IP_HEADER_LEN + tcp_packet_len;
         let ethernet_packet_len = 14 + ipv4_packet_len;
 
         self.gw_sender
@@ -1089,7 +1084,7 @@ impl TcpStreamControlBlock {
                 tcp_packet.set_destination(self.addr_pair.source.port());
                 tcp_packet.set_sequence(seq);
                 tcp_packet.set_acknowledgement(self.state_data.ack);
-                tcp_packet.set_data_offset(((20 + opts_size) / 4) as u8);
+                tcp_packet.set_data_offset(((MIN_TCP_HEADER_LEN + opts_size) / 4) as u8);
                 tcp_packet.set_reserved(0);
                 tcp_packet.set_flags(flags);
                 tcp_packet

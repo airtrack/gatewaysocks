@@ -1,6 +1,6 @@
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use dashmap::DashMap;
@@ -83,6 +83,37 @@ impl StreamStats {
         self.stats.recv_queue.store(bytes, Ordering::Relaxed);
     }
 
+    /// Updates whether the connection is currently limited by congestion control.
+    ///
+    /// # Arguments
+    ///
+    /// * `congestion_limited` - True if transmission is limited by congestion window
+    pub(super) fn set_congestion_limited(&self, congestion_limited: bool) {
+        self.stats
+            .congestion_limited
+            .store(congestion_limited, Ordering::Relaxed);
+    }
+
+    /// Updates the current congestion control state.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - New congestion state (SlowStart, Recovery, or CongestionAvoidance)
+    pub(super) fn set_congestion_state(&self, state: CongestionState) {
+        self.stats
+            .congestion_state
+            .store(state as usize, Ordering::Relaxed);
+    }
+
+    /// Updates the congestion window size in bytes.
+    ///
+    /// # Arguments
+    ///
+    /// * `cwnd` - Current congestion window size in bytes
+    pub(super) fn set_congestion_window(&self, cwnd: usize) {
+        self.stats.congestion_window.store(cwnd, Ordering::Relaxed);
+    }
+
     /// Returns the current TCP connection state.
     ///
     /// Returns State::Closed if the stored state value is invalid.
@@ -100,6 +131,24 @@ impl StreamStats {
     pub fn get_recv_queue(&self) -> usize {
         self.stats.recv_queue.load(Ordering::Relaxed)
     }
+
+    /// Returns whether the connection is currently limited by congestion control.
+    pub fn get_congestion_limited(&self) -> bool {
+        self.stats.congestion_limited.load(Ordering::Relaxed)
+    }
+
+    /// Returns the current congestion control state.
+    ///
+    /// Returns SlowStart if the stored state value is invalid.
+    pub fn get_congestion_state(&self) -> CongestionState {
+        let state = self.stats.congestion_state.load(Ordering::Relaxed);
+        CongestionState::from_integer(state).unwrap_or(CongestionState::SlowStart)
+    }
+
+    /// Returns the congestion window size in bytes.
+    pub fn get_congestion_window(&self) -> usize {
+        self.stats.congestion_window.load(Ordering::Relaxed)
+    }
 }
 
 /// Internal statistics storage using atomic operations for thread safety.
@@ -111,4 +160,43 @@ struct StreamStatsInner {
     send_queue: AtomicUsize,
     /// Number of bytes queued for reading
     recv_queue: AtomicUsize,
+    /// Whether transmission is limited by congestion control
+    congestion_limited: AtomicBool,
+    /// Current congestion control state
+    congestion_state: AtomicUsize,
+    /// Current congestion window size in bytes
+    congestion_window: AtomicUsize,
+}
+
+/// TCP congestion control states according to congestion control algorithms.
+///
+/// Represents the different phases of TCP congestion control, each with
+/// specific behavior for handling acknowledgments and congestion events.
+pub enum CongestionState {
+    SlowStart = 0,
+    Recovery,
+    CongestionAvoidance,
+}
+
+impl CongestionState {
+    /// Converts an integer value back to a congestion state.
+    ///
+    /// Returns None for invalid values.
+    fn from_integer(state: usize) -> Option<Self> {
+        match state {
+            0 => Some(CongestionState::SlowStart),
+            1 => Some(CongestionState::Recovery),
+            2 => Some(CongestionState::CongestionAvoidance),
+            _ => None,
+        }
+    }
+
+    /// Returns the string representation of the congestion state.
+    pub fn to_str(&self) -> &'static str {
+        match self {
+            CongestionState::SlowStart => "SlowStart",
+            CongestionState::Recovery => "Recovery",
+            CongestionState::CongestionAvoidance => "CongestionAvoidance",
+        }
+    }
 }

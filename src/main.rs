@@ -130,6 +130,18 @@ async fn gateway_stats(listen: &str, tcp_stats: tcp::StatsMap, udp_stats: udp::S
         state: &'static str,
     }
 
+    #[derive(Tabled)]
+    struct TcpSocketEntry {
+        #[tabled(inline)]
+        socket: SocketEntry,
+        #[tabled(rename = "Congestion On")]
+        limited: bool,
+        #[tabled(rename = "Congestion State")]
+        state: &'static str,
+        #[tabled(rename = "Congestion Window")]
+        window: usize,
+    }
+
     struct StatsState {
         tcp: tcp::StatsMap,
         udp: udp::StatsSet,
@@ -169,6 +181,33 @@ async fn gateway_stats(listen: &str, tcp_stats: tcp::StatsMap, udp_stats: udp::S
         table.to_string()
     }
 
+    async fn netstat_tcp(
+        axum::extract::State(stats): axum::extract::State<Arc<StatsState>>,
+    ) -> impl IntoResponse {
+        let mut entries = Vec::new();
+
+        stats.tcp.for_each(|k, v| {
+            let entry = TcpSocketEntry {
+                socket: SocketEntry {
+                    proto: "tcp4",
+                    recv_queue: v.get_recv_queue(),
+                    send_queue: v.get_send_queue(),
+                    source: k.source,
+                    destination: k.destination,
+                    state: v.get_state().to_str(),
+                },
+                limited: v.get_congestion_limited(),
+                state: v.get_congestion_state().to_str(),
+                window: v.get_congestion_window(),
+            };
+            entries.push(entry);
+        });
+
+        let mut table = Table::new(entries);
+        table.with(Style::empty());
+        table.to_string()
+    }
+
     let stats_state = Arc::new(StatsState {
         tcp: tcp_stats,
         udp: udp_stats,
@@ -176,6 +215,7 @@ async fn gateway_stats(listen: &str, tcp_stats: tcp::StatsMap, udp_stats: udp::S
 
     let app = Router::new()
         .route("/netstat", routing::get(netstat))
+        .route("/netstat/tcp", routing::get(netstat_tcp))
         .with_state(stats_state);
 
     let listener = TcpListener::bind(listen).await.unwrap();
