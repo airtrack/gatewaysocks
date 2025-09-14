@@ -97,7 +97,77 @@ impl CubicState {
 enum State {
     SlowStart,
     Recovery(Instant),
-    CongestionAvoidance(Instant),
+    CongestionAvoidance(AvoidanceTiming),
+}
+
+/// Timing state for CUBIC congestion avoidance phase.
+///
+/// Tracks time periods and handles application-limited scenarios during
+/// congestion avoidance. This ensures that time spent in application-limited
+/// state doesn't affect CUBIC's time-based calculations, maintaining accurate
+/// congestion window growth behavior.
+/// <https://datatracker.ietf.org/doc/html/rfc8312#section-5.8>
+struct AvoidanceTiming {
+    /// Start time of the current congestion avoidance phase
+    start_time: Instant,
+    /// Last time congestion avoidance calculations were performed
+    last_avoidance_time: Instant,
+    /// Time when the connection became application-limited (if any)
+    last_app_limited_time: Option<Instant>,
+}
+
+impl AvoidanceTiming {
+    /// Creates a new timing tracker for congestion avoidance phase.
+    ///
+    /// # Arguments
+    /// * `now` - Current timestamp when entering congestion avoidance
+    fn new(now: Instant) -> Self {
+        Self {
+            start_time: now,
+            last_avoidance_time: now,
+            last_app_limited_time: None,
+        }
+    }
+
+    /// Returns the elapsed time since congestion avoidance began.
+    ///
+    /// This time excludes periods when the connection was application-limited,
+    /// ensuring CUBIC calculations are based only on congestion-limited time.
+    ///
+    /// # Arguments
+    /// * `now` - Current timestamp
+    fn t(&self, now: Instant) -> Duration {
+        now - self.start_time
+    }
+
+    /// Records when the connection becomes application-limited.
+    ///
+    /// Application-limited periods should not contribute to CUBIC's time-based
+    /// window calculations, as they don't reflect network congestion conditions.
+    ///
+    /// # Arguments
+    /// * `now` - Timestamp when application limiting began
+    fn on_app_limited(&mut self, now: Instant) {
+        self.last_app_limited_time = Some(now);
+    }
+
+    /// Updates timing state when performing congestion avoidance calculations.
+    ///
+    /// If there was an application-limited period, adjusts the start time to
+    /// exclude that period from CUBIC calculations. This ensures that time
+    /// spent not sending due to application limits doesn't affect the cubic
+    /// function's growth behavior.
+    ///
+    /// # Arguments
+    /// * `now` - Current timestamp
+    fn on_avoidance(&mut self, now: Instant) {
+        if let Some(app_limited_time) = self.last_app_limited_time.take() {
+            // Adjust start time to exclude application-limited period
+            self.start_time += app_limited_time - self.last_avoidance_time;
+        }
+
+        self.last_avoidance_time = now;
+    }
 }
 
 /// CUBIC congestion control implementation (RFC 8312).
@@ -203,21 +273,12 @@ impl Controller for Cubic {
         self.window
     }
 
-    fn on_sent(&mut self, now: Instant, bytes: usize) {
+    fn on_sent(&mut self, _now: Instant, bytes: usize) {
         self.in_flight += bytes;
 
         let congestion_limited = self.is_congestion_limited();
-
-        // Change from application limited to congestion limited
-        if self.app_limited && congestion_limited {
-            if matches!(self.state, State::CongestionAvoidance(_)) {
-                self.state = State::CongestionAvoidance(now);
-                self.cubic.w_max = self.window as f32;
-                self.cubic.k = 0.0;
-            }
-        }
-
         self.app_limited = !congestion_limited;
+
         self.stats.set_congestion_limited(congestion_limited);
     }
 
@@ -225,6 +286,10 @@ impl Controller for Cubic {
         self.in_flight -= bytes;
 
         if self.app_limited {
+            if let State::CongestionAvoidance(ref mut timing) = self.state {
+                timing.on_app_limited(now);
+            }
+
             return;
         }
 
@@ -232,7 +297,7 @@ impl Controller for Cubic {
             State::SlowStart => {
                 self.window += bytes;
                 if self.window >= self.ssthresh {
-                    self.state = State::CongestionAvoidance(now);
+                    self.state = State::CongestionAvoidance(AvoidanceTiming::new(now));
                     self.cubic.w_max = self.window as f32;
                     self.cubic.k = 0.0;
 
@@ -242,13 +307,15 @@ impl Controller for Cubic {
             }
             State::Recovery(start_time) => {
                 if sent >= start_time {
-                    self.state = State::CongestionAvoidance(now);
+                    self.state = State::CongestionAvoidance(AvoidanceTiming::new(now));
                     self.stats
                         .set_congestion_state(stats::CongestionState::CongestionAvoidance);
                 }
             }
-            State::CongestionAvoidance(start_time) => {
-                self.congestion_avoidance(now - start_time, rtt.get());
+            State::CongestionAvoidance(ref mut timing) => {
+                timing.on_avoidance(now);
+                let t = timing.t(now);
+                self.congestion_avoidance(t, rtt.get());
             }
         }
 
