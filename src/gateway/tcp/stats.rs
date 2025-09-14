@@ -18,6 +18,7 @@ pub struct StatsMap {
 
 impl StatsMap {
     /// Creates a new empty statistics map.
+    #[inline]
     pub(super) fn new() -> Self {
         Self::default()
     }
@@ -28,6 +29,7 @@ impl StatsMap {
     /// # Arguments
     ///
     /// * `f` - Function to call for each (address_pair, stats) entry
+    #[inline]
     pub fn for_each<F>(&self, mut f: F)
     where
         F: FnMut(&AddrPair, &StreamStats),
@@ -50,6 +52,7 @@ pub struct StreamStats {
 
 impl StreamStats {
     /// Creates a new stream statistics tracker with default values.
+    #[inline]
     pub(super) fn new() -> Self {
         Self {
             stats: Arc::new(StreamStatsInner::default()),
@@ -61,6 +64,7 @@ impl StreamStats {
     /// # Arguments
     ///
     /// * `state` - New TCP state (Listen, SynRcvd, Estab, etc.)
+    #[inline]
     pub(super) fn set_state(&self, state: State) {
         self.stats.state.store(state as usize, Ordering::Relaxed);
     }
@@ -70,6 +74,7 @@ impl StreamStats {
     /// # Arguments
     ///
     /// * `bytes` - Number of bytes currently queued for transmission
+    #[inline]
     pub(super) fn set_send_queue(&self, bytes: usize) {
         self.stats.send_queue.store(bytes, Ordering::Relaxed);
     }
@@ -79,6 +84,7 @@ impl StreamStats {
     /// # Arguments
     ///
     /// * `bytes` - Number of bytes currently queued for reading
+    #[inline]
     pub(super) fn set_recv_queue(&self, bytes: usize) {
         self.stats.recv_queue.store(bytes, Ordering::Relaxed);
     }
@@ -88,6 +94,7 @@ impl StreamStats {
     /// # Arguments
     ///
     /// * `congestion_limited` - True if transmission is limited by congestion window
+    #[inline]
     pub(super) fn set_congestion_limited(&self, congestion_limited: bool) {
         self.stats
             .congestion_limited
@@ -99,6 +106,7 @@ impl StreamStats {
     /// # Arguments
     ///
     /// * `state` - New congestion state (SlowStart, Recovery, or CongestionAvoidance)
+    #[inline]
     pub(super) fn set_congestion_state(&self, state: CongestionState) {
         self.stats
             .congestion_state
@@ -110,6 +118,7 @@ impl StreamStats {
     /// # Arguments
     ///
     /// * `cwnd` - Current congestion window size in bytes
+    #[inline]
     pub(super) fn set_congestion_window(&self, cwnd: usize) {
         self.stats.congestion_window.store(cwnd, Ordering::Relaxed);
     }
@@ -117,22 +126,26 @@ impl StreamStats {
     /// Returns the current TCP connection state.
     ///
     /// Returns State::Closed if the stored state value is invalid.
+    #[inline]
     pub fn get_state(&self) -> State {
         let value = self.stats.state.load(Ordering::Relaxed);
         State::from_integer(value).unwrap_or(State::Closed)
     }
 
     /// Returns the current send queue size in bytes.
+    #[inline]
     pub fn get_send_queue(&self) -> usize {
         self.stats.send_queue.load(Ordering::Relaxed)
     }
 
     /// Returns the current receive queue size in bytes.
+    #[inline]
     pub fn get_recv_queue(&self) -> usize {
         self.stats.recv_queue.load(Ordering::Relaxed)
     }
 
     /// Returns whether the connection is currently limited by congestion control.
+    #[inline]
     pub fn get_congestion_limited(&self) -> bool {
         self.stats.congestion_limited.load(Ordering::Relaxed)
     }
@@ -140,12 +153,14 @@ impl StreamStats {
     /// Returns the current congestion control state.
     ///
     /// Returns SlowStart if the stored state value is invalid.
+    #[inline]
     pub fn get_congestion_state(&self) -> CongestionState {
         let state = self.stats.congestion_state.load(Ordering::Relaxed);
         CongestionState::from_integer(state).unwrap_or(CongestionState::SlowStart)
     }
 
     /// Returns the congestion window size in bytes.
+    #[inline]
     pub fn get_congestion_window(&self) -> usize {
         self.stats.congestion_window.load(Ordering::Relaxed)
     }
@@ -182,6 +197,7 @@ impl CongestionState {
     /// Converts an integer value back to a congestion state.
     ///
     /// Returns None for invalid values.
+    #[inline]
     fn from_integer(state: usize) -> Option<Self> {
         match state {
             0 => Some(CongestionState::SlowStart),
@@ -192,6 +208,7 @@ impl CongestionState {
     }
 
     /// Returns the string representation of the congestion state.
+    #[inline]
     pub fn to_str(&self) -> &'static str {
         match self {
             CongestionState::SlowStart => "SlowStart",

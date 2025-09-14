@@ -154,6 +154,7 @@ pub struct StatsSet {
 
 impl StatsSet {
     /// Creates a new empty statistics set.
+    #[inline]
     fn new() -> Self {
         Self::default()
     }
@@ -163,6 +164,7 @@ impl StatsSet {
     /// # Arguments
     ///
     /// * `f` - Function to call for each active socket address
+    #[inline]
     pub fn for_each<F>(&self, mut f: F)
     where
         F: FnMut(&SocketAddrV4),
