@@ -10,6 +10,8 @@ pub(super) struct RttEstimator {
     srtt: Option<Duration>,
     /// Latest RTT measurement
     latest: Duration,
+    /// Minimum RTT measurement
+    min: Duration,
     /// RTT variance estimate for RTO calculation
     var: Duration,
     /// Current Retransmission Timeout value
@@ -30,6 +32,7 @@ impl RttEstimator {
         Self {
             srtt: None,
             latest: init_rtt,
+            min: init_rtt,
             var: Duration::default(),
             rto: init_rto,
             granu: granularity,
@@ -53,6 +56,11 @@ impl RttEstimator {
         self.latest
     }
 
+    /// Returns the minimum RTT measurement.
+    pub(super) fn min(&self) -> Duration {
+        self.min
+    }
+
     /// Updates RTT estimates with a new measurement using RFC 6298 algorithms.
     ///
     /// # Arguments
@@ -60,6 +68,9 @@ impl RttEstimator {
     /// * `rtt` - New RTT measurement to incorporate into estimates
     pub(super) fn update(&mut self, rtt: Duration) {
         self.latest = rtt;
+        if rtt < self.min {
+            self.min = rtt;
+        }
 
         if let Some(srtt) = self.srtt {
             let var = if rtt > srtt { rtt - srtt } else { srtt - rtt };

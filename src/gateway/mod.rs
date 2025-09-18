@@ -255,6 +255,7 @@ impl GatewayReceiver {
 ///
 /// Returns true if the source is in the same subnet as the gateway but is not
 /// the gateway itself (to avoid processing our own packets).
+#[inline]
 fn is_to_gateway(gateway: Ipv4Addr, subnet_mask: Ipv4Addr, source: Ipv4Addr) -> bool {
     source != gateway && is_same_subnet(source, gateway, subnet_mask)
 }
@@ -263,13 +264,10 @@ fn is_to_gateway(gateway: Ipv4Addr, subnet_mask: Ipv4Addr, source: Ipv4Addr) -> 
 ///
 /// Applies the subnet mask to both addresses and compares the results.
 /// Returns true if both addresses have the same network portion.
+#[inline]
 fn is_same_subnet(addr1: Ipv4Addr, addr2: Ipv4Addr, subnet_mask: Ipv4Addr) -> bool {
-    let mask = subnet_mask.octets();
-    let a1 = addr1.octets();
-    let a2 = addr2.octets();
-    // Compare each octet after applying the mask
-    (a1[0] & mask[0] == a2[0] & mask[0])
-        && (a1[1] & mask[1] == a2[1] & mask[1])
-        && (a1[2] & mask[2] == a2[2] & mask[2])
-        && (a1[3] & mask[3] == a2[3] & mask[3])
+    let mask = subnet_mask.to_bits();
+    let a1 = addr1.to_bits();
+    let a2 = addr2.to_bits();
+    a1 & mask == a2 & mask
 }

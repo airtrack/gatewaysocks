@@ -123,6 +123,65 @@ impl StreamStats {
         self.stats.congestion_window.store(cwnd, Ordering::Relaxed);
     }
 
+    /// Increments the count of congestion events encountered.
+    ///
+    /// Used to track how many times congestion control has detected
+    /// and responded to network congestion during the connection.
+    #[inline]
+    pub(super) fn increase_congestion_times(&self) {
+        self.stats.congestion_times.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Updates the smoothed round-trip time (SRTT) in microseconds.
+    ///
+    /// # Arguments
+    ///
+    /// * `srtt` - Smoothed RTT estimate in microseconds
+    #[inline]
+    pub(super) fn set_srtt(&self, srtt: usize) {
+        self.stats.srtt.store(srtt, Ordering::Relaxed);
+    }
+
+    /// Updates the minimum round-trip time observed in microseconds.
+    ///
+    /// # Arguments
+    ///
+    /// * `min_rtt` - Minimum RTT observed in microseconds
+    #[inline]
+    pub(super) fn set_min_rtt(&self, min_rtt: usize) {
+        self.stats.min_rtt.store(min_rtt, Ordering::Relaxed);
+    }
+
+    /// Updates the remote peer's advertised receive window size.
+    ///
+    /// # Arguments
+    ///
+    /// * `rwnd` - Remote window size in bytes
+    #[inline]
+    pub(super) fn set_remote_window(&self, rwnd: usize) {
+        self.stats.remote_window.store(rwnd, Ordering::Relaxed);
+    }
+
+    /// Increments the total number of bytes transmitted.
+    ///
+    /// # Arguments
+    ///
+    /// * `bytes` - Number of bytes being transmitted
+    #[inline]
+    pub(super) fn increase_tx_bytes(&self, bytes: usize) {
+        self.stats.tx_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Increments the total number of bytes received.
+    ///
+    /// # Arguments
+    ///
+    /// * `bytes` - Number of bytes being received
+    #[inline]
+    pub(super) fn increase_rx_bytes(&self, bytes: usize) {
+        self.stats.rx_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
     /// Returns the current TCP connection state.
     ///
     /// Returns State::Closed if the stored state value is invalid.
@@ -164,6 +223,42 @@ impl StreamStats {
     pub fn get_congestion_window(&self) -> usize {
         self.stats.congestion_window.load(Ordering::Relaxed)
     }
+
+    /// Returns the total number of congestion events encountered.
+    #[inline]
+    pub fn get_congestion_times(&self) -> usize {
+        self.stats.congestion_times.load(Ordering::Relaxed)
+    }
+
+    /// Returns the current smoothed round-trip time in microseconds.
+    #[inline]
+    pub fn get_srtt(&self) -> usize {
+        self.stats.srtt.load(Ordering::Relaxed)
+    }
+
+    /// Returns the minimum round-trip time observed in microseconds.
+    #[inline]
+    pub fn get_min_rtt(&self) -> usize {
+        self.stats.min_rtt.load(Ordering::Relaxed)
+    }
+
+    /// Returns the remote peer's current advertised receive window size.
+    #[inline]
+    pub fn get_remote_window(&self) -> usize {
+        self.stats.remote_window.load(Ordering::Relaxed)
+    }
+
+    /// Returns the total number of bytes transmitted.
+    #[inline]
+    pub fn get_tx_bytes(&self) -> usize {
+        self.stats.tx_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Returns the total number of bytes received.
+    #[inline]
+    pub fn get_rx_bytes(&self) -> usize {
+        self.stats.rx_bytes.load(Ordering::Relaxed)
+    }
 }
 
 /// Internal statistics storage using atomic operations for thread safety.
@@ -181,6 +276,18 @@ struct StreamStatsInner {
     congestion_state: AtomicUsize,
     /// Current congestion window size in bytes
     congestion_window: AtomicUsize,
+    /// Total count of congestion events detected
+    congestion_times: AtomicUsize,
+    /// Smoothed round-trip time in microseconds
+    srtt: AtomicUsize,
+    /// Minimum round-trip time observed in microseconds
+    min_rtt: AtomicUsize,
+    /// Remote peer's advertised receive window size
+    remote_window: AtomicUsize,
+    /// Total bytes transmitted
+    tx_bytes: AtomicUsize,
+    /// Total bytes received
+    rx_bytes: AtomicUsize,
 }
 
 /// TCP congestion control states according to congestion control algorithms.

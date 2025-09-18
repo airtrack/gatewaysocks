@@ -315,7 +315,7 @@ impl Controller for Cubic {
             State::CongestionAvoidance(ref mut timing) => {
                 timing.on_avoidance(now);
                 let t = timing.t(now);
-                self.congestion_avoidance(t, rtt.get());
+                self.congestion_avoidance(t, rtt.min());
             }
         }
 
@@ -333,6 +333,7 @@ impl Controller for Cubic {
         self.stats.set_congestion_window(self.window);
         self.stats
             .set_congestion_state(stats::CongestionState::Recovery);
+        self.stats.increase_congestion_times();
     }
 }
 

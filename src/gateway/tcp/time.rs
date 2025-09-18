@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// TCP stream timing tracker for timestamps and connection lifecycle.
 ///
@@ -23,7 +23,7 @@ impl StreamTime {
         }
     }
 
-    /// Returns elapsed milliseconds since stream initialization as u32 timestamp.
+    /// Returns u32 timestamp since stream initialization.
     ///
     /// This is used for TCP timestamp option values. The result wraps around
     /// at u32::MAX, which is handled correctly by TCP timestamp processing.
@@ -31,9 +31,28 @@ impl StreamTime {
     ///
     /// # Arguments
     ///
-    /// * `now` - Current time to calculate elapsed duration from
-    pub(super) fn elapsed_millis(&self, now: Instant) -> u32 {
-        (now - self.init).as_millis() as u32
+    /// * `now` - Current time to calculate timestamp
+    pub(super) fn timestamp(&self, now: Instant) -> u32 {
+        (now - self.init).as_micros() as u32
+    }
+
+    /// Calculates the duration between a start timestamp and current time.
+    ///
+    /// Handles timestamp wraparound correctly by using wrapping arithmetic.
+    /// Used for measuring elapsed time between TCP timestamp values.
+    ///
+    /// # Arguments
+    ///
+    /// * `now` - Current time instant
+    /// * `start` - Starting timestamp (from TCP timestamp option)
+    ///
+    /// # Returns
+    ///
+    /// Duration between start timestamp and current time
+    pub(super) fn duration(&self, now: Instant, start: u32) -> Duration {
+        let now = self.timestamp(now);
+        let duration = now.wrapping_sub(start);
+        Duration::from_micros(duration as u64)
     }
 
     /// Returns the last time this stream was active.
@@ -56,26 +75,26 @@ mod tests {
     fn test_timestamp() {
         let now = Instant::now();
         let time = StreamTime::new(now);
-        let duration = Duration::from_millis(u32::MAX as u64);
+        let duration = Duration::from_micros(u32::MAX as u64);
 
         // Test timestamp at u32::MAX
         let now = time.init + duration;
-        let t1 = time.elapsed_millis(now);
+        let t1 = time.timestamp(now);
         assert_eq!(t1, u32::MAX);
 
         // Test wraparound: u32::MAX + 1 wraps to 0
-        let now = now + Duration::from_millis(1);
-        let t2 = time.elapsed_millis(now);
+        let now = now + Duration::from_micros(1);
+        let t2 = time.timestamp(now);
         assert_eq!(t2, 0);
 
         // Test continued counting after wraparound
-        let now = now + Duration::from_millis(10);
-        let t3 = time.elapsed_millis(now);
+        let now = now + Duration::from_micros(10);
+        let t3 = time.timestamp(now);
         assert_eq!(t3, 10);
 
         // Test another full cycle: should wrap again
         let now = now + duration;
-        let t4 = time.elapsed_millis(now);
+        let t4 = time.timestamp(now);
         assert_eq!(t4, 9); // 10 - 1 (due to previous +1)
     }
 }

@@ -139,7 +139,19 @@ async fn gateway_stats(listen: &str, tcp_stats: tcp::StatsMap, udp_stats: udp::S
         #[tabled(rename = "Congestion State")]
         state: &'static str,
         #[tabled(rename = "Congestion Window")]
-        window: usize,
+        cwnd: usize,
+        #[tabled(rename = "Congestion Times")]
+        times: usize,
+        #[tabled(rename = "Min-RTT")]
+        min_rtt: usize,
+        #[tabled(rename = "SRTT")]
+        srtt: usize,
+        #[tabled(rename = "Remote Window")]
+        rwnd: usize,
+        #[tabled(rename = "TX Bytes")]
+        tx_bytes: usize,
+        #[tabled(rename = "RX Bytes")]
+        rx_bytes: usize,
     }
 
     struct StatsState {
@@ -198,7 +210,13 @@ async fn gateway_stats(listen: &str, tcp_stats: tcp::StatsMap, udp_stats: udp::S
                 },
                 limited: v.get_congestion_limited(),
                 state: v.get_congestion_state().to_str(),
-                window: v.get_congestion_window(),
+                cwnd: v.get_congestion_window(),
+                times: v.get_congestion_times(),
+                min_rtt: v.get_min_rtt(),
+                srtt: v.get_srtt(),
+                rwnd: v.get_remote_window(),
+                tx_bytes: v.get_tx_bytes(),
+                rx_bytes: v.get_rx_bytes(),
             };
             entries.push(entry);
         });

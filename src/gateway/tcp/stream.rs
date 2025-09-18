@@ -225,6 +225,9 @@ impl TcpStreamControlBlock {
         let pacing = Pacer::new(DEFAULT_RTT, congestion.window(), GRANULARITY, DEFAULT_MSS);
         let rtt = RttEstimator::new(DEFAULT_RTT, DEFAULT_RTO, GRANULARITY);
 
+        stats.set_srtt(rtt.get().as_micros() as usize);
+        stats.set_min_rtt(rtt.min().as_micros() as usize);
+
         Self {
             stats,
             src_mac,
@@ -331,6 +334,8 @@ impl TcpStreamControlBlock {
         if self.recv_buffer.readable() {
             let size = self.recv_buffer.read(buf.initialize_unfilled());
             buf.advance(size);
+
+            self.stats.increase_rx_bytes(size);
             self.stats.set_recv_queue(self.recv_buffer.readable_size());
             return std::task::Poll::Ready(Ok(()));
         }
@@ -841,13 +846,13 @@ impl TcpStreamControlBlock {
             }
 
             trace!(
-                "{}[{}]: resend data at seq: {}, len: {}, rto: {}({})ms",
+                "{}[{}]: resend data at seq: {}, len: {}, rto: {}({})us",
                 self.addr_pair,
                 self.state,
                 in_flight.seq(),
                 in_flight.len(),
-                rto.as_millis(),
-                self.rtt.rto().as_millis()
+                rto.as_micros(),
+                self.rtt.rto().as_micros()
             );
 
             self.congestion.on_congestion(now, in_flight.sent_time());
@@ -866,10 +871,11 @@ impl TcpStreamControlBlock {
     fn send_pending(&mut self, now: Instant) -> Option<Instant> {
         let srtt = self.rtt.get();
         let cwnd = self.congestion.window();
+        let rwnd = self.state_data.remote_window as usize;
         let sent_seq = self.state_data.seq;
 
         let mut until_time = None;
-        let mut window = cwnd.saturating_sub(self.send_buffer.in_flight());
+        let mut window = rwnd.saturating_sub(self.send_buffer.in_flight());
         let mut sent_bytes = 0;
 
         for data in self.send_buffer.pending_iter() {
@@ -921,15 +927,13 @@ impl TcpStreamControlBlock {
     fn update_remote_window(&mut self, request: &TcpPacket) {
         self.state_data.remote_window = request.get_window() as u32;
         self.state_data.remote_window <<= self.state_data.wscale;
+        self.stats
+            .set_remote_window(self.state_data.remote_window as usize);
+
         trace!(
             "{}[{}]: update remote window size: {}",
             self.addr_pair, self.state, self.state_data.remote_window
         );
-    }
-
-    /// Gets current timestamp in milliseconds for TCP timestamp option.
-    fn timestamp(&self) -> u32 {
-        self.time.elapsed_millis(Instant::now())
     }
 
     /// Adds TCP timestamp option with proper padding to options list.
@@ -937,7 +941,7 @@ impl TcpStreamControlBlock {
         opts.push(TcpOption::nop());
         opts.push(TcpOption::nop());
         opts.push(TcpOption::timestamp(
-            self.timestamp(),
+            self.time.timestamp(Instant::now()),
             self.state_data.remote_ts,
         ));
         *opts_size += 12;
@@ -1135,15 +1139,19 @@ impl TcpStreamControlBlock {
 
                 let echo_ts = u32::from_be_bytes(payload);
                 if echo_ts != 0 {
-                    let rtt = self.timestamp() - echo_ts;
-                    self.rtt.update(Duration::from_millis(rtt as u64));
+                    let rtt = self.time.duration(Instant::now(), echo_ts);
+
+                    self.rtt.update(rtt);
+                    self.stats.set_srtt(self.rtt.get().as_micros() as usize);
+                    self.stats.set_min_rtt(self.rtt.min().as_micros() as usize);
+
                     trace!(
-                        "{}[{}]: rtt {}ms, srtt {}ms, rto {}ms",
+                        "{}[{}]: rtt {}us, srtt {}us, rto {}us",
                         self.addr_pair,
                         self.state,
-                        self.rtt.latest().as_millis(),
-                        self.rtt.get().as_millis(),
-                        self.rtt.rto().as_millis(),
+                        self.rtt.latest().as_micros(),
+                        self.rtt.get().as_micros(),
+                        self.rtt.rto().as_micros(),
                     );
                 }
             }
@@ -1159,8 +1167,10 @@ impl TcpStreamControlBlock {
         let in_flight = self.send_buffer.in_flight();
         trace!("{}[{}]: process ack: {}", self.addr_pair, self.state, ack);
 
+        let mut ack_bytes = 0;
         self.send_buffer.ack_in_flight(ack, |sent_time, bytes| {
             self.congestion.on_ack(now, sent_time, bytes, &self.rtt);
+            ack_bytes += bytes;
         });
 
         if in_flight != self.send_buffer.in_flight() {
@@ -1173,6 +1183,7 @@ impl TcpStreamControlBlock {
             }
         }
 
+        self.stats.increase_tx_bytes(ack_bytes);
         self.stats.set_send_queue(self.send_buffer.len());
     }
 
