@@ -871,8 +871,14 @@ impl TcpStreamControlBlock {
     fn send_pending(&mut self, now: Instant) -> Option<Instant> {
         let srtt = self.rtt.get();
         let cwnd = self.congestion.window();
-        let rwnd = self.state_data.remote_window as usize;
         let sent_seq = self.state_data.seq;
+
+        // Probe the new remote window size if the remote window is 0
+        let rwnd = if self.state_data.remote_window == 0 {
+            1
+        } else {
+            self.state_data.remote_window as usize
+        };
 
         let mut until_time = None;
         let mut window = rwnd.saturating_sub(self.send_buffer.in_flight());
