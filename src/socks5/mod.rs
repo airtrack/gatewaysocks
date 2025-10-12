@@ -4,37 +4,43 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-pub const ATYP_IPV4: u8 = 1;
+const ATYP_IPV4: u8 = 1;
 const VER: u8 = 5;
 const NO_AUTH: u8 = 0;
 const CMD_CONNECT: u8 = 1;
 const CMD_UDP_ASSOCIATE: u8 = 3;
 
 pub struct Handshaker {
-    server: SocketAddr,
     stream: TcpStream,
 }
 
 impl Handshaker {
-    pub async fn new(server: SocketAddr) -> Result<Self> {
-        let stream = TcpStream::connect(server).await?;
-        let mut handshaker = Self { server, stream };
+    async fn new(addr: SocketAddr) -> Result<Self> {
+        let stream = TcpStream::connect(addr).await?;
+        let mut handshaker = Self { stream };
 
         handshaker.select_method().await?;
         Ok(handshaker)
     }
 
-    pub fn into_tcp_stream(self) -> TcpStream {
-        self.stream
+    pub async fn connect(socks5: SocketAddr, destination: SocketAddr) -> Result<TcpStream> {
+        let mut handshaker = Self::new(socks5).await?;
+        handshaker.handshake(destination, CMD_CONNECT).await?;
+        Ok(handshaker.stream)
     }
 
-    pub async fn connect(&mut self, destination: SocketAddr) -> Result<SocketAddr> {
-        self.handshake(destination, CMD_CONNECT).await
-    }
+    pub async fn udp_associate(
+        socks5: SocketAddr,
+        local_addr: SocketAddr,
+    ) -> Result<(SocketAddr, TcpStream)> {
+        let mut handshaker = Self::new(socks5).await?;
+        let mut addr = handshaker.handshake(local_addr, CMD_UDP_ASSOCIATE).await?;
 
-    pub async fn udp_associate(&mut self, local_addr: SocketAddr) -> Result<SocketAddr> {
-        let addr = self.handshake(local_addr, CMD_UDP_ASSOCIATE).await?;
-        Ok(SocketAddr::new(self.server.ip(), addr.port()))
+        if addr.ip().is_unspecified() {
+            addr = SocketAddr::new(socks5.ip(), addr.port());
+        }
+
+        Ok((addr, handshaker.stream))
     }
 
     async fn select_method(&mut self) -> Result<()> {
@@ -79,5 +85,91 @@ impl Handshaker {
         let port = u16::from_be_bytes(response[8..10].try_into().unwrap());
 
         Ok(SocketAddr::V4(SocketAddrV4::new(ip, port)))
+    }
+}
+
+pub struct UdpSocketBuf {
+    buf: [u8; 1500],
+    data_len: usize,
+}
+
+impl UdpSocketBuf {
+    pub fn new() -> Self {
+        Self {
+            buf: [0u8; _],
+            data_len: 0,
+        }
+    }
+
+    pub fn as_mut(&mut self) -> &mut [u8] {
+        &mut self.buf[10..]
+    }
+
+    pub fn set_len(&mut self, len: usize) {
+        self.data_len = len;
+    }
+
+    pub fn as_ref(&self) -> &[u8] {
+        &self.buf[10..10 + self.data_len]
+    }
+}
+
+pub struct UdpSocket {
+    socket: tokio::net::UdpSocket,
+}
+
+impl UdpSocket {
+    pub fn from(socket: tokio::net::UdpSocket) -> Self {
+        Self { socket }
+    }
+
+    pub async fn send_to(
+        &self,
+        buf: &mut UdpSocketBuf,
+        addr: SocketAddrV4,
+        proxy_addr: SocketAddr,
+    ) -> Result<()> {
+        let len = buf.data_len;
+        let buf = &mut buf.buf;
+
+        buf[0] = 0;
+        buf[1] = 0;
+        buf[2] = 0;
+        buf[3] = ATYP_IPV4;
+        buf[4..8].copy_from_slice(&addr.ip().octets());
+        buf[8..10].copy_from_slice(&addr.port().to_be_bytes());
+
+        self.socket.send_to(&buf[..10 + len], proxy_addr).await?;
+        Ok(())
+    }
+
+    pub async fn recv_from(&self, buf: &mut UdpSocketBuf) -> Result<SocketAddrV4> {
+        loop {
+            let (n, _) = self.socket.recv_from(&mut buf.buf).await?;
+            if n <= 10 || buf.buf[3] != ATYP_IPV4 {
+                continue;
+            }
+
+            buf.set_len(n - 10);
+
+            let buf = &mut buf.buf;
+            let ip = Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]);
+            let port = u16::from_be_bytes(buf[8..10].try_into().unwrap());
+
+            return Ok(SocketAddrV4::new(ip, port));
+        }
+    }
+}
+
+pub async fn udp_holder(stream: &mut TcpStream) -> Result<()> {
+    loop {
+        let mut buffer = [0u8; 1024];
+        let size = stream.read(&mut buffer).await?;
+        if size == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "holding tcp closed",
+            ));
+        }
     }
 }

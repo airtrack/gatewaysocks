@@ -13,49 +13,38 @@ use getopts::Options;
 use log::info;
 use tabled::settings::Style;
 use tabled::{Table, Tabled};
-use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::runtime::Runtime;
 use tokio::time::sleep_until;
 
 async fn gateway_udp_send(
     socket: &gateway::UdpSocket,
-    osocket: &UdpSocket,
+    osocket: &socks5::UdpSocket,
     proxy_addr: SocketAddr,
     t: Arc<AtomicInstant>,
 ) -> std::io::Result<()> {
+    let mut buf = socks5::UdpSocketBuf::new();
+
     loop {
-        let mut buf = [0u8; 1500];
-        let (size, dst) = socket.recv(&mut buf[10..]).await?;
+        let (size, dst) = socket.recv(buf.as_mut()).await?;
+        buf.set_len(size);
 
-        buf[0] = 0;
-        buf[1] = 0;
-        buf[2] = 0;
-        buf[3] = socks5::ATYP_IPV4;
-        buf[4..8].copy_from_slice(&dst.ip().octets());
-        buf[8..10].copy_from_slice(&dst.port().to_be_bytes());
-
-        osocket.send_to(&buf[..10 + size], proxy_addr).await?;
+        osocket.send_to(&mut buf, dst, proxy_addr).await?;
         t.store(Instant::now(), Ordering::Relaxed);
     }
 }
 
 async fn gateway_udp_recv(
     socket: &gateway::UdpSocket,
-    osocket: &UdpSocket,
+    osocket: &socks5::UdpSocket,
     t: Arc<AtomicInstant>,
 ) -> std::io::Result<()> {
-    loop {
-        let mut buf = [0u8; 1500];
-        let (n, _) = osocket.recv_from(&mut buf).await?;
-        if n <= 10 || buf[3] != socks5::ATYP_IPV4 {
-            continue;
-        }
+    let mut buf = socks5::UdpSocketBuf::new();
 
-        let ip = Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]);
-        let port = u16::from_be_bytes(buf[8..10].try_into().unwrap());
-        let from = SocketAddrV4::new(ip, port);
-        socket.try_send(&buf[10..n], from)?;
+    loop {
+        let from = osocket.recv_from(&mut buf).await?;
+
+        socket.try_send(buf.as_ref(), from)?;
         t.store(Instant::now(), Ordering::Relaxed);
     }
 }
@@ -72,23 +61,15 @@ async fn gateway_udp_timeout(t: Arc<AtomicInstant>, timeout: Duration) -> std::i
 }
 
 async fn gateway_udp_holder(mut holder: TcpStream) -> std::io::Result<()> {
-    loop {
-        let mut buffer = [0u8; 1024];
-        let size = holder.read(&mut buffer).await?;
-        if size == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionAborted,
-                "holding tcp closed",
-            ));
-        }
-    }
+    socks5::udp_holder(&mut holder).await
 }
 
 async fn gateway_udp_socket(socket: gateway::UdpSocket, socks5: SocketAddr) -> std::io::Result<()> {
-    let mut handshaker = socks5::Handshaker::new(socks5).await?;
     let osocket = UdpSocket::bind("0.0.0.0:0").await?;
-    let proxy_addr = handshaker.udp_associate(osocket.local_addr()?).await?;
-    let holder = handshaker.into_tcp_stream();
+    let (proxy_addr, holder) =
+        socks5::Handshaker::udp_associate(socks5, osocket.local_addr()?).await?;
+    let osocket = socks5::UdpSocket::from(osocket);
+
     let t = Arc::new(AtomicInstant::now());
     let timeout = Duration::from_secs(60);
 
@@ -103,11 +84,8 @@ async fn gateway_udp_socket(socket: gateway::UdpSocket, socks5: SocketAddr) -> s
 }
 
 async fn gateway_tcp_stream(stream: gateway::TcpStream, socks5: SocketAddr) -> std::io::Result<()> {
-    let mut handshaker = socks5::Handshaker::new(socks5).await?;
-    handshaker.connect(stream.destination_addr()).await?;
-
+    let mut ostream = socks5::Handshaker::connect(socks5, stream.destination_addr()).await?;
     let mut stream = stream;
-    let mut ostream = handshaker.into_tcp_stream();
 
     tokio::io::copy_bidirectional(&mut stream, &mut ostream).await?;
     Ok(())
