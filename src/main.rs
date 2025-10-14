@@ -13,14 +13,13 @@ use getopts::Options;
 use log::info;
 use tabled::settings::Style;
 use tabled::{Table, Tabled};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::runtime::Runtime;
 use tokio::time::sleep_until;
 
 async fn gateway_udp_send(
     socket: &gateway::UdpSocket,
     osocket: &socks5::UdpSocket,
-    proxy_addr: SocketAddr,
     t: Arc<AtomicInstant>,
 ) -> std::io::Result<()> {
     let mut buf = socks5::UdpSocketBuf::new();
@@ -29,7 +28,7 @@ async fn gateway_udp_send(
         let (size, dst) = socket.recv(buf.as_mut()).await?;
         buf.set_len(size);
 
-        osocket.send_to(&mut buf, dst, proxy_addr).await?;
+        osocket.send_to(&mut buf, dst).await?;
         t.store(Instant::now(), Ordering::Relaxed);
     }
 }
@@ -60,21 +59,19 @@ async fn gateway_udp_timeout(t: Arc<AtomicInstant>, timeout: Duration) -> std::i
     }
 }
 
-async fn gateway_udp_holder(mut holder: TcpStream) -> std::io::Result<()> {
-    socks5::udp_holder(&mut holder).await
+async fn gateway_udp_holder(mut holder: socks5::UdpSocketHolder) -> std::io::Result<()> {
+    holder.wait().await
 }
 
 async fn gateway_udp_socket(socket: gateway::UdpSocket, socks5: SocketAddr) -> std::io::Result<()> {
     let osocket = UdpSocket::bind("0.0.0.0:0").await?;
-    let (proxy_addr, holder) =
-        socks5::Handshaker::udp_associate(socks5, osocket.local_addr()?).await?;
-    let osocket = socks5::UdpSocket::from(osocket);
+    let (osocket, holder) = socks5::udp_associate(socks5, osocket).await?;
 
     let t = Arc::new(AtomicInstant::now());
     let timeout = Duration::from_secs(60);
 
     futures::try_join!(
-        gateway_udp_send(&socket, &osocket, proxy_addr, t.clone()),
+        gateway_udp_send(&socket, &osocket, t.clone()),
         gateway_udp_recv(&socket, &osocket, t.clone()),
         gateway_udp_timeout(t, timeout),
         gateway_udp_holder(holder),
@@ -84,7 +81,7 @@ async fn gateway_udp_socket(socket: gateway::UdpSocket, socks5: SocketAddr) -> s
 }
 
 async fn gateway_tcp_stream(stream: gateway::TcpStream, socks5: SocketAddr) -> std::io::Result<()> {
-    let mut ostream = socks5::Handshaker::connect(socks5, stream.destination_addr()).await?;
+    let mut ostream = socks5::connect(socks5, stream.destination_addr()).await?;
     let mut stream = stream;
 
     tokio::io::copy_bidirectional(&mut stream, &mut ostream).await?;

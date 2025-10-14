@@ -10,7 +10,31 @@ const NO_AUTH: u8 = 0;
 const CMD_CONNECT: u8 = 1;
 const CMD_UDP_ASSOCIATE: u8 = 3;
 
-pub struct Handshaker {
+pub async fn connect(socks5: SocketAddr, destination: SocketAddr) -> Result<TcpStream> {
+    let mut handshaker = Handshaker::new(socks5).await?;
+    handshaker.handshake(destination, CMD_CONNECT).await?;
+    Ok(handshaker.stream)
+}
+
+pub async fn udp_associate(
+    socks5: SocketAddr,
+    socket: tokio::net::UdpSocket,
+) -> Result<(UdpSocket, UdpSocketHolder)> {
+    let local_addr = socket.local_addr()?;
+    let mut handshaker = Handshaker::new(socks5).await?;
+    let mut peer_addr = handshaker.handshake(local_addr, CMD_UDP_ASSOCIATE).await?;
+
+    if peer_addr.ip().is_unspecified() {
+        peer_addr = SocketAddr::new(socks5.ip(), peer_addr.port());
+    }
+
+    Ok((
+        UdpSocket::from(socket, peer_addr),
+        UdpSocketHolder::new(handshaker.stream),
+    ))
+}
+
+struct Handshaker {
     stream: TcpStream,
 }
 
@@ -21,26 +45,6 @@ impl Handshaker {
 
         handshaker.select_method().await?;
         Ok(handshaker)
-    }
-
-    pub async fn connect(socks5: SocketAddr, destination: SocketAddr) -> Result<TcpStream> {
-        let mut handshaker = Self::new(socks5).await?;
-        handshaker.handshake(destination, CMD_CONNECT).await?;
-        Ok(handshaker.stream)
-    }
-
-    pub async fn udp_associate(
-        socks5: SocketAddr,
-        local_addr: SocketAddr,
-    ) -> Result<(SocketAddr, TcpStream)> {
-        let mut handshaker = Self::new(socks5).await?;
-        let mut addr = handshaker.handshake(local_addr, CMD_UDP_ASSOCIATE).await?;
-
-        if addr.ip().is_unspecified() {
-            addr = SocketAddr::new(socks5.ip(), addr.port());
-        }
-
-        Ok((addr, handshaker.stream))
     }
 
     async fn select_method(&mut self) -> Result<()> {
@@ -96,7 +100,7 @@ pub struct UdpSocketBuf {
 impl UdpSocketBuf {
     pub fn new() -> Self {
         Self {
-            buf: [0u8; _],
+            buf: [0; _],
             data_len: 0,
         }
     }
@@ -116,19 +120,15 @@ impl UdpSocketBuf {
 
 pub struct UdpSocket {
     socket: tokio::net::UdpSocket,
+    peer_addr: SocketAddr,
 }
 
 impl UdpSocket {
-    pub fn from(socket: tokio::net::UdpSocket) -> Self {
-        Self { socket }
+    pub fn from(socket: tokio::net::UdpSocket, peer_addr: SocketAddr) -> Self {
+        Self { socket, peer_addr }
     }
 
-    pub async fn send_to(
-        &self,
-        buf: &mut UdpSocketBuf,
-        addr: SocketAddrV4,
-        proxy_addr: SocketAddr,
-    ) -> Result<()> {
+    pub async fn send_to(&self, buf: &mut UdpSocketBuf, addr: SocketAddrV4) -> Result<()> {
         let len = buf.data_len;
         let buf = &mut buf.buf;
 
@@ -139,7 +139,9 @@ impl UdpSocket {
         buf[4..8].copy_from_slice(&addr.ip().octets());
         buf[8..10].copy_from_slice(&addr.port().to_be_bytes());
 
-        self.socket.send_to(&buf[..10 + len], proxy_addr).await?;
+        self.socket
+            .send_to(&buf[..10 + len], self.peer_addr)
+            .await?;
         Ok(())
     }
 
@@ -161,15 +163,25 @@ impl UdpSocket {
     }
 }
 
-pub async fn udp_holder(stream: &mut TcpStream) -> Result<()> {
-    loop {
-        let mut buffer = [0u8; 1024];
-        let size = stream.read(&mut buffer).await?;
-        if size == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionAborted,
-                "holding tcp closed",
-            ));
+pub struct UdpSocketHolder {
+    stream: TcpStream,
+}
+
+impl UdpSocketHolder {
+    fn new(stream: TcpStream) -> UdpSocketHolder {
+        Self { stream }
+    }
+
+    pub async fn wait(&mut self) -> Result<()> {
+        loop {
+            let mut buffer = [0u8; 1024];
+            let size = self.stream.read(&mut buffer).await?;
+            if size == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "holding tcp closed",
+                ));
+            }
         }
     }
 }
