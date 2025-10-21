@@ -2,6 +2,7 @@
 
 Relay TCP/UDP to SOCKS5.
 
+```
     ---------------------------------       ----------------       ------------------
     |                               |       |              |       |                |
     |        Nintendo Switch        | ----> | gatewaysocks | ----> |  socks5 proxy  |
@@ -9,6 +10,7 @@ Relay TCP/UDP to SOCKS5.
     |     10.6.0.2/255.255.255.0    | ----> |   10.6.0.1   | ----> | 127.0.0.1:1080 |
     |                               |       |              |       |                |
     ---------------------------------       ----------------       ------------------
+```
 
 * basic TCP/UDP/ARP protocol implementation
 * CUBIC congeston controller implementation for TCP
@@ -22,11 +24,13 @@ Run `gatewaysocks` as root.
 
 ***IMPORTANT*** change the limit of open files to be large enough, e.g. `ulimit -n 100000`.
 
-    ./gatewaysocks \
-        [-s socks5-address(e.g. 127.0.0.1:1080)] \
-        [-i interface(e.g. en0)] \
-        [--gateway-ip ip(e.g. 10.6.0.1)] \
-        [--subnet-mask mask(e.g. 255.255.255.0)]
+```sh
+./gatewaysocks \
+    [-s socks5-address(e.g. 127.0.0.1:1080)] \
+    [-i interface(e.g. en0)] \
+    [--gateway-ip ip(e.g. 10.6.0.1)] \
+    [--subnet-mask mask(e.g. 255.255.255.0)]
+```
 
 By default:
 
@@ -50,12 +54,17 @@ Change device's network settings:
 * [autoproxy](https://github.com/airtrack/autoproxy)
 
 ```
-    ----------------                 -------------                        -----------
-    | gatewaysocks | --- TCP/UDP --> | autoproxy | ------- TCP/UDP -----> | stunnel |
-    ----------------                 -------------    |                   -----------
-           ^                               ^          |                   -----------
-           |                               |          |--- TCP/UDP -----> |  direct |
-           |                               |                              -----------
+    ----------------                 -------------                        -------------
+    |              |                 |           |                        |           |
+    | gatewaysocks | --- TCP/UDP --> | autoproxy | ------- TCP/UDP -----> |  stunnel  |
+    |              |                 |           |    |                   |           |
+    ----------------                 -------------    |                   -------------
+           ^                               ^          |
+           |                               |          |                   -------------
+           |                               |          |                   |           |
+           |                               |          |--- TCP/UDP -----> |  direct   |
+           |                               |                              |           |
+           |                               |                              -------------
     -----------------             ------------------
     |    devices    |             |   set system   |
     |  in the same  |             | proxy settings |
