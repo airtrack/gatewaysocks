@@ -7,8 +7,7 @@ use std::time::{Duration, Instant};
 use atomic_time::AtomicInstant;
 use axum::response::IntoResponse;
 use axum::{Router, routing};
-use gatewaysocks::gateway::{tcp, udp};
-use gatewaysocks::{gateway, socks5};
+use gatewaysocks::gateway::{self, tcp, udp};
 use getopts::Options;
 use log::info;
 use tabled::settings::Style;
@@ -28,7 +27,7 @@ async fn gateway_udp_send(
         let (size, dst) = socket.recv(buf.as_mut()).await?;
         buf.set_len(size);
 
-        osocket.send_to(&mut buf, dst).await?;
+        osocket.send(&mut buf, SocketAddr::V4(dst)).await?;
         t.store(Instant::now(), Ordering::Relaxed);
     }
 }
@@ -41,10 +40,10 @@ async fn gateway_udp_recv(
     let mut buf = socks5::UdpSocketBuf::new();
 
     loop {
-        let from = osocket.recv_from(&mut buf).await?;
-
-        socket.try_send(buf.as_ref(), from)?;
-        t.store(Instant::now(), Ordering::Relaxed);
+        if let SocketAddr::V4(from) = osocket.recv(&mut buf).await? {
+            socket.try_send(buf.as_ref(), from)?;
+            t.store(Instant::now(), Ordering::Relaxed);
+        }
     }
 }
 
@@ -81,7 +80,8 @@ async fn gateway_udp_socket(socket: gateway::UdpSocket, socks5: SocketAddr) -> s
 }
 
 async fn gateway_tcp_stream(stream: gateway::TcpStream, socks5: SocketAddr) -> std::io::Result<()> {
-    let mut ostream = socks5::connect(socks5, stream.destination_addr()).await?;
+    let destination = socks5::Address::Ip(stream.destination_addr());
+    let mut ostream = socks5::connect(socks5, destination).await?;
     let mut stream = stream;
 
     tokio::io::copy_bidirectional(&mut stream, &mut ostream).await?;

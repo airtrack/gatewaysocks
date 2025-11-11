@@ -352,6 +352,7 @@ dependencies = [
  "log",
  "pnet",
  "rand",
+ "socks5",
  "tabled",
  "tokio",
 ]
@@ -1012,6 +1013,14 @@ checksum = "233504af464074f9d066d7b5416c5f9b894a5862a6506e306f7b816cdd6f1807"
 dependencies = [
  "libc",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "socks5"
+version = "0.1.0"
+source = "git+https://github.com/airtrack/sproxy.git?tag=0.1.0#f63fea8f318b64295ee2befdae937e342092c778"
+dependencies = [
+ "tokio",
 ]
 
 [[package]]
