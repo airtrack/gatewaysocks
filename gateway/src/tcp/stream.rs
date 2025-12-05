@@ -15,16 +15,16 @@ use pnet::packet::{MutablePacket, Packet};
 use pnet::util::MacAddr;
 use tokio::time::{Sleep, sleep_until};
 
-use crate::gateway::GatewaySender;
-use crate::gateway::tcp::StreamCloser;
-use crate::gateway::tcp::congestion::{Controller, Cubic};
-use crate::gateway::tcp::pacing::Pacer;
-use crate::gateway::tcp::recv_buffer::RecvBuffer;
-use crate::gateway::tcp::rtt::RttEstimator;
-use crate::gateway::tcp::send_buffer::SendBuffer;
-use crate::gateway::tcp::stats::StreamStats;
-use crate::gateway::tcp::time::StreamTime;
-use crate::gateway::tcp::types::{AddrPair, State};
+use crate::GatewaySender;
+use crate::tcp::StreamCloser;
+use crate::tcp::congestion::{Controller, Cubic};
+use crate::tcp::pacing::Pacer;
+use crate::tcp::recv_buffer::RecvBuffer;
+use crate::tcp::rtt::RttEstimator;
+use crate::tcp::send_buffer::SendBuffer;
+use crate::tcp::stats::StreamStats;
+use crate::tcp::time::StreamTime;
+use crate::tcp::types::{AddrPair, State};
 
 const MSL_2: Duration = Duration::from_secs(60);
 const FIN_TIMEOUT: Duration = Duration::from_secs(600);

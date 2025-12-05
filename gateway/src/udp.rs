@@ -17,7 +17,7 @@ use tokio::sync::mpsc::{
     Receiver, Sender, UnboundedReceiver, UnboundedSender, channel, unbounded_channel,
 };
 
-use crate::gateway::GatewaySender;
+use crate::GatewaySender;
 
 /// Creates a new UDP handler and binder pair.
 ///

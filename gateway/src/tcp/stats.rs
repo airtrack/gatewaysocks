@@ -5,7 +5,7 @@ use std::sync::{
 
 use dashmap::DashMap;
 
-use crate::gateway::tcp::types::{AddrPair, State};
+use crate::tcp::types::{AddrPair, State};
 
 /// Thread-safe map of TCP connection statistics indexed by address pairs.
 ///

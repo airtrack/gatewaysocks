@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use crate::gateway::tcp::{StreamStats, rtt::RttEstimator, stats};
+use crate::tcp::{StreamStats, rtt::RttEstimator, stats};
 
 /// Trait for TCP congestion control algorithms.
 ///

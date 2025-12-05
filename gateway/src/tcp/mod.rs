@@ -28,8 +28,8 @@ use tokio::sync::mpsc::{
     Receiver, Sender, UnboundedReceiver, UnboundedSender, channel, unbounded_channel,
 };
 
-use crate::gateway::GatewaySender;
-use crate::gateway::tcp::stream::{TcpStreamInner, is_syn_packet};
+use crate::GatewaySender;
+use crate::tcp::stream::{TcpStreamInner, is_syn_packet};
 
 mod congestion;
 mod pacing;

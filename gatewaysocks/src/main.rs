@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use atomic_time::AtomicInstant;
 use axum::response::IntoResponse;
 use axum::{Router, routing};
-use gatewaysocks::gateway::{self, tcp, udp};
+use gateway::{tcp, udp};
 use getopts::Options;
 use log::info;
 use tabled::settings::Style;

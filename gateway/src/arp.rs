@@ -10,7 +10,7 @@ use pnet::packet::{MutablePacket, Packet};
 use pnet::util::MacAddr;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use crate::gateway::GatewaySender;
+use crate::GatewaySender;
 
 /// Creates a new ARP handler with the given packet channel and gateway sender.
 ///
