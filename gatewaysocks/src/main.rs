@@ -13,7 +13,6 @@ use log::info;
 use tabled::settings::Style;
 use tabled::{Table, Tabled};
 use tokio::net::{TcpListener, UdpSocket};
-use tokio::runtime::Runtime;
 use tokio::time::sleep_until;
 
 async fn gateway_udp_send(
@@ -254,7 +253,8 @@ async fn gateway_serve(
     futures::join!(fut_udp, fut_tcp, fut_stats);
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let args: Vec<String> = env::args().collect();
     let mut opts = Options::new();
 
@@ -290,8 +290,5 @@ fn main() {
     let gateway = gateway_addr.parse::<Ipv4Addr>().unwrap();
     let subnet_mask = subnet_addr.parse::<Ipv4Addr>().unwrap();
 
-    let rt = Runtime::new().unwrap();
-    rt.block_on(async move {
-        gateway_serve(&stats, &iface_name, gateway, subnet_mask, socks5).await;
-    });
+    gateway_serve(&stats, &iface_name, gateway, subnet_mask, socks5).await;
 }
