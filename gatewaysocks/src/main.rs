@@ -10,6 +10,9 @@ use axum::{Router, routing};
 use gateway::{tcp, udp};
 use getopts::Options;
 use log::info;
+use opentelemetry::{KeyValue, global};
+use opentelemetry_otlp::{MetricExporter, Protocol, WithExportConfig};
+use opentelemetry_sdk::metrics::SdkMeterProvider;
 use tabled::settings::Style;
 use tabled::{Table, Tabled};
 use tokio::net::{TcpListener, UdpSocket};
@@ -214,6 +217,53 @@ async fn gateway_stats(listen: &str, tcp_stats: tcp::StatsMap, udp_stats: udp::S
     axum::serve(listener, app).await.unwrap();
 }
 
+fn gateway_metrics(tcp_stats: tcp::StatsMap) {
+    let exporter = MetricExporter::builder()
+        .with_http()
+        .with_endpoint("http://localhost:9090/api/v1/otlp/v1/metrics")
+        .with_protocol(Protocol::HttpJson)
+        .build()
+        .unwrap();
+
+    let meter_provider = SdkMeterProvider::builder()
+        .with_periodic_exporter(exporter)
+        .build();
+
+    global::set_meter_provider(meter_provider);
+
+    let meter = global::meter("gatewaysocks");
+
+    macro_rules! metric_u64 {
+        ($meter:ident, $name:expr, $iter:ident, $get_fn:ident) => {
+            let m = $iter.clone();
+            $meter
+                .u64_observable_gauge($name)
+                .with_callback(move |observer| {
+                    m.for_each(|k, v| {
+                        observer.observe(
+                            v.$get_fn() as u64,
+                            &[KeyValue::new("socket_pair", k.to_string())],
+                        );
+                    });
+                })
+                .build();
+        };
+    }
+
+    metric_u64!(meter, "tcp_state", tcp_stats, get_state);
+    metric_u64!(meter, "tcp_send_queue", tcp_stats, get_send_queue);
+    metric_u64!(meter, "tcp_recv_queue", tcp_stats, get_recv_queue);
+    metric_u64!(meter, "tcp_climited", tcp_stats, get_congestion_limited);
+    metric_u64!(meter, "tcp_cstate", tcp_stats, get_congestion_state);
+    metric_u64!(meter, "tcp_cwnd", tcp_stats, get_congestion_window);
+    metric_u64!(meter, "tcp_ctimes", tcp_stats, get_congestion_times);
+    metric_u64!(meter, "tcp_min_rtt", tcp_stats, get_min_rtt);
+    metric_u64!(meter, "tcp_srtt", tcp_stats, get_srtt);
+    metric_u64!(meter, "tcp_rwnd", tcp_stats, get_remote_window);
+    metric_u64!(meter, "tcp_tx_bytes", tcp_stats, get_tx_bytes);
+    metric_u64!(meter, "tcp_rx_bytes", tcp_stats, get_rx_bytes);
+}
+
 async fn gateway_serve(
     stats: &str,
     iface_name: &str,
@@ -229,6 +279,8 @@ async fn gateway_serve(
     let (mut udp, mut tcp) = gateway::new(gateway, subnet_mask, iface_name).unwrap();
     let udp_stats = udp.get_stats();
     let tcp_stats = tcp.get_stats();
+
+    gateway_metrics(tcp_stats.clone());
 
     let fut_udp = async {
         loop {
