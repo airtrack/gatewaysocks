@@ -10,6 +10,9 @@ use axum::{Router, routing};
 use gateway::{tcp, udp};
 use getopts::Options;
 use log::info;
+use opentelemetry::{KeyValue, global};
+use opentelemetry_otlp::{MetricExporter, Protocol, WithExportConfig};
+use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use tabled::settings::Style;
 use tabled::{Table, Tabled};
 use tokio::net::{TcpListener, UdpSocket};
@@ -214,12 +217,61 @@ async fn gateway_stats(listen: &str, tcp_stats: tcp::StatsMap, udp_stats: udp::S
     axum::serve(listener, app).await.unwrap();
 }
 
+fn gateway_metrics(opentel: &str, tcp_stats: tcp::StatsMap) {
+    let exporter = MetricExporter::builder()
+        .with_http()
+        .with_endpoint(opentel.to_string() + "/v1/metrics")
+        .with_protocol(Protocol::HttpBinary)
+        .build()
+        .unwrap();
+
+    let reader = PeriodicReader::builder(exporter)
+        .with_interval(Duration::from_secs(1))
+        .build();
+    let meter_provider = SdkMeterProvider::builder().with_reader(reader).build();
+
+    global::set_meter_provider(meter_provider);
+
+    let meter = global::meter("gatewaysocks");
+
+    macro_rules! metric_u64 {
+        ($meter:ident, $name:expr, $iter:ident, $get_fn:ident) => {
+            let m = $iter.clone();
+            $meter
+                .u64_observable_gauge($name)
+                .with_callback(move |observer| {
+                    m.for_each(|k, v| {
+                        observer.observe(
+                            v.$get_fn() as u64,
+                            &[KeyValue::new("socket_pair", k.to_string())],
+                        );
+                    });
+                })
+                .build();
+        };
+    }
+
+    metric_u64!(meter, "tcp_state", tcp_stats, get_state);
+    metric_u64!(meter, "tcp_send_queue", tcp_stats, get_send_queue);
+    metric_u64!(meter, "tcp_recv_queue", tcp_stats, get_recv_queue);
+    metric_u64!(meter, "tcp_climited", tcp_stats, get_congestion_limited);
+    metric_u64!(meter, "tcp_cstate", tcp_stats, get_congestion_state);
+    metric_u64!(meter, "tcp_cwnd", tcp_stats, get_congestion_window);
+    metric_u64!(meter, "tcp_ctimes", tcp_stats, get_congestion_times);
+    metric_u64!(meter, "tcp_min_rtt", tcp_stats, get_min_rtt);
+    metric_u64!(meter, "tcp_srtt", tcp_stats, get_srtt);
+    metric_u64!(meter, "tcp_rwnd", tcp_stats, get_remote_window);
+    metric_u64!(meter, "tcp_tx_bytes", tcp_stats, get_tx_bytes);
+    metric_u64!(meter, "tcp_rx_bytes", tcp_stats, get_rx_bytes);
+}
+
 async fn gateway_serve(
     stats: &str,
     iface_name: &str,
     gateway: Ipv4Addr,
     subnet_mask: Ipv4Addr,
     socks5: SocketAddr,
+    opentel: Option<&str>,
 ) {
     info!(
         "start gatewaysocks on {}: {}({}), relay to socks5://{} ...",
@@ -229,6 +281,10 @@ async fn gateway_serve(
     let (mut udp, mut tcp) = gateway::new(gateway, subnet_mask, iface_name).unwrap();
     let udp_stats = udp.get_stats();
     let tcp_stats = tcp.get_stats();
+
+    if let Some(opentel) = opentel {
+        gateway_metrics(opentel, tcp_stats.clone());
+    }
 
     let fut_udp = async {
         loop {
@@ -263,6 +319,7 @@ async fn main() {
     opts.optopt("", "gateway-ip", "gateway ip", "gateway");
     opts.optopt("", "subnet-mask", "subnet mask", "subnet");
     opts.optopt("", "stats", "query statistics", "ip:port");
+    opts.optopt("", "opentel", "opentel address", "http://ip:port");
 
     let matches = match opts.parse(&args[1..]) {
         Ok(m) => m,
@@ -280,6 +337,7 @@ async fn main() {
     let stats = matches
         .opt_str("stats")
         .unwrap_or("127.0.0.1:3080".to_string());
+    let opentel = matches.opt_str("opentel");
 
     env_logger::builder()
         .filter_level(log::LevelFilter::Info)
@@ -290,5 +348,13 @@ async fn main() {
     let gateway = gateway_addr.parse::<Ipv4Addr>().unwrap();
     let subnet_mask = subnet_addr.parse::<Ipv4Addr>().unwrap();
 
-    gateway_serve(&stats, &iface_name, gateway, subnet_mask, socks5).await;
+    gateway_serve(
+        &stats,
+        &iface_name,
+        gateway,
+        subnet_mask,
+        socks5,
+        opentel.as_deref(),
+    )
+    .await;
 }
