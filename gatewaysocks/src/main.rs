@@ -90,7 +90,7 @@ async fn gateway_tcp_stream(stream: gateway::TcpStream, socks5: SocketAddr) -> s
     Ok(())
 }
 
-async fn gateway_stats(listen: &str, tcp_stats: tcp::StatsMap, udp_stats: udp::StatsSet) {
+async fn gateway_netstat(listen: &str, tcp_stats: tcp::StatsMap, udp_stats: udp::StatsSet) {
     #[derive(Tabled)]
     struct SocketEntry {
         #[tabled(rename = "Proto")]
@@ -266,7 +266,7 @@ fn gateway_metrics(opentel: &str, tcp_stats: tcp::StatsMap) {
 }
 
 async fn gateway_serve(
-    stats: &str,
+    netstat: &str,
     iface_name: &str,
     gateway: Ipv4Addr,
     subnet_mask: Ipv4Addr,
@@ -304,7 +304,7 @@ async fn gateway_serve(
             tokio::spawn(gateway_tcp_stream(stream, socks5));
         }
     };
-    let fut_stats = gateway_stats(stats, tcp_stats, udp_stats);
+    let fut_stats = gateway_netstat(netstat, tcp_stats, udp_stats);
 
     futures::join!(fut_udp, fut_tcp, fut_stats);
 }
@@ -318,7 +318,7 @@ async fn main() {
     opts.optopt("s", "socks5", "socks5 address", "socks5");
     opts.optopt("", "gateway-ip", "gateway ip", "gateway");
     opts.optopt("", "subnet-mask", "subnet mask", "subnet");
-    opts.optopt("", "stats", "query statistics", "ip:port");
+    opts.optopt("", "netstat", "netstat listen address", "ip:port");
     opts.optopt("", "opentel", "opentel address", "http://ip:port");
 
     let matches = match opts.parse(&args[1..]) {
@@ -334,8 +334,8 @@ async fn main() {
     let subnet_addr = matches
         .opt_str("subnet-mask")
         .unwrap_or("255.255.255.0".to_string());
-    let stats = matches
-        .opt_str("stats")
+    let netstat = matches
+        .opt_str("netstat")
         .unwrap_or("127.0.0.1:3080".to_string());
     let opentel = matches.opt_str("opentel");
 
@@ -349,7 +349,7 @@ async fn main() {
     let subnet_mask = subnet_addr.parse::<Ipv4Addr>().unwrap();
 
     gateway_serve(
-        &stats,
+        &netstat,
         &iface_name,
         gateway,
         subnet_mask,
