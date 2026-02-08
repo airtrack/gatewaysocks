@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 use std::net::SocketAddrV4;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
-use dashmap::DashSet;
+use dashmap::DashMap;
 use log::trace;
 use pnet::packet::ethernet::{EtherTypes, EthernetPacket, MutableEthernetPacket};
 use pnet::packet::ip::IpNextHeaderProtocols;
@@ -46,7 +47,7 @@ pub(super) fn new(
         socket_closer,
         closed_socket,
         sockets: HashMap::new(),
-        stats: StatsSet::new(),
+        stats: StatsMap::new(),
     };
 
     let binder = UdpBinder {
@@ -68,7 +69,7 @@ pub(super) struct UdpHandler {
     socket_closer: UnboundedSender<SocketAddrV4>,
     closed_socket: UnboundedReceiver<SocketAddrV4>,
     sockets: HashMap<SocketAddrV4, UdpSocketInner>,
-    stats: StatsSet,
+    stats: StatsMap,
 }
 
 impl UdpHandler {
@@ -96,7 +97,7 @@ impl UdpHandler {
     /// Removes a closed socket from the active sockets map.
     fn remove_socket(&mut self, addr: SocketAddrV4) {
         self.sockets.remove(&addr);
-        self.stats.set.remove(&addr);
+        self.stats.map.remove(&addr);
     }
 
     /// Processes an incoming UDP packet.
@@ -118,9 +119,11 @@ impl UdpHandler {
         match self.sockets.get(&src) {
             Some(inner) => inner.try_input_packet(data, dst).ok()?,
             None => {
+                let stats = SocketStats::new();
                 let (packets_tx, packets_rx) = channel(32);
 
                 let socket = UdpSocket {
+                    stats: stats.clone(),
                     source_mac: mac,
                     source_addr: src,
                     gw_sender: self.gw_sender.clone(),
@@ -134,7 +137,7 @@ impl UdpHandler {
 
                 inner.try_input_packet(data, dst).ok()?;
                 self.sockets.insert(src, inner);
-                self.stats.set.insert(src);
+                self.stats.map.insert(src, stats);
                 self.new_socket.send(socket).ok()?;
             }
         }
@@ -143,17 +146,17 @@ impl UdpHandler {
     }
 }
 
-/// Thread-safe set for tracking active UDP socket addresses.
+/// Thread-safe map for tracking active UDP socket addresses.
 ///
-/// Provides concurrent access to the set of active UDP sockets
+/// Provides concurrent access to the map of active UDP sockets
 /// for statistics and monitoring purposes.
 #[derive(Clone, Default)]
-pub struct StatsSet {
-    set: Arc<DashSet<SocketAddrV4>>,
+pub struct StatsMap {
+    map: Arc<DashMap<SocketAddrV4, SocketStats>>,
 }
 
-impl StatsSet {
-    /// Creates a new empty statistics set.
+impl StatsMap {
+    /// Creates a new empty statistics map.
     #[inline]
     fn new() -> Self {
         Self::default()
@@ -167,12 +170,93 @@ impl StatsSet {
     #[inline]
     pub fn for_each<F>(&self, mut f: F)
     where
-        F: FnMut(&SocketAddrV4),
+        F: FnMut(&SocketAddrV4, &SocketStats),
     {
-        for item in self.set.iter() {
-            f(item.key());
+        for item in self.map.iter() {
+            f(item.key(), item.value());
         }
     }
+}
+
+/// Statistics tracker for UDP socket traffic.
+///
+/// Provides thread-safe counters for tracking transmitted and received
+/// packets and bytes for a UDP socket. The statistics are tracked using
+/// atomic counters, making them safe for concurrent access from multiple threads.
+#[derive(Clone)]
+pub struct SocketStats(Arc<SocketStatsInner>);
+
+impl SocketStats {
+    #[inline]
+    fn new() -> Self {
+        Self(Arc::new(SocketStatsInner::default()))
+    }
+
+    #[inline]
+    fn increase_tx_packet(&self, bytes_of_packet: usize) {
+        self.0.tx_packets.fetch_add(1, Ordering::Relaxed);
+        self.0
+            .tx_bytes
+            .fetch_add(bytes_of_packet, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn increase_rx_packet(&self, bytes_of_packet: usize) {
+        self.0.rx_packets.fetch_add(1, Ordering::Relaxed);
+        self.0
+            .rx_bytes
+            .fetch_add(bytes_of_packet, Ordering::Relaxed);
+    }
+
+    /// Returns the number of packets transmitted from the socket.
+    ///
+    /// This counts all UDP datagrams that have been sent through this socket.
+    #[inline]
+    pub fn get_tx_packets(&self) -> usize {
+        self.0.tx_packets.load(Ordering::Relaxed)
+    }
+
+    /// Returns the total number of bytes transmitted from the socket.
+    ///
+    /// This includes the payload size of all UDP datagrams sent through this socket.
+    #[inline]
+    pub fn get_tx_bytes(&self) -> usize {
+        self.0.tx_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Returns the number of packets received by the socket.
+    ///
+    /// This counts all UDP datagrams that have been received by this socket.
+    #[inline]
+    pub fn get_rx_packets(&self) -> usize {
+        self.0.rx_packets.load(Ordering::Relaxed)
+    }
+
+    /// Returns the total number of bytes received by the socket.
+    ///
+    /// This includes the payload size of all UDP datagrams received by this socket.
+    #[inline]
+    pub fn get_rx_bytes(&self) -> usize {
+        self.0.rx_bytes.load(Ordering::Relaxed)
+    }
+}
+
+/// Internal struct for UDP socket statistics counters.
+///
+/// Stores atomic counters for tracking packet and byte counts in both
+/// transmission (TX) and reception (RX) directions. This struct is
+/// wrapped by `SocketStats` to provide a public interface while keeping
+/// the implementation details private.
+#[derive(Default)]
+struct SocketStatsInner {
+    /// Number of packets transmitted from the socket
+    tx_packets: AtomicUsize,
+    /// Number of packets received by the socket
+    rx_packets: AtomicUsize,
+    /// Total bytes transmitted from the socket
+    tx_bytes: AtomicUsize,
+    /// Total bytes received by the socket
+    rx_bytes: AtomicUsize,
 }
 
 /// UDP socket binder for accepting incoming UDP connections.
@@ -180,7 +264,7 @@ impl StatsSet {
 /// Provides an interface for applications to accept new UDP sockets
 /// and access connection statistics.
 pub struct UdpBinder {
-    stats: StatsSet,
+    stats: StatsMap,
     sockets: UnboundedReceiver<UdpSocket>,
 }
 
@@ -196,8 +280,8 @@ impl UdpBinder {
         ))
     }
 
-    /// Returns a clone of the current socket statistics set.
-    pub fn get_stats(&self) -> StatsSet {
+    /// Returns a clone of the current socket statistics map.
+    pub fn get_stats(&self) -> StatsMap {
         self.stats.clone()
     }
 }
@@ -208,6 +292,7 @@ impl UdpBinder {
 /// UDP datagrams. Handles packet construction and transmission at the
 /// network layer.
 pub struct UdpSocket {
+    stats: SocketStats,
     source_mac: MacAddr,
     source_addr: SocketAddrV4,
     gw_sender: GatewaySender,
@@ -242,6 +327,7 @@ impl UdpSocket {
         ))?;
 
         trace!("{} send data({}) to {}", self.source_addr, data.len(), dst);
+        self.stats.increase_tx_packet(data.len());
 
         let size = data.len().min(buf.len());
         buf[..size].copy_from_slice(&data[..size]);
@@ -265,6 +351,7 @@ impl UdpSocket {
             buf.len(),
             from
         );
+        self.stats.increase_rx_packet(buf.len());
 
         // Calculate packet sizes: UDP header (8) + payload
         let udp_packet_len = 8 + buf.len();

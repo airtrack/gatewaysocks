@@ -90,7 +90,7 @@ async fn gateway_tcp_stream(stream: gateway::TcpStream, socks5: SocketAddr) -> s
     Ok(())
 }
 
-async fn gateway_netstat(listen: &str, tcp_stats: tcp::StatsMap, udp_stats: udp::StatsSet) {
+async fn gateway_netstat(listen: &str, tcp_stats: tcp::StatsMap, udp_stats: udp::StatsMap) {
     #[derive(Tabled)]
     struct SocketEntry {
         #[tabled(rename = "Proto")]
@@ -131,9 +131,23 @@ async fn gateway_netstat(listen: &str, tcp_stats: tcp::StatsMap, udp_stats: udp:
         rx_bytes: usize,
     }
 
+    #[derive(Tabled)]
+    struct UdpSocketEntry {
+        #[tabled(rename = "Source Address")]
+        source: SocketAddrV4,
+        #[tabled(rename = "TX Packets")]
+        tx_packets: usize,
+        #[tabled(rename = "RX Packets")]
+        rx_packets: usize,
+        #[tabled(rename = "TX Bytes")]
+        tx_bytes: usize,
+        #[tabled(rename = "RX Bytes")]
+        rx_bytes: usize,
+    }
+
     struct StatsState {
         tcp: tcp::StatsMap,
-        udp: udp::StatsSet,
+        udp: udp::StatsMap,
     }
 
     async fn netstat(
@@ -153,7 +167,7 @@ async fn gateway_netstat(listen: &str, tcp_stats: tcp::StatsMap, udp_stats: udp:
             entries.push(entry);
         });
 
-        stats.udp.for_each(|k| {
+        stats.udp.for_each(|k, _| {
             let entry = SocketEntry {
                 proto: "udp4",
                 recv_queue: 0,
@@ -203,6 +217,27 @@ async fn gateway_netstat(listen: &str, tcp_stats: tcp::StatsMap, udp_stats: udp:
         table.to_string()
     }
 
+    async fn netstat_udp(
+        axum::extract::State(stats): axum::extract::State<Arc<StatsState>>,
+    ) -> impl IntoResponse {
+        let mut entries = Vec::new();
+
+        stats.udp.for_each(|k, v| {
+            let entry = UdpSocketEntry {
+                source: *k,
+                tx_packets: v.get_tx_packets(),
+                rx_packets: v.get_rx_packets(),
+                tx_bytes: v.get_tx_bytes(),
+                rx_bytes: v.get_rx_bytes(),
+            };
+            entries.push(entry);
+        });
+
+        let mut table = Table::new(entries);
+        table.with(Style::empty());
+        table.to_string()
+    }
+
     let stats_state = Arc::new(StatsState {
         tcp: tcp_stats,
         udp: udp_stats,
@@ -211,13 +246,14 @@ async fn gateway_netstat(listen: &str, tcp_stats: tcp::StatsMap, udp_stats: udp:
     let app = Router::new()
         .route("/netstat", routing::get(netstat))
         .route("/netstat/tcp", routing::get(netstat_tcp))
+        .route("/netstat/udp", routing::get(netstat_udp))
         .with_state(stats_state);
 
     let listener = TcpListener::bind(listen).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
 
-fn gateway_metrics(opentel: &str, tcp_stats: tcp::StatsMap) {
+fn gateway_metrics(opentel: &str, tcp_stats: tcp::StatsMap, udp_stats: udp::StatsMap) {
     let exporter = MetricExporter::builder()
         .with_http()
         .with_endpoint(opentel.to_string() + "/v1/metrics")
@@ -235,34 +271,49 @@ fn gateway_metrics(opentel: &str, tcp_stats: tcp::StatsMap) {
     let meter = global::meter("gatewaysocks");
 
     macro_rules! metric_u64 {
-        ($meter:ident, $name:expr, $iter:ident, $get_fn:ident) => {
+        ($meter:ident, $label:expr, $name:expr, $iter:ident, $get_fn:ident) => {
             let m = $iter.clone();
             $meter
                 .u64_observable_gauge($name)
                 .with_callback(move |observer| {
                     m.for_each(|k, v| {
-                        observer.observe(
-                            v.$get_fn() as u64,
-                            &[KeyValue::new("socket_pair", k.to_string())],
-                        );
+                        observer
+                            .observe(v.$get_fn() as u64, &[KeyValue::new($label, k.to_string())]);
                     });
                 })
                 .build();
         };
     }
 
-    metric_u64!(meter, "tcp_state", tcp_stats, get_state);
-    metric_u64!(meter, "tcp_send_queue", tcp_stats, get_send_queue);
-    metric_u64!(meter, "tcp_recv_queue", tcp_stats, get_recv_queue);
-    metric_u64!(meter, "tcp_climited", tcp_stats, get_congestion_limited);
-    metric_u64!(meter, "tcp_cstate", tcp_stats, get_congestion_state);
-    metric_u64!(meter, "tcp_cwnd", tcp_stats, get_congestion_window);
-    metric_u64!(meter, "tcp_ctimes", tcp_stats, get_congestion_times);
-    metric_u64!(meter, "tcp_min_rtt", tcp_stats, get_min_rtt);
-    metric_u64!(meter, "tcp_srtt", tcp_stats, get_srtt);
-    metric_u64!(meter, "tcp_rwnd", tcp_stats, get_remote_window);
-    metric_u64!(meter, "tcp_tx_bytes", tcp_stats, get_tx_bytes);
-    metric_u64!(meter, "tcp_rx_bytes", tcp_stats, get_rx_bytes);
+    macro_rules! metric_u64_tcp {
+        ($meter:ident, $name:expr, $iter:ident, $get_fn:ident) => {
+            metric_u64!($meter, "socket_pair", $name, $iter, $get_fn);
+        };
+    }
+
+    macro_rules! metric_u64_udp {
+        ($meter:ident, $name:expr, $iter:ident, $get_fn:ident) => {
+            metric_u64!($meter, "socket", $name, $iter, $get_fn);
+        };
+    }
+
+    metric_u64_tcp!(meter, "tcp_state", tcp_stats, get_state);
+    metric_u64_tcp!(meter, "tcp_send_queue", tcp_stats, get_send_queue);
+    metric_u64_tcp!(meter, "tcp_recv_queue", tcp_stats, get_recv_queue);
+    metric_u64_tcp!(meter, "tcp_climited", tcp_stats, get_congestion_limited);
+    metric_u64_tcp!(meter, "tcp_cstate", tcp_stats, get_congestion_state);
+    metric_u64_tcp!(meter, "tcp_cwnd", tcp_stats, get_congestion_window);
+    metric_u64_tcp!(meter, "tcp_ctimes", tcp_stats, get_congestion_times);
+    metric_u64_tcp!(meter, "tcp_min_rtt", tcp_stats, get_min_rtt);
+    metric_u64_tcp!(meter, "tcp_srtt", tcp_stats, get_srtt);
+    metric_u64_tcp!(meter, "tcp_rwnd", tcp_stats, get_remote_window);
+    metric_u64_tcp!(meter, "tcp_tx_bytes", tcp_stats, get_tx_bytes);
+    metric_u64_tcp!(meter, "tcp_rx_bytes", tcp_stats, get_rx_bytes);
+
+    metric_u64_udp!(meter, "udp_tx_packets", udp_stats, get_tx_packets);
+    metric_u64_udp!(meter, "udp_rx_packets", udp_stats, get_rx_packets);
+    metric_u64_udp!(meter, "udp_tx_bytes", udp_stats, get_tx_bytes);
+    metric_u64_udp!(meter, "udp_rx_bytes", udp_stats, get_rx_bytes);
 }
 
 async fn gateway_serve(
@@ -283,7 +334,7 @@ async fn gateway_serve(
     let tcp_stats = tcp.get_stats();
 
     if let Some(opentel) = opentel {
-        gateway_metrics(opentel, tcp_stats.clone());
+        gateway_metrics(opentel, tcp_stats.clone(), udp_stats.clone());
     }
 
     let fut_udp = async {
