@@ -16,22 +16,76 @@ use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use tabled::settings::Style;
 use tabled::{Table, Tabled};
 use tokio::net::{TcpListener, UdpSocket};
+use tokio::sync::oneshot;
 use tokio::time::sleep_until;
 
 async fn gateway_udp_send(
     socket: &gateway::UdpSocket,
     osocket: &socks5::UdpSocket,
     t: Arc<AtomicInstant>,
+    gateway_ip: Ipv4Addr,
+    upstream_dns: Option<SocketAddr>,
 ) -> std::io::Result<()> {
-    let mut buf = socks5::UdpSocketBuf::new();
+    let (dns_tx, dns_rx) = if upstream_dns.is_some() {
+        let (tx, rx) = oneshot::channel();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
 
-    loop {
-        let (size, dst) = socket.recv(buf.as_mut()).await?;
-        buf.set_len(size);
+    let send_loop = async || -> std::io::Result<()> {
+        let mut buf = socks5::UdpSocketBuf::new();
+        let mut dns_socket: Option<Arc<UdpSocket>> = None;
+        let mut dns_tx = dns_tx;
 
-        osocket.send(&mut buf, SocketAddr::V4(dst)).await?;
-        t.store(Instant::now(), Ordering::Relaxed);
-    }
+        loop {
+            let (size, dst) = socket.recv(buf.as_mut()).await?;
+            buf.set_len(size);
+
+            if let Some(upstream_dns) = upstream_dns {
+                if dst == SocketAddrV4::new(gateway_ip, 53) {
+                    if dns_socket.is_none() {
+                        let s = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+                        dns_socket = Some(s.clone());
+                        dns_tx.take().map(|tx| tx.send(s).ok());
+                    }
+
+                    dns_socket
+                        .as_ref()
+                        .unwrap()
+                        .send_to(buf.as_ref(), upstream_dns)
+                        .await?;
+                }
+            } else {
+                osocket.send(&mut buf, SocketAddr::V4(dst)).await?;
+            }
+
+            t.store(Instant::now(), Ordering::Relaxed);
+        }
+    };
+
+    let dns_recv_loop = async || -> std::io::Result<()> {
+        if let Some(rx) = dns_rx {
+            let dns_socket = match rx.await {
+                Ok(s) => s,
+                Err(_) => futures::future::pending::<Arc<UdpSocket>>().await,
+            };
+
+            let mut buf = [0u8; 2048];
+            let from = SocketAddrV4::new(gateway_ip, 53);
+
+            loop {
+                let (size, _) = dns_socket.recv_from(&mut buf).await?;
+                socket.try_send(&buf[..size], from)?;
+                t.store(Instant::now(), Ordering::Relaxed);
+            }
+        } else {
+            futures::future::pending::<std::io::Result<()>>().await
+        }
+    };
+
+    futures::try_join!(send_loop(), dns_recv_loop())?;
+    Ok(())
 }
 
 async fn gateway_udp_recv(
@@ -64,7 +118,12 @@ async fn gateway_udp_holder(mut holder: socks5::UdpSocketHolder) -> std::io::Res
     holder.wait().await
 }
 
-async fn gateway_udp_socket(socket: gateway::UdpSocket, socks5: SocketAddr) -> std::io::Result<()> {
+async fn gateway_udp_socket(
+    socket: gateway::UdpSocket,
+    socks5: SocketAddr,
+    gateway_ip: Ipv4Addr,
+    upstream_dns: Option<SocketAddr>,
+) -> std::io::Result<()> {
     let osocket = UdpSocket::bind("0.0.0.0:0").await?;
     let (osocket, holder) = socks5::udp_associate(socks5, osocket).await?;
 
@@ -72,7 +131,7 @@ async fn gateway_udp_socket(socket: gateway::UdpSocket, socks5: SocketAddr) -> s
     let timeout = Duration::from_secs(60);
 
     futures::try_join!(
-        gateway_udp_send(&socket, &osocket, t.clone()),
+        gateway_udp_send(&socket, &osocket, t.clone(), gateway_ip, upstream_dns),
         gateway_udp_recv(&socket, &osocket, t.clone()),
         gateway_udp_timeout(t, timeout),
         gateway_udp_holder(holder),
@@ -323,6 +382,7 @@ async fn gateway_serve(
     subnet_mask: Ipv4Addr,
     socks5: SocketAddr,
     opentel: Option<&str>,
+    upstream_dns: Option<SocketAddr>,
 ) {
     info!(
         "start gatewaysocks on {}: {}({}), relay to socks5://{} ...",
@@ -341,7 +401,7 @@ async fn gateway_serve(
         loop {
             let socket = udp.accept().await.unwrap();
             info!("UDP socket going out: {}", socket.source_addr());
-            tokio::spawn(gateway_udp_socket(socket, socks5));
+            tokio::spawn(gateway_udp_socket(socket, socks5, gateway, upstream_dns));
         }
     };
     let fut_tcp = async {
@@ -371,6 +431,7 @@ async fn main() {
     opts.optopt("", "subnet-mask", "subnet mask", "subnet");
     opts.optopt("", "netstat", "netstat listen address", "ip:port");
     opts.optopt("", "opentel", "opentel address", "http://ip:port");
+    opts.optopt("", "upstream-dns", "upstream dns address", "ip:port");
 
     let matches = match opts.parse(&args[1..]) {
         Ok(m) => m,
@@ -389,6 +450,9 @@ async fn main() {
         .opt_str("netstat")
         .unwrap_or("127.0.0.1:3080".to_string());
     let opentel = matches.opt_str("opentel");
+    let upstream_dns = matches
+        .opt_str("upstream-dns")
+        .map(|s| s.parse::<SocketAddr>().unwrap());
 
     env_logger::builder()
         .filter_level(log::LevelFilter::Info)
@@ -406,6 +470,7 @@ async fn main() {
         subnet_mask,
         socks5,
         opentel.as_deref(),
+        upstream_dns,
     )
     .await;
 }
