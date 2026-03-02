@@ -29,21 +29,24 @@ Run `gatewaysocks` as root.
     [-s socks5-address(e.g. 127.0.0.1:1080)] \
     [-i interface(e.g. en0)] \
     [--gateway-ip ip(e.g. 10.6.0.1)] \
-    [--subnet-mask mask(e.g. 255.255.255.0)]
+    [--subnet-mask mask(e.g. 255.255.255.0)] \
+    [--netstat ip:port(e.g. 127.0.0.1:3080)] \
+    [--upstream-dns ip[:port](e.g. 192.168.0.1)]
 ```
 
 By default:
 
 * socks5 address is `127.0.0.1:1080`
 * gateway address is `10.6.0.1`
-* subnet mask is `255.255.255.0`.
+* subnet mask is `255.255.255.0`
+* netstat listens on `127.0.0.1:3080`
 
 Change device's network settings:
 
 1. change the IP to an IP in the subnet `10.6.0.1/255.255.255.0`
 2. change the gateway to `10.6.0.1`
 3. change the subnet mask to `255.255.255.0`
-4. change the DNS(e.g. `8.8.8.8`)
+4. change the DNS(e.g. `8.8.8.8`, or the gateway IP if an upstream DNS is specified)
 
 # Status
 `gatewaysocks` was tested on macOS(Apple silicon) and Linux.
