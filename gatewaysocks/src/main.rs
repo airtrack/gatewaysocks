@@ -450,9 +450,14 @@ async fn main() {
         .opt_str("netstat")
         .unwrap_or("127.0.0.1:3080".to_string());
     let opentel = matches.opt_str("opentel");
-    let upstream_dns = matches
-        .opt_str("upstream-dns")
-        .map(|s| s.parse::<SocketAddr>().unwrap());
+    let upstream_dns = matches.opt_str("upstream-dns").map(|s| {
+        s.parse::<SocketAddr>().unwrap_or_else(|_| {
+            let ip = s
+                .parse::<std::net::IpAddr>()
+                .expect("invalid upstream-dns address");
+            SocketAddr::new(ip, 53)
+        })
+    });
 
     env_logger::builder()
         .filter_level(log::LevelFilter::Info)
