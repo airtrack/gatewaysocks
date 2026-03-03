@@ -1,6 +1,6 @@
 [package]
 name = "gatewaysocks"
-version = "0.2.1"
+version = "0.2.2"
 authors = ["airtrack <airtrack.sk@gmail.com>"]
 edition = "2024"
 
