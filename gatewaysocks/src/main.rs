@@ -16,7 +16,7 @@ use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use tabled::settings::Style;
 use tabled::{Table, Tabled};
 use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::oneshot;
+use tokio::sync::oneshot::{self, Receiver, Sender};
 use tokio::time::sleep_until;
 
 async fn gateway_udp_send(
@@ -24,47 +24,68 @@ async fn gateway_udp_send(
     osocket: &socks5::UdpSocket,
     t: Arc<AtomicInstant>,
     gateway_ip: Ipv4Addr,
-    upstream_dns: Option<SocketAddr>,
+    dns_tx: Option<(Sender<Arc<UdpSocket>>, SocketAddr)>,
 ) -> std::io::Result<()> {
-    let (dns_tx, dns_rx) = if upstream_dns.is_some() {
-        let (tx, rx) = oneshot::channel();
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
+    let mut buf = socks5::UdpSocketBuf::new();
 
-    let send_loop = async || -> std::io::Result<()> {
-        let mut buf = socks5::UdpSocketBuf::new();
+    if let Some((tx, upstream_dns)) = dns_tx {
+        let gateway = SocketAddrV4::new(gateway_ip, 53);
         let mut dns_socket: Option<Arc<UdpSocket>> = None;
-        let mut dns_tx = dns_tx;
+        let mut tx = Some(tx);
 
         loop {
             let (size, dst) = socket.recv(buf.as_mut()).await?;
             buf.set_len(size);
 
-            if let Some(upstream_dns) = upstream_dns {
-                if dst == SocketAddrV4::new(gateway_ip, 53) {
-                    if dns_socket.is_none() {
-                        let s = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
-                        dns_socket = Some(s.clone());
-                        dns_tx.take().map(|tx| tx.send(s).ok());
-                    }
-
-                    dns_socket
-                        .as_ref()
-                        .unwrap()
-                        .send_to(buf.as_ref(), upstream_dns)
-                        .await?;
+            if dst == gateway {
+                if dns_socket.is_none() {
+                    let s = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+                    dns_socket = Some(s.clone());
+                    tx.take().map(|tx| tx.send(s).ok());
                 }
+
+                dns_socket
+                    .as_ref()
+                    .unwrap()
+                    .send_to(buf.as_ref(), upstream_dns)
+                    .await?;
+
+                t.store(Instant::now(), Ordering::Relaxed);
             } else {
                 osocket.send(&mut buf, SocketAddr::V4(dst)).await?;
+                t.store(Instant::now(), Ordering::Relaxed);
             }
+        }
+    } else {
+        loop {
+            let (size, dst) = socket.recv(buf.as_mut()).await?;
+            buf.set_len(size);
 
+            osocket.send(&mut buf, SocketAddr::V4(dst)).await?;
             t.store(Instant::now(), Ordering::Relaxed);
+        }
+    }
+}
+
+async fn gateway_udp_recv(
+    socket: &gateway::UdpSocket,
+    osocket: &socks5::UdpSocket,
+    t: Arc<AtomicInstant>,
+    gateway_ip: Ipv4Addr,
+    dns_rx: Option<Receiver<Arc<UdpSocket>>>,
+) -> std::io::Result<()> {
+    let socks5_recv = async || -> std::io::Result<()> {
+        let mut buf = socks5::UdpSocketBuf::new();
+
+        loop {
+            if let SocketAddr::V4(from) = osocket.recv(&mut buf).await? {
+                socket.try_send(buf.as_ref(), from)?;
+                t.store(Instant::now(), Ordering::Relaxed);
+            }
         }
     };
 
-    let dns_recv_loop = async || -> std::io::Result<()> {
+    let dns_recv = async || -> std::io::Result<()> {
         if let Some(rx) = dns_rx {
             let dns_socket = match rx.await {
                 Ok(s) => s,
@@ -84,23 +105,8 @@ async fn gateway_udp_send(
         }
     };
 
-    futures::try_join!(send_loop(), dns_recv_loop())?;
+    futures::try_join!(socks5_recv(), dns_recv())?;
     Ok(())
-}
-
-async fn gateway_udp_recv(
-    socket: &gateway::UdpSocket,
-    osocket: &socks5::UdpSocket,
-    t: Arc<AtomicInstant>,
-) -> std::io::Result<()> {
-    let mut buf = socks5::UdpSocketBuf::new();
-
-    loop {
-        if let SocketAddr::V4(from) = osocket.recv(&mut buf).await? {
-            socket.try_send(buf.as_ref(), from)?;
-            t.store(Instant::now(), Ordering::Relaxed);
-        }
-    }
 }
 
 async fn gateway_udp_timeout(t: Arc<AtomicInstant>, timeout: Duration) -> std::io::Result<()> {
@@ -130,9 +136,17 @@ async fn gateway_udp_socket(
     let t = Arc::new(AtomicInstant::now());
     let timeout = Duration::from_secs(60);
 
+    let (dns_tx, dns_rx) = match upstream_dns {
+        Some(upstream) => {
+            let (tx, rx) = oneshot::channel();
+            (Some((tx, upstream)), Some(rx))
+        }
+        None => (None, None),
+    };
+
     futures::try_join!(
-        gateway_udp_send(&socket, &osocket, t.clone(), gateway_ip, upstream_dns),
-        gateway_udp_recv(&socket, &osocket, t.clone()),
+        gateway_udp_send(&socket, &osocket, t.clone(), gateway_ip, dns_tx),
+        gateway_udp_recv(&socket, &osocket, t.clone(), gateway_ip, dns_rx),
         gateway_udp_timeout(t, timeout),
         gateway_udp_holder(holder),
     )?;
