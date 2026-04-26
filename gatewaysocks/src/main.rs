@@ -1,4 +1,3 @@
-use std::env;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -7,17 +6,109 @@ use std::time::{Duration, Instant};
 use atomic_time::AtomicInstant;
 use axum::response::IntoResponse;
 use axum::{Router, routing};
+use clap::Parser;
 use gateway::{tcp, udp};
-use getopts::Options;
 use log::info;
 use opentelemetry::{KeyValue, global};
 use opentelemetry_otlp::{MetricExporter, Protocol, WithExportConfig};
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
+use shadow_rs::shadow;
 use tabled::settings::Style;
 use tabled::{Table, Tabled};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::oneshot::{self, Receiver, Sender};
 use tokio::time::sleep_until;
+
+shadow!(build);
+
+#[derive(Parser)]
+#[command(name = "gatewaysocks", disable_version_flag = true)]
+struct Args {
+    #[arg(
+        short = 'i',
+        long = "interface",
+        value_name = "interface",
+        help = "ether interface"
+    )]
+    interface: Option<String>,
+
+    #[arg(
+        short = 's',
+        long = "socks5",
+        value_name = "socks5",
+        default_value = "127.0.0.1:1080",
+        help = "socks5 address"
+    )]
+    socks5: SocketAddr,
+
+    #[arg(
+        long = "gateway-ip",
+        value_name = "gateway",
+        default_value = "10.6.0.1",
+        help = "gateway ip"
+    )]
+    gateway_ip: Ipv4Addr,
+
+    #[arg(
+        long = "subnet-mask",
+        value_name = "subnet",
+        default_value = "255.255.255.0",
+        help = "subnet mask"
+    )]
+    subnet_mask: Ipv4Addr,
+
+    #[arg(
+        long = "netstat",
+        value_name = "ip:port",
+        default_value = "127.0.0.1:3080",
+        help = "netstat listen address"
+    )]
+    netstat: String,
+
+    #[arg(
+        long = "opentel",
+        value_name = "http://ip:port",
+        help = "opentel address"
+    )]
+    opentel: Option<String>,
+
+    #[arg(
+        long = "upstream-dns",
+        value_name = "ip:port",
+        value_parser = parse_upstream_dns,
+        help = "upstream dns address"
+    )]
+    upstream_dns: Option<SocketAddr>,
+
+    #[arg(long = "version", help = "print version information")]
+    version: bool,
+}
+
+fn parse_upstream_dns(s: &str) -> Result<SocketAddr, String> {
+    s.parse::<SocketAddr>().or_else(|_| {
+        let ip = s
+            .parse::<std::net::IpAddr>()
+            .map_err(|_| "invalid upstream-dns address".to_string())?;
+        Ok(SocketAddr::new(ip, 53))
+    })
+}
+
+fn version() -> String {
+    let git_dirty = if build::GIT_CLEAN { "" } else { "*" };
+    let build_time = build::BUILD_TIME
+        .rsplit_once(' ')
+        .map(|(date, _)| date)
+        .unwrap_or(build::BUILD_TIME);
+
+    format!(
+        "{} {} ({}{} {})",
+        build::PROJECT_NAME,
+        build::PKG_VERSION,
+        build::SHORT_COMMIT,
+        git_dirty,
+        build_time
+    )
+}
 
 async fn gateway_udp_send(
     socket: &gateway::UdpSocket,
@@ -436,60 +527,28 @@ async fn gateway_serve(
 
 #[tokio::main]
 async fn main() {
-    let args: Vec<String> = env::args().collect();
-    let mut opts = Options::new();
+    let args = Args::parse();
 
-    opts.optopt("i", "interface", "ether interface", "interface");
-    opts.optopt("s", "socks5", "socks5 address", "socks5");
-    opts.optopt("", "gateway-ip", "gateway ip", "gateway");
-    opts.optopt("", "subnet-mask", "subnet mask", "subnet");
-    opts.optopt("", "netstat", "netstat listen address", "ip:port");
-    opts.optopt("", "opentel", "opentel address", "http://ip:port");
-    opts.optopt("", "upstream-dns", "upstream dns address", "ip:port");
-
-    let matches = match opts.parse(&args[1..]) {
-        Ok(m) => m,
-        Err(_) => return println!("{}", opts.short_usage(&args[0])),
-    };
-
-    let iface_name = matches.opt_str("i").unwrap_or("".to_string());
-    let socks5_addr = matches.opt_str("s").unwrap_or("127.0.0.1:1080".to_string());
-    let gateway_addr = matches
-        .opt_str("gateway-ip")
-        .unwrap_or("10.6.0.1".to_string());
-    let subnet_addr = matches
-        .opt_str("subnet-mask")
-        .unwrap_or("255.255.255.0".to_string());
-    let netstat = matches
-        .opt_str("netstat")
-        .unwrap_or("127.0.0.1:3080".to_string());
-    let opentel = matches.opt_str("opentel");
-    let upstream_dns = matches.opt_str("upstream-dns").map(|s| {
-        s.parse::<SocketAddr>().unwrap_or_else(|_| {
-            let ip = s
-                .parse::<std::net::IpAddr>()
-                .expect("invalid upstream-dns address");
-            SocketAddr::new(ip, 53)
-        })
-    });
+    if args.version {
+        println!("{}", version());
+        return;
+    }
 
     env_logger::builder()
         .filter_level(log::LevelFilter::Info)
         .parse_default_env()
         .init();
 
-    let socks5 = socks5_addr.parse::<SocketAddr>().unwrap();
-    let gateway = gateway_addr.parse::<Ipv4Addr>().unwrap();
-    let subnet_mask = subnet_addr.parse::<Ipv4Addr>().unwrap();
+    let iface_name = args.interface.unwrap_or_default();
 
     gateway_serve(
-        &netstat,
+        &args.netstat,
         &iface_name,
-        gateway,
-        subnet_mask,
-        socks5,
-        opentel.as_deref(),
-        upstream_dns,
+        args.gateway_ip,
+        args.subnet_mask,
+        args.socks5,
+        args.opentel.as_deref(),
+        args.upstream_dns,
     )
     .await;
 }

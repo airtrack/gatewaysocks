@@ -31,7 +31,8 @@ Run `gatewaysocks` as root.
     [--gateway-ip ip(e.g. 10.6.0.1)] \
     [--subnet-mask mask(e.g. 255.255.255.0)] \
     [--netstat ip:port(e.g. 127.0.0.1:3080)] \
-    [--upstream-dns ip[:port](e.g. 192.168.0.1)]
+    [--upstream-dns ip[:port](e.g. 192.168.0.1)] \
+    [--version]
 ```
 
 By default:
