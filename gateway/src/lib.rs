@@ -1,7 +1,7 @@
 //! Network gateway module for intercepting and processing network packets.
 //!
 //! This module implements a network gateway that captures packets at the data link layer,
-//! processes them based on protocol type (ARP, UDP, TCP), and provides application-level
+//! processes them based on protocol type (ARP, ICMP, UDP, TCP), and provides application-level
 //! interfaces for network communication. It acts as a bridge between raw network packets
 //! and high-level async I/O abstractions.
 //!
@@ -9,7 +9,7 @@
 //!
 //! - `GatewayReceiver`: Captures raw packets and routes them to protocol handlers
 //! - `GatewaySender`: Sends packets back to the network interface
-//! - Protocol handlers: ARP, UDP, and TCP processing modules
+//! - Protocol handlers: ARP, ICMP, UDP, and TCP processing modules
 //! - Application interfaces: `UdpBinder`, `TcpListener` for async I/O
 
 use std::net::Ipv4Addr;
@@ -31,6 +31,7 @@ pub use udp::UdpBinder;
 pub use udp::UdpSocket;
 
 mod arp;
+mod icmp;
 pub mod tcp;
 pub mod udp;
 
@@ -97,6 +98,7 @@ pub fn new(
     };
 
     let (arp_tx, arp_rx) = unbounded_channel();
+    let (icmp_tx, icmp_rx) = unbounded_channel();
     let (udp_tx, udp_rx) = unbounded_channel();
     let (tcp_tx, tcp_rx) = unbounded_channel();
 
@@ -109,16 +111,19 @@ pub fn new(
         info,
         datalink_rx,
         arp_channel: arp_tx,
+        icmp_channel: icmp_tx,
         udp_channel: udp_tx,
         tcp_channel: tcp_tx,
     };
 
     let arp_handler = arp::new_arp(arp_rx, gw_sender.clone());
+    let icmp_handler = icmp::new(icmp_rx, gw_sender.clone());
     let (udp_handler, udp_binder) = udp::new(udp_rx, gw_sender.clone());
     let (tcp_handler, tcp_listener) = tcp::new(tcp_rx, gw_sender);
 
     gw_receiver.start();
     arp_handler.start();
+    icmp_handler.start();
     udp_handler.start();
     tcp_handler.start();
 
@@ -182,6 +187,8 @@ struct GatewayReceiver {
     datalink_rx: Box<dyn DataLinkReceiver>,
     /// Channel for sending ARP packets to ARP handler
     arp_channel: UnboundedSender<Bytes>,
+    /// Channel for sending ICMP packets to ICMP handler
+    icmp_channel: UnboundedSender<Bytes>,
     /// Channel for sending UDP packets to UDP handler
     udp_channel: UnboundedSender<Bytes>,
     /// Channel for sending TCP packets to TCP handler
@@ -219,6 +226,7 @@ impl GatewayReceiver {
 
                                     // Route based on IP protocol
                                     match ipv4_packet.get_next_level_protocol() {
+                                        IpNextHeaderProtocols::Icmp => self.handle_icmp(data),
                                         IpNextHeaderProtocols::Udp => self.handle_udp(data),
                                         IpNextHeaderProtocols::Tcp => self.handle_tcp(data),
                                         _ => {}
@@ -238,6 +246,11 @@ impl GatewayReceiver {
     /// Routes ARP packets to the ARP handler.
     fn handle_arp(&self, data: Bytes) {
         self.arp_channel.send(data).unwrap();
+    }
+
+    /// Routes ICMP packets to the ICMP handler.
+    fn handle_icmp(&self, data: Bytes) {
+        self.icmp_channel.send(data).unwrap();
     }
 
     /// Routes UDP packets to the UDP handler.
