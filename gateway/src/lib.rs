@@ -56,6 +56,7 @@ pub mod udp;
 /// - Network interface not found or unavailable
 /// - MAC address not available
 /// - Interface is not Ethernet-compatible
+/// - Raw ICMP transport cannot be opened
 pub fn new(
     addr: Ipv4Addr,
     mask: Ipv4Addr,
@@ -117,7 +118,7 @@ pub fn new(
     };
 
     let arp_handler = arp::new_arp(arp_rx, gw_sender.clone());
-    let icmp_handler = icmp::new(icmp_rx, gw_sender.clone());
+    let icmp_handler = icmp::new(icmp_rx, gw_sender.clone())?;
     let (udp_handler, udp_binder) = udp::new(udp_rx, gw_sender.clone());
     let (tcp_handler, tcp_listener) = tcp::new(tcp_rx, gw_sender);
 
