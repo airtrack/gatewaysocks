@@ -14,6 +14,7 @@ use pnet::packet::tcp::{self, MutableTcpPacket, TcpFlags, TcpOption, TcpOptionNu
 use pnet::packet::{MutablePacket, Packet};
 use pnet::util::MacAddr;
 use tokio::time::{Sleep, sleep_until};
+use tracing::{Span, info_span};
 
 use crate::GatewaySender;
 use crate::tcp::StreamCloser;
@@ -47,6 +48,30 @@ pub(super) fn is_syn_packet(request: &TcpPacket) -> bool {
     request.get_flags() & TcpFlags::SYN != 0
 }
 
+/// Creates the span of a connection state as a child of the connection span.
+///
+/// The parent is passed explicitly rather than inherited: state spans are
+/// created from the driver task, which never enters the connection span.
+///
+/// The state is in the span name rather than in a field, so that a trace shows
+/// which state a span covers without opening the span. Every arm needs its own
+/// literal name, since `tracing` resolves a span name into a static callsite at
+/// compile time.
+fn state_span(parent: &Span, state: State) -> Span {
+    match state {
+        State::Listen => info_span!(parent: parent, "listen"),
+        State::SynRcvd => info_span!(parent: parent, "syn_rcvd"),
+        State::Estab => info_span!(parent: parent, "estab"),
+        State::FinWait1 => info_span!(parent: parent, "fin_wait1"),
+        State::FinWait2 => info_span!(parent: parent, "fin_wait2"),
+        State::Closing => info_span!(parent: parent, "closing"),
+        State::TimeWait => info_span!(parent: parent, "time_wait"),
+        State::CloseWait => info_span!(parent: parent, "close_wait"),
+        State::LastAck => info_span!(parent: parent, "last_ack"),
+        State::Closed => info_span!(parent: parent, "closed"),
+    }
+}
+
 /// Thread-safe wrapper around the TCP stream control block.
 ///
 /// Provides a mutex-protected interface to the TCP connection state
@@ -62,6 +87,7 @@ impl TcpStreamInner {
         stream_closer: StreamCloser,
         gw_sender: GatewaySender,
         stats: StreamStats,
+        span: Span,
     ) -> Self {
         TcpStreamInner {
             cb: Mutex::new(TcpStreamControlBlock::new(
@@ -70,6 +96,7 @@ impl TcpStreamInner {
                 stream_closer,
                 gw_sender,
                 stats,
+                span,
             )),
         }
     }
@@ -110,12 +137,18 @@ impl TcpStreamInner {
     }
 
     pub(super) fn poll_state(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
-        self.cb.lock().unwrap().poll_state(cx)
+        self.cb
+            .lock()
+            .unwrap()
+            .enter_state_scope(|cb| cb.poll_state(cx))
     }
 
     pub(super) fn handle_tcp_packet(&self, packet: Bytes) -> Option<()> {
         let request = TcpPacket::new(&packet)?;
-        self.cb.lock().unwrap().handle_tcp_packet(&request, &packet);
+        self.cb
+            .lock()
+            .unwrap()
+            .enter_state_scope(|cb| cb.handle_tcp_packet(&request, &packet));
         Some(())
     }
 }
@@ -210,6 +243,15 @@ struct TcpStreamControlBlock {
     read_waker: Option<Waker>,
     write_waker: Option<Waker>,
     driver_waker: Option<Waker>,
+    /// Root span of this connection, parent of every state span.
+    stream_span: Span,
+    /// Span of the state the connection is currently in.
+    ///
+    /// `None` until the first packet is handled, so that no span is created for
+    /// the initial state, which no packet is ever handled in.
+    state_span: Option<Span>,
+    /// The state `state_span` was created for, to detect state changes.
+    span_state: State,
 }
 
 impl TcpStreamControlBlock {
@@ -219,6 +261,7 @@ impl TcpStreamControlBlock {
         closer: StreamCloser,
         gw_sender: GatewaySender,
         stats: StreamStats,
+        stream_span: Span,
     ) -> Self {
         let now = Instant::now();
         let congestion = Cubic::new(DEFAULT_MSS, stats.clone());
@@ -227,6 +270,8 @@ impl TcpStreamControlBlock {
 
         stats.set_srtt(rtt.get().as_micros() as usize);
         stats.set_min_rtt(rtt.min().as_micros() as usize);
+
+        let state = State::Listen;
 
         Self {
             stats,
@@ -237,7 +282,7 @@ impl TcpStreamControlBlock {
             timer: Box::pin(sleep_until(now.into())),
             timers: TimerTable::default(),
             shutdown: false,
-            state: State::Listen,
+            state: state,
             pacing: pacing,
             time: StreamTime::new(now),
             rtt: rtt,
@@ -248,6 +293,9 @@ impl TcpStreamControlBlock {
             read_waker: None,
             write_waker: None,
             driver_waker: None,
+            stream_span: stream_span,
+            state_span: None,
+            span_state: state,
         }
     }
 
@@ -256,12 +304,19 @@ impl TcpStreamControlBlock {
     /// Handles RST packets immediately and then dispatches to appropriate
     /// state handler based on current TCP state machine state.
     fn handle_tcp_packet(&mut self, request: &TcpPacket, packet: &Bytes) {
+        // Start the span of the state this packet is handled in. Placed on the
+        // dispatch rather than in `set_state` so that a state span covers the
+        // whole handler; `set_state` is also called mid-handler. It runs before
+        // the RST check so that a RST is recorded against the state it leads to.
+        self.enter_state();
+
         if request.get_flags() & TcpFlags::RST != 0 {
             trace!(
                 "{}[{}]: recv RST, change state to Closed",
                 self.addr_pair, self.state
             );
             self.set_state(State::Closed);
+            tracing::event!(name: "tcp.rst", tracing::Level::INFO, {});
         }
 
         self.time.update_alive(Instant::now());
@@ -453,6 +508,12 @@ impl TcpStreamControlBlock {
                     "{}[{}]: SYN-ACK has been resent more than {} times",
                     self.addr_pair, self.state, MAX_RETRY_TIMES
                 );
+                tracing::event!(
+                    name: "tcp.timeout",
+                    tracing::Level::WARN,
+                    "tcp.timeout.kind" = "syn_ack",
+                    "tcp.timeout.retries" = syn_ack.num_of_retries()
+                );
 
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
@@ -462,7 +523,15 @@ impl TcpStreamControlBlock {
 
             self.send_tcp_syn_ack_packet();
 
+            let retry = syn_ack.num_of_retries();
             syn_ack.retried_at(now);
+            tracing::event!(
+                name: "tcp.retransmit",
+                tracing::Level::INFO,
+                "tcp.retransmit.kind" = "syn_ack",
+                "tcp.retransmit.retry" = retry,
+                "tcp.retransmit.rto_us" = rto.as_micros() as u64
+            );
             deadline = syn_ack.timeout(rto);
         }
 
@@ -520,6 +589,12 @@ impl TcpStreamControlBlock {
                     "{}[{}]: FIN has been resent more than {} times",
                     self.addr_pair, self.state, MAX_RETRY_TIMES
                 );
+                tracing::event!(
+                    name: "tcp.timeout",
+                    tracing::Level::WARN,
+                    "tcp.timeout.kind" = "fin",
+                    "tcp.timeout.retries" = fin.num_of_retries()
+                );
 
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
@@ -529,7 +604,15 @@ impl TcpStreamControlBlock {
 
             self.send_tcp_fin_packet();
 
+            let retry = fin.num_of_retries();
             fin.retried_at(now);
+            tracing::event!(
+                name: "tcp.retransmit",
+                tracing::Level::INFO,
+                "tcp.retransmit.kind" = "fin",
+                "tcp.retransmit.retry" = retry,
+                "tcp.retransmit.rto_us" = rto.as_micros() as u64
+            );
             deadline = fin.timeout(rto);
         }
 
@@ -549,6 +632,12 @@ impl TcpStreamControlBlock {
                 "{}[{}]: timeout for receiving the peer FIN",
                 self.addr_pair, self.state
             );
+            tracing::event!(
+                name: "tcp.timeout",
+                tracing::Level::WARN,
+                "tcp.timeout.kind" = "fin_wait2",
+                "tcp.timeout.secs" = FIN_TIMEOUT.as_secs()
+            );
         } else {
             self.timers.set(TimerType::Rto, deadline);
         }
@@ -565,6 +654,12 @@ impl TcpStreamControlBlock {
 
         if timeout {
             trace!("{}[{}]: TimeWait timeout", self.addr_pair, self.state);
+            tracing::event!(
+                name: "tcp.timeout",
+                tracing::Level::INFO,
+                "tcp.timeout.kind" = "time_wait",
+                "tcp.timeout.secs" = MSL_2.as_secs()
+            );
         } else {
             self.timers.set(TimerType::Rto, deadline);
         }
@@ -575,6 +670,37 @@ impl TcpStreamControlBlock {
     fn set_state(&mut self, state: State) {
         self.state = state;
         self.stats.set_state(state);
+    }
+
+    /// Runs `f` with the span of the current state entered, so that events
+    /// recorded inside land on the right state span.
+    ///
+    /// The state span is cloned into a local so that the guard does not borrow
+    /// the control block, and `f` receives the block as an argument instead of
+    /// capturing it, so the only lock taken is the caller's.
+    fn enter_state_scope<F, R>(&mut self, f: F) -> R
+    where
+        F: FnOnce(&mut Self) -> R,
+    {
+        match self.state_span.clone() {
+            Some(span) => span.in_scope(|| f(self)),
+            None => f(self),
+        }
+    }
+
+    /// Starts the span of the state the connection has moved into.
+    ///
+    /// Called on packet dispatch, where `self.state` already holds the final
+    /// state for this packet. Nothing is done unless the state changed, so a
+    /// state span lasts exactly as long as the connection stays in that state.
+    /// Dropping the previous span is what ends and exports it.
+    fn enter_state(&mut self) {
+        if self.span_state == self.state {
+            return;
+        }
+
+        self.state_span = Some(state_span(&self.stream_span, self.state));
+        self.span_state = self.state;
     }
 
     /// Handles incoming packets in LISTEN state - processes SYN packets to begin connection.
@@ -817,6 +943,13 @@ impl TcpStreamControlBlock {
                     in_flight.seq().wrapping_add(in_flight.len() as u32),
                     MAX_RETRY_TIMES
                 );
+                tracing::event!(
+                    name: "tcp.timeout",
+                    tracing::Level::WARN,
+                    "tcp.timeout.kind" = "data",
+                    "tcp.timeout.seq" = in_flight.seq(),
+                    "tcp.timeout.retries" = in_flight.num_of_retries()
+                );
 
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
@@ -853,6 +986,17 @@ impl TcpStreamControlBlock {
                 in_flight.len(),
                 rto.as_micros(),
                 self.rtt.rto().as_micros()
+            );
+
+            let retry = in_flight.num_of_retries();
+            tracing::event!(
+                name: "tcp.retransmit",
+                tracing::Level::INFO,
+                "tcp.retransmit.kind" = "data",
+                "tcp.retransmit.seq" = in_flight.seq(),
+                "tcp.retransmit.len" = bytes,
+                "tcp.retransmit.retry" = retry,
+                "tcp.retransmit.rto_us" = rto.as_micros() as u64
             );
 
             self.congestion.on_congestion(now, in_flight.sent_time());

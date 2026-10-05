@@ -9,17 +9,28 @@ use axum::{Router, routing};
 use clap::Parser;
 use gateway::{tcp, udp};
 use log::info;
+use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::{KeyValue, global};
-use opentelemetry_otlp::{MetricExporter, Protocol, WithExportConfig};
+use opentelemetry_otlp::{MetricExporter, Protocol, SpanExporter, WithExportConfig};
+use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
+use opentelemetry_sdk::trace::SdkTracerProvider;
 use shadow_rs::shadow;
 use tabled::settings::Style;
 use tabled::{Table, Tabled};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::oneshot::{self, Receiver, Sender};
 use tokio::time::sleep_until;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 shadow!(build);
+
+/// Maximum number of events recorded on a single span.
+///
+/// The OpenTelemetry SDK default is 128 and silently drops anything beyond it,
+/// which truncates exactly the long lived connections a trace is most useful for.
+const MAX_EVENTS_PER_SPAN: u32 = 1024;
 
 #[derive(Parser)]
 #[command(name = "gatewaysocks", disable_version_flag = true)]
@@ -480,6 +491,41 @@ fn gateway_metrics(opentel: &str, tcp_stats: tcp::StatsMap, udp_stats: udp::Stat
     metric_u64_udp!(meter, "udp_rx_bytes", udp_stats, get_rx_bytes);
 }
 
+/// Builds the resource shared by metrics and traces.
+fn gateway_resource(iface_name: &str) -> Resource {
+    Resource::builder()
+        .with_service_name(build::PROJECT_NAME)
+        .with_attribute(KeyValue::new("service.version", version()))
+        .with_attribute(KeyValue::new("net.host.name", iface_name.to_string()))
+        .build()
+}
+
+/// Installs the OpenTelemetry tracing subscriber that exports TCP connection
+/// traces produced by the `gateway` crate.
+///
+/// Only `tracing` spans and events are exported. The `log` records of both
+/// crates stay on `env_logger` and are not bridged into traces.
+fn gateway_trace(opentel: &str, resource: Resource) {
+    let exporter = SpanExporter::builder()
+        .with_http()
+        .with_endpoint(opentel.to_string() + "/v1/traces")
+        .with_protocol(Protocol::HttpBinary)
+        .build()
+        .unwrap();
+
+    let tracer_provider = SdkTracerProvider::builder()
+        .with_resource(resource)
+        .with_max_events_per_span(MAX_EVENTS_PER_SPAN)
+        .with_batch_exporter(exporter)
+        .build();
+
+    let tracer = tracer_provider.tracer(build::PROJECT_NAME);
+
+    tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(tracer))
+        .init();
+}
+
 async fn gateway_serve(
     netstat: &str,
     iface_name: &str,
@@ -500,6 +546,7 @@ async fn gateway_serve(
 
     if let Some(opentel) = opentel {
         gateway_metrics(opentel, tcp_stats.clone(), udp_stats.clone());
+        gateway_trace(opentel, gateway_resource(iface_name));
     }
 
     let fut_udp = async {

@@ -327,6 +327,8 @@ impl Controller for Cubic {
             return;
         }
 
+        let window_before = self.window;
+
         self.state = State::Recovery(now);
         self.multiplicative_decrease();
 
@@ -334,6 +336,14 @@ impl Controller for Cubic {
         self.stats
             .set_congestion_state(stats::CongestionState::Recovery);
         self.stats.increase_congestion_times();
+
+        tracing::event!(
+            name: "tcp.congestion.window_decrease",
+            tracing::Level::INFO,
+            "tcp.congestion.cwnd_before" = window_before,
+            "tcp.congestion.cwnd_after" = self.window,
+            "tcp.congestion.ssthresh" = self.ssthresh
+        );
     }
 }
 

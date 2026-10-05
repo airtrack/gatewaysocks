@@ -19,6 +19,9 @@ tabled = "0.20"
 opentelemetry = "0.31.0"
 opentelemetry_sdk = "0.31.0"
 opentelemetry-otlp = "0.31.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["smallvec", "fmt", "ansi", "std"] }
+tracing-opentelemetry = "0.32"
 shadow-rs = { version = "2.0.0", default-features = false }
 
 [build-dependencies]

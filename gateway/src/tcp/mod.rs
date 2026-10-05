@@ -16,7 +16,6 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::net::{SocketAddr, SocketAddrV4};
 use std::sync::Arc;
-use std::usize;
 
 use bytes::Bytes;
 use pnet::packet::Packet;
@@ -212,12 +211,21 @@ impl TcpHandler {
                     let gw_sender = self.gw_sender.clone();
                     let stats = StreamStats::new();
 
+                    // Root span of one connection. Every state span and event is
+                    // attached below it, so the whole connection is one trace.
+                    let span = tracing::info_span!(
+                        "tcp.stream",
+                        "socket.src" = %src,
+                        "socket.dst" = %dst
+                    );
+
                     let inner = Arc::new(TcpStreamInner::new(
                         mac,
                         pair,
                         stream_closer,
                         gw_sender,
                         stats.clone(),
+                        span,
                     ));
 
                     let driver = TcpStreamDriver {

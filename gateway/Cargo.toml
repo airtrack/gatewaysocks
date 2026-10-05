@@ -6,6 +6,7 @@ edition = "2024"
 
 [dependencies]
 log = "0.4"
+tracing = "0.1"
 pnet = "0.34.0"
 tokio = { version = "1.38.0", features = ["full"] }
 bytes = "1"
