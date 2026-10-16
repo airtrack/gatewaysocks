@@ -336,6 +336,7 @@ impl Controller for Cubic {
         self.stats
             .set_congestion_state(stats::CongestionState::Recovery);
         self.stats.increase_congestion_times();
+        metrics::counter!("tcp_congestion").increment(1);
 
         tracing::event!(
             name: "tcp.congestion.window_decrease",

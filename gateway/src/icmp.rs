@@ -90,18 +90,23 @@ impl IcmpHandler {
         let ipv4_packet = Ipv4Packet::new(ethernet_packet.payload())?;
 
         if is_fragment(&ipv4_packet) {
+            metrics::counter!("icmp_ignored").increment(1);
             return None;
         }
 
         let icmp_packet = IcmpPacket::new(ipv4_packet.payload())?;
         if icmp_packet.get_icmp_type() != IcmpTypes::EchoRequest {
+            metrics::counter!("icmp_ignored").increment(1);
             return None;
         }
 
         let echo_request = EchoRequestPacket::new(ipv4_packet.payload())?;
         if echo_request.get_icmp_code() != EchoRequestCodes::NoCode {
+            metrics::counter!("icmp_ignored").increment(1);
             return None;
         }
+
+        metrics::counter!("icmp_echo_requests").increment(1);
 
         let client_mac = ethernet_packet.get_source();
         let client_ip = ipv4_packet.get_source();
@@ -111,7 +116,10 @@ impl IcmpHandler {
             self.send_local_echo_reply(client_mac, client_ip, &echo_request);
         } else {
             self.forward_echo_request(client_mac, client_ip, target_ip, &echo_request)
-                .inspect_err(|error| warn!("ICMP echo forward to {} failed: {}", target_ip, error))
+                .inspect_err(|error| {
+                    warn!("ICMP echo forward to {} failed: {}", target_ip, error);
+                    metrics::counter!("icmp_echo_dropped").increment(1);
+                })
                 .ok()?;
         }
 
@@ -126,18 +134,25 @@ impl IcmpHandler {
 
         let icmp_packet = IcmpPacket::new(&packet.data)?;
         if icmp_packet.get_icmp_type() != IcmpTypes::EchoReply {
+            metrics::counter!("icmp_ignored").increment(1);
             return None;
         }
 
         let echo_reply =
             pnet::packet::icmp::echo_reply::EchoReplyPacket::new(icmp_packet.packet())?;
         if echo_reply.get_icmp_code() != EchoReplyCodes::NoCode {
+            metrics::counter!("icmp_ignored").increment(1);
             return None;
         }
 
-        let flow = self
+        let Some(flow) = self
             .flows
-            .flow_for_reply(target_ip, echo_reply.get_identifier())?;
+            .flow_for_reply(target_ip, echo_reply.get_identifier())
+        else {
+            // The request was never forwarded, or its flow has expired.
+            metrics::counter!("icmp_echo_dropped").increment(1);
+            return None;
+        };
 
         trace!(
             "ICMP echo reply forward {} -> {} id {}({})",
@@ -173,6 +188,8 @@ impl IcmpHandler {
                     echo_request.payload(),
                 );
             });
+
+        metrics::counter!("icmp_echo_replies").increment(1);
     }
 
     fn forward_echo_request(
@@ -190,6 +207,7 @@ impl IcmpHandler {
         );
 
         let Some(flow) = flow else {
+            metrics::counter!("icmp_echo_dropped").increment(1);
             return Ok(());
         };
 
@@ -208,6 +226,7 @@ impl IcmpHandler {
 
         let echo_request = EchoRequestPacket::new(&packet).unwrap();
         self.sender.send_to(echo_request, IpAddr::V4(target_ip))?;
+        metrics::counter!("icmp_echo_forwarded").increment(1);
         Ok(())
     }
 
@@ -233,6 +252,8 @@ impl IcmpHandler {
                     echo_reply.payload(),
                 );
             });
+
+        metrics::counter!("icmp_echo_replies").increment(1);
     }
 }
 
@@ -322,6 +343,7 @@ impl FlowTable {
 
         self.by_client.insert(client_key, flow);
         self.by_reply.insert(flow.reply_key(), flow);
+        self.update_flow_gauge();
         Some(flow)
     }
 
@@ -355,6 +377,13 @@ impl FlowTable {
             .retain(|_, flow| now.duration_since(flow.last_seen) < FLOW_TTL);
         self.by_reply
             .retain(|_, flow| now.duration_since(flow.last_seen) < FLOW_TTL);
+
+        self.update_flow_gauge();
+    }
+
+    /// Reports the number of tracked flows, one entry per echoed identifier.
+    fn update_flow_gauge(&self) {
+        metrics::gauge!("icmp_flows").set(self.by_client.len() as f64);
     }
 }
 

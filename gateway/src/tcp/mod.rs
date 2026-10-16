@@ -180,7 +180,9 @@ impl TcpHandler {
 
     /// Removes a closed stream from the active streams map.
     fn remove_stream(&mut self, addr_pair: AddrPair) {
-        self.streams.remove(&addr_pair);
+        if self.streams.remove(&addr_pair).is_some() {
+            metrics::gauge!("tcp_streams").decrement(1.0);
+        }
         self.stats.map.remove(&addr_pair);
     }
 
@@ -238,6 +240,8 @@ impl TcpHandler {
                     packets_tx.try_send(data).ok()?;
                     self.streams.insert(pair, packets_tx);
                     self.stats.map.insert(pair, stats);
+                    metrics::counter!("tcp_connections_opened").increment(1);
+                    metrics::gauge!("tcp_streams").increment(1.0);
                     self.stream_starter.start(stream).ok()?;
                     driver.start();
                 }

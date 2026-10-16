@@ -96,7 +96,9 @@ impl UdpHandler {
 
     /// Removes a closed socket from the active sockets map.
     fn remove_socket(&mut self, addr: SocketAddrV4) {
-        self.sockets.remove(&addr);
+        if self.sockets.remove(&addr).is_some() {
+            metrics::gauge!("udp_sockets").decrement(1.0);
+        }
         self.stats.map.remove(&addr);
     }
 
@@ -117,7 +119,14 @@ impl UdpHandler {
         let data = packet.slice_ref(udp_packet.payload());
 
         match self.sockets.get(&src) {
-            Some(inner) => inner.try_input_packet(data, dst).ok()?,
+            Some(inner) => {
+                inner
+                    .try_input_packet(data, dst)
+                    .inspect_err(|_| {
+                        metrics::counter!("udp_dropped").increment(1);
+                    })
+                    .ok()?;
+            }
             None => {
                 let stats = SocketStats::new();
                 let (packets_tx, packets_rx) = channel(32);
@@ -135,9 +144,16 @@ impl UdpHandler {
                     packets: packets_tx,
                 };
 
-                inner.try_input_packet(data, dst).ok()?;
+                inner
+                    .try_input_packet(data, dst)
+                    .inspect_err(|_| {
+                        metrics::counter!("udp_dropped").increment(1);
+                    })
+                    .ok()?;
+
                 self.sockets.insert(src, inner);
                 self.stats.map.insert(src, stats);
+                metrics::gauge!("udp_sockets").increment(1.0);
                 self.new_socket.send(socket).ok()?;
             }
         }
@@ -328,6 +344,8 @@ impl UdpSocket {
 
         trace!("{} send data({}) to {}", self.source_addr, data.len(), dst);
         self.stats.increase_tx_packet(data.len());
+        metrics::counter!("udp_tx_packets").increment(1);
+        metrics::counter!("udp_tx_bytes").increment(data.len() as u64);
 
         let size = data.len().min(buf.len());
         buf[..size].copy_from_slice(&data[..size]);
@@ -352,6 +370,8 @@ impl UdpSocket {
             from
         );
         self.stats.increase_rx_packet(buf.len());
+        metrics::counter!("udp_rx_packets").increment(1);
+        metrics::counter!("udp_rx_bytes").increment(buf.len() as u64);
 
         // Calculate packet sizes: UDP header (8) + payload
         let udp_packet_len = 8 + buf.len();

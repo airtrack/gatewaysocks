@@ -9,8 +9,10 @@ use axum::{Router, routing};
 use clap::Parser;
 use gateway::{tcp, udp};
 use log::info;
+use metrics_exporter_otel::OpenTelemetryRecorder;
+use opentelemetry::KeyValue;
+use opentelemetry::metrics::MeterProvider as _;
 use opentelemetry::trace::TracerProvider as _;
-use opentelemetry::{KeyValue, global};
 use opentelemetry_otlp::{MetricExporter, Protocol, SpanExporter, WithExportConfig};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
@@ -428,7 +430,16 @@ async fn gateway_netstat(listen: &str, tcp_stats: tcp::StatsMap, udp_stats: udp:
     axum::serve(listener, app).await.unwrap();
 }
 
-fn gateway_metrics(opentel: &str, tcp_stats: tcp::StatsMap, udp_stats: udp::StatsMap) {
+/// Installs the recorder the `gateway` crate reports its metrics through.
+///
+/// The gateway owns the metrics and emits them with the `metrics` macros, so
+/// all that is set up here is the OTLP exporter and the recorder that receives
+/// those metrics.
+///
+/// The returned provider must be held for as long as metrics are wanted:
+/// dropping the last reference shuts the periodic reader down and stops the
+/// export.
+fn gateway_metrics(opentel: &str, resource: Resource) -> SdkMeterProvider {
     let exporter = MetricExporter::builder()
         .with_http()
         .with_endpoint(opentel.to_string() + "/v1/metrics")
@@ -437,58 +448,17 @@ fn gateway_metrics(opentel: &str, tcp_stats: tcp::StatsMap, udp_stats: udp::Stat
         .unwrap();
 
     let reader = PeriodicReader::builder(exporter)
-        .with_interval(Duration::from_secs(1))
+        .with_interval(Duration::from_secs(15))
         .build();
-    let meter_provider = SdkMeterProvider::builder().with_reader(reader).build();
+    let meter_provider = SdkMeterProvider::builder()
+        .with_resource(resource)
+        .with_reader(reader)
+        .build();
 
-    global::set_meter_provider(meter_provider);
+    let meter = meter_provider.meter(build::PROJECT_NAME);
+    metrics::set_global_recorder(OpenTelemetryRecorder::new(meter)).unwrap();
 
-    let meter = global::meter("gatewaysocks");
-
-    macro_rules! metric_u64 {
-        ($meter:ident, $label:expr, $name:expr, $iter:ident, $get_fn:ident) => {
-            let m = $iter.clone();
-            $meter
-                .u64_observable_gauge($name)
-                .with_callback(move |observer| {
-                    m.for_each(|k, v| {
-                        observer
-                            .observe(v.$get_fn() as u64, &[KeyValue::new($label, k.to_string())]);
-                    });
-                })
-                .build();
-        };
-    }
-
-    macro_rules! metric_u64_tcp {
-        ($meter:ident, $name:expr, $iter:ident, $get_fn:ident) => {
-            metric_u64!($meter, "socket_pair", $name, $iter, $get_fn);
-        };
-    }
-
-    macro_rules! metric_u64_udp {
-        ($meter:ident, $name:expr, $iter:ident, $get_fn:ident) => {
-            metric_u64!($meter, "socket", $name, $iter, $get_fn);
-        };
-    }
-
-    metric_u64_tcp!(meter, "tcp_state", tcp_stats, get_state);
-    metric_u64_tcp!(meter, "tcp_send_queue", tcp_stats, get_send_queue);
-    metric_u64_tcp!(meter, "tcp_recv_queue", tcp_stats, get_recv_queue);
-    metric_u64_tcp!(meter, "tcp_climited", tcp_stats, get_congestion_limited);
-    metric_u64_tcp!(meter, "tcp_cstate", tcp_stats, get_congestion_state);
-    metric_u64_tcp!(meter, "tcp_cwnd", tcp_stats, get_congestion_window);
-    metric_u64_tcp!(meter, "tcp_ctimes", tcp_stats, get_congestion_times);
-    metric_u64_tcp!(meter, "tcp_min_rtt", tcp_stats, get_min_rtt);
-    metric_u64_tcp!(meter, "tcp_srtt", tcp_stats, get_srtt);
-    metric_u64_tcp!(meter, "tcp_rwnd", tcp_stats, get_remote_window);
-    metric_u64_tcp!(meter, "tcp_tx_bytes", tcp_stats, get_tx_bytes);
-    metric_u64_tcp!(meter, "tcp_rx_bytes", tcp_stats, get_rx_bytes);
-
-    metric_u64_udp!(meter, "udp_tx_packets", udp_stats, get_tx_packets);
-    metric_u64_udp!(meter, "udp_rx_packets", udp_stats, get_rx_packets);
-    metric_u64_udp!(meter, "udp_tx_bytes", udp_stats, get_tx_bytes);
-    metric_u64_udp!(meter, "udp_rx_bytes", udp_stats, get_rx_bytes);
+    meter_provider
 }
 
 /// Builds the resource shared by metrics and traces.
@@ -540,14 +510,19 @@ async fn gateway_serve(
         iface_name, gateway, subnet_mask, socks5
     );
 
+    let resource = gateway_resource(iface_name);
+
+    // Telemetry is installed before the gateway starts, so that the metrics and
+    // the traces of the first packets are not lost. The meter provider is held
+    // for the rest of the process, since dropping it stops the export.
+    let _meter_provider = opentel.map(|opentel| {
+        gateway_trace(opentel, resource.clone());
+        gateway_metrics(opentel, resource)
+    });
+
     let (mut udp, mut tcp) = gateway::new(gateway, subnet_mask, iface_name).unwrap();
     let udp_stats = udp.get_stats();
     let tcp_stats = tcp.get_stats();
-
-    if let Some(opentel) = opentel {
-        gateway_metrics(opentel, tcp_stats.clone(), udp_stats.clone());
-        gateway_trace(opentel, gateway_resource(iface_name));
-    }
 
     let fut_udp = async {
         loop {

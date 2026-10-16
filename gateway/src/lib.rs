@@ -217,25 +217,29 @@ impl GatewayReceiver {
                     if let Some(ethernet_packet) = EthernetPacket::new(&data) {
                         match ethernet_packet.get_ethertype() {
                             EtherTypes::Ipv4 => {
-                                if let Some(ipv4_packet) =
-                                    Ipv4Packet::new(ethernet_packet.payload())
-                                {
-                                    // Only process packets from our subnet
-                                    if !self.info.in_subnet(ipv4_packet.get_source()) {
-                                        continue;
-                                    }
+                                match Ipv4Packet::new(ethernet_packet.payload()) {
+                                    Some(ipv4_packet) => {
+                                        // Only process packets from our subnet
+                                        if !self.info.in_subnet(ipv4_packet.get_source()) {
+                                            metrics::counter!("gateway_rx_filtered").increment(1);
+                                            continue;
+                                        }
 
-                                    // Route based on IP protocol
-                                    match ipv4_packet.get_next_level_protocol() {
-                                        IpNextHeaderProtocols::Icmp => self.handle_icmp(data),
-                                        IpNextHeaderProtocols::Udp => self.handle_udp(data),
-                                        IpNextHeaderProtocols::Tcp => self.handle_tcp(data),
-                                        _ => {}
+                                        // Route based on IP protocol
+                                        match ipv4_packet.get_next_level_protocol() {
+                                            IpNextHeaderProtocols::Icmp => self.handle_icmp(data),
+                                            IpNextHeaderProtocols::Udp => self.handle_udp(data),
+                                            IpNextHeaderProtocols::Tcp => self.handle_tcp(data),
+                                            _ => {
+                                                metrics::counter!("gateway_rx_ignored").increment(1)
+                                            }
+                                        }
                                     }
+                                    None => metrics::counter!("gateway_rx_ignored").increment(1),
                                 }
                             }
                             EtherTypes::Arp => self.handle_arp(data),
-                            _ => {}
+                            _ => metrics::counter!("gateway_rx_ignored").increment(1),
                         }
                     }
                 }
@@ -246,21 +250,25 @@ impl GatewayReceiver {
 
     /// Routes ARP packets to the ARP handler.
     fn handle_arp(&self, data: Bytes) {
+        metrics::counter!("gateway_rx_packets", "protocol" => "arp").increment(1);
         self.arp_channel.send(data).unwrap();
     }
 
     /// Routes ICMP packets to the ICMP handler.
     fn handle_icmp(&self, data: Bytes) {
+        metrics::counter!("gateway_rx_packets", "protocol" => "icmp").increment(1);
         self.icmp_channel.send(data).unwrap();
     }
 
     /// Routes UDP packets to the UDP handler.
     fn handle_udp(&self, data: Bytes) {
+        metrics::counter!("gateway_rx_packets", "protocol" => "udp").increment(1);
         self.udp_channel.send(data).unwrap();
     }
 
     /// Routes TCP packets to the TCP handler.
     fn handle_tcp(&self, data: Bytes) {
+        metrics::counter!("gateway_rx_packets", "protocol" => "tcp").increment(1);
         self.tcp_channel.send(data).unwrap();
     }
 }

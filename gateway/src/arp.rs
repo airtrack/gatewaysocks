@@ -73,6 +73,8 @@ impl ArpHandler {
                 return None;
             }
 
+            metrics::counter!("arp_requests").increment(1);
+
             // Only respond if someone is asking for our IP address
             if arp_request.get_target_proto_addr() != self.gw_sender.info.addr {
                 return None;
@@ -83,6 +85,7 @@ impl ArpHandler {
 
             // Send ARP reply with our MAC address
             self.send_packet(source_mac, source_ip, ArpOperations::Reply);
+            metrics::counter!("arp_replies").increment(1);
         }
 
         Some(())

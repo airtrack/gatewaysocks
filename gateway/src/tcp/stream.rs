@@ -316,6 +316,7 @@ impl TcpStreamControlBlock {
                 self.addr_pair, self.state
             );
             self.set_state(State::Closed);
+            metrics::counter!("tcp_resets", "direction" => "recv").increment(1);
             tracing::event!(name: "tcp.rst", tracing::Level::INFO, {});
         }
 
@@ -392,6 +393,7 @@ impl TcpStreamControlBlock {
 
             self.stats.increase_rx_bytes(size);
             self.stats.set_recv_queue(self.recv_buffer.readable_size());
+            metrics::counter!("tcp_rx_bytes").increment(size as u64);
             return std::task::Poll::Ready(Ok(()));
         }
 
@@ -508,6 +510,7 @@ impl TcpStreamControlBlock {
                     "{}[{}]: SYN-ACK has been resent more than {} times",
                     self.addr_pair, self.state, MAX_RETRY_TIMES
                 );
+                metrics::counter!("tcp_timeouts", "kind" => "syn_ack").increment(1);
                 tracing::event!(
                     name: "tcp.timeout",
                     tracing::Level::WARN,
@@ -525,6 +528,7 @@ impl TcpStreamControlBlock {
 
             let retry = syn_ack.num_of_retries();
             syn_ack.retried_at(now);
+            metrics::counter!("tcp_retransmits", "kind" => "syn_ack").increment(1);
             tracing::event!(
                 name: "tcp.retransmit",
                 tracing::Level::INFO,
@@ -589,6 +593,7 @@ impl TcpStreamControlBlock {
                     "{}[{}]: FIN has been resent more than {} times",
                     self.addr_pair, self.state, MAX_RETRY_TIMES
                 );
+                metrics::counter!("tcp_timeouts", "kind" => "fin").increment(1);
                 tracing::event!(
                     name: "tcp.timeout",
                     tracing::Level::WARN,
@@ -606,6 +611,7 @@ impl TcpStreamControlBlock {
 
             let retry = fin.num_of_retries();
             fin.retried_at(now);
+            metrics::counter!("tcp_retransmits", "kind" => "fin").increment(1);
             tracing::event!(
                 name: "tcp.retransmit",
                 tracing::Level::INFO,
@@ -632,6 +638,7 @@ impl TcpStreamControlBlock {
                 "{}[{}]: timeout for receiving the peer FIN",
                 self.addr_pair, self.state
             );
+            metrics::counter!("tcp_timeouts", "kind" => "fin_wait2").increment(1);
             tracing::event!(
                 name: "tcp.timeout",
                 tracing::Level::WARN,
@@ -654,6 +661,7 @@ impl TcpStreamControlBlock {
 
         if timeout {
             trace!("{}[{}]: TimeWait timeout", self.addr_pair, self.state);
+            metrics::counter!("tcp_timeouts", "kind" => "time_wait").increment(1);
             tracing::event!(
                 name: "tcp.timeout",
                 tracing::Level::INFO,
@@ -670,6 +678,7 @@ impl TcpStreamControlBlock {
     fn set_state(&mut self, state: State) {
         self.state = state;
         self.stats.set_state(state);
+        metrics::counter!("tcp_states", "state" => state.to_str()).increment(1);
     }
 
     /// Runs `f` with the span of the current state entered, so that events
@@ -950,6 +959,7 @@ impl TcpStreamControlBlock {
                     "tcp.timeout.seq" = in_flight.seq(),
                     "tcp.timeout.retries" = in_flight.num_of_retries()
                 );
+                metrics::counter!("tcp_timeouts", "kind" => "data").increment(1);
 
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
@@ -989,6 +999,7 @@ impl TcpStreamControlBlock {
             );
 
             let retry = in_flight.num_of_retries();
+            metrics::counter!("tcp_retransmits", "kind" => "data").increment(1);
             tracing::event!(
                 name: "tcp.retransmit",
                 tracing::Level::INFO,
@@ -1175,6 +1186,7 @@ impl TcpStreamControlBlock {
     /// Sends RST+ACK packet to forcibly reset the connection.
     fn send_tcp_rst_packet(&self) {
         self.send_tcp_control_packet(TcpFlags::ACK | TcpFlags::RST);
+        metrics::counter!("tcp_resets", "direction" => "send").increment(1);
         trace!("{}[{}]: send RST", self.addr_pair, self.state);
     }
 
@@ -1335,6 +1347,7 @@ impl TcpStreamControlBlock {
 
         self.stats.increase_tx_bytes(ack_bytes);
         self.stats.set_send_queue(self.send_buffer.len());
+        metrics::counter!("tcp_tx_bytes").increment(ack_bytes as u64);
     }
 
     /// Processes incoming data payload and updates receive buffer.
