@@ -462,11 +462,18 @@ fn gateway_metrics(opentel: &str, resource: Resource) -> SdkMeterProvider {
 }
 
 /// Builds the resource shared by metrics and traces.
-fn gateway_resource(iface_name: &str) -> Resource {
+///
+/// The gateway IP is the instance identity: two gatewaysocks processes can
+/// share the host and the interface, so the interface name alone does not
+/// distinguish them. The same IP is also exported as `gateway.ip` so
+/// dashboards can filter on a readable attribute.
+fn gateway_resource(iface_name: &str, gateway: Ipv4Addr) -> Resource {
     Resource::builder()
         .with_service_name(build::PROJECT_NAME)
         .with_attribute(KeyValue::new("service.version", version()))
-        .with_attribute(KeyValue::new("net.host.name", iface_name.to_string()))
+        .with_attribute(KeyValue::new("service.instance.id", gateway.to_string()))
+        .with_attribute(KeyValue::new("gateway.ip", gateway.to_string()))
+        .with_attribute(KeyValue::new("net.host.interface", iface_name.to_string()))
         .build()
 }
 
@@ -510,7 +517,7 @@ async fn gateway_serve(
         iface_name, gateway, subnet_mask, socks5
     );
 
-    let resource = gateway_resource(iface_name);
+    let resource = gateway_resource(iface_name, gateway);
 
     // Telemetry is installed before the gateway starts, so that the metrics and
     // the traces of the first packets are not lost. The meter provider is held
