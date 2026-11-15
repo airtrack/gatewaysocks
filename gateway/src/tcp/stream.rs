@@ -43,6 +43,16 @@ const MAX_TCP_HEADER_LEN: usize = 60;
 const MAX_TCP_OPTION_HEADER_LEN: usize = MAX_TCP_HEADER_LEN - MIN_TCP_HEADER_LEN;
 const MAX_SEND_BUFFER: usize = 128 * 1024;
 
+/// Computes the 16-bit window field for the negotiated window scale.
+///
+/// The shifted receive window can exceed `u16::MAX`: 256 KiB shifted right by 2
+/// is exactly 65536. Casting that straight to `u16` wraps to 0, which advertises
+/// a zero receive window and makes the peer stop sending (it only probes the
+/// window). Clamp instead of wrapping.
+fn window_field(local_window: u32, wscale: u8) -> u16 {
+    (local_window >> wscale).min(u16::MAX as u32) as u16
+}
+
 /// Checks if a TCP packet has the SYN flag set.
 pub(super) fn is_syn_packet(request: &TcpPacket) -> bool {
     request.get_flags() & TcpFlags::SYN != 0
@@ -1253,8 +1263,10 @@ impl TcpStreamControlBlock {
                 tcp_packet.set_data_offset(((MIN_TCP_HEADER_LEN + opts_size) / 4) as u8);
                 tcp_packet.set_reserved(0);
                 tcp_packet.set_flags(flags);
-                tcp_packet
-                    .set_window((self.state_data.local_window >> self.state_data.wscale) as u16);
+                tcp_packet.set_window(window_field(
+                    self.state_data.local_window,
+                    self.state_data.wscale,
+                ));
                 tcp_packet.set_checksum(0);
                 tcp_packet.set_urgent_ptr(0);
                 tcp_packet.set_options(opts);
@@ -1412,5 +1424,26 @@ impl TcpStreamControlBlock {
         if let Some(waker) = self.read_waker.take() {
             waker.wake();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LOCAL_WINDOW, window_field};
+
+    #[test]
+    fn window_field_clamps_instead_of_wrapping() {
+        // 256 KiB >> 2 is 65536, one more than the 16-bit window field can
+        // hold. Wrapping would advertise a zero window.
+        assert_eq!(window_field(LOCAL_WINDOW, 2), u16::MAX);
+        assert_eq!(window_field(LOCAL_WINDOW, 0), u16::MAX);
+        assert_eq!(window_field(LOCAL_WINDOW, 1), u16::MAX);
+    }
+
+    #[test]
+    fn window_field_keeps_values_that_fit() {
+        assert_eq!(window_field(LOCAL_WINDOW, 3), 32768);
+        assert_eq!(window_field(LOCAL_WINDOW, 8), 1024);
+        assert_eq!(window_field(4096, 2), 1024);
     }
 }
